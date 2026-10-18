@@ -1,0 +1,21 @@
+{
+  "name": "jarvis-friday-bridge",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "engines": {
+    "node": "24.x"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check:remote": "python3 scripts/check_bridge.py && python3 scripts/check_health.py && python3 scripts/check_oauth_diagnostics.py",
+    "package:plugin": "python3 scripts/package_plugin.py"
+  },
+  "dependencies": {
+    "@vercel/queue": "0.8.0",
+    "ipaddr.js": "2.5.0",
+    "jose": "6.2.12",
+    "pg": "8.23.1",
+    "standardwebhooks": "1.1.1"
+  }
+}

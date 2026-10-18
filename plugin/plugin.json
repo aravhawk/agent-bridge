@@ -1,0 +1,21 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "author": {
+    "name": "Arav Jain"
+  },
+  "description": "Connect Jarvis to the Vercel-hosted Friday bridge.",
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "capabilities": [],
+        "category": "Productivity",
+        "developerName": "Arav Jain",
+        "displayName": "Jarvis Friday Bridge",
+        "longDescription": "Use the existing Vercel-hosted bridge through the Jarvis MCP endpoint.",
+        "shortDescription": "Connect Jarvis and Friday"
+      }
+    }
+  },
+  "name": "rn-jarvis-friday-bridge",
+  "version": "0.1.0"
+}

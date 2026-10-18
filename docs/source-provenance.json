@@ -1,0 +1,147 @@
+{
+  "product": "Jarvis Friday Bridge",
+  "productionDeploymentId": "dpl_As2mXHyEH9hqFaZpJpGxpoeRCZeL",
+  "vercelProjectId": "prj_U4y7PBcoZN3cI2bE3NLE2GZGBFIG",
+  "vercelTeamId": "team_rCVvKJ5rUgNP0LOPEwzfyl0z",
+  "runtimeFiles": [
+    {
+      "path": "package.json",
+      "productionSha256": "80e73768b2ec85296005f22f5447141b823db70f6f1948ce54c7ad6d299b1b96",
+      "repositorySha256": "cf51110aa045f76a49626d81c132d4e6d633fb4110a05562dc885e2c75992091",
+      "matchesProduction": false,
+      "allowedDifference": "package name and local scripts only"
+    },
+    {
+      "path": "package-lock.json",
+      "productionSha256": "4a8f75a1bf3bc95927b326d3d32ddaafc82caf915ada64b34d96180dd23272ff",
+      "repositorySha256": "fb79594773d9c6109d33ba3be7365261075795287e988720af2ceddbc76affba",
+      "matchesProduction": false,
+      "allowedDifference": "package name and local scripts only"
+    },
+    {
+      "path": "vercel.json",
+      "productionSha256": "c853783ecf4c8b81a8a595b36c520fbc2f6d2d52edace3089f5e4b23b14f3494",
+      "repositorySha256": "c853783ecf4c8b81a8a595b36c520fbc2f6d2d52edace3089f5e4b23b14f3494",
+      "matchesProduction": true,
+      "allowedDifference": null
+    },
+    {
+      "path": "src/bridge.mjs",
+      "productionSha256": "ae8eec971dc023b99f442130e14aba694f3ccb388f8280f6587f6bd47a03a768",
+      "repositorySha256": "ae8eec971dc023b99f442130e14aba694f3ccb388f8280f6587f6bd47a03a768",
+      "matchesProduction": true,
+      "allowedDifference": null
+    },
+    {
+      "path": "src/delivery.mjs",
+      "productionSha256": "b67670b91c4d735f6552bc05eeb1b5dc3902aa1c9a61c43800ffa90bc5e4ee27",
+      "repositorySha256": "b67670b91c4d735f6552bc05eeb1b5dc3902aa1c9a61c43800ffa90bc5e4ee27",
+      "matchesProduction": true,
+      "allowedDifference": null
+    },
+    {
+      "path": "src/events.mjs",
+      "productionSha256": "adeabcd4e471f39bd8948e06355519d77a38d235dd678b954d483fc1d4e56a84",
+      "repositorySha256": "adeabcd4e471f39bd8948e06355519d77a38d235dd678b954d483fc1d4e56a84",
+      "matchesProduction": true,
+      "allowedDifference": null
+    },
+    {
+      "path": "src/mcp.mjs",
+      "productionSha256": "708cca3ead670d1cd27577caa0b8f5100cbb781a3c226781256193ab5d65aa75",
+      "repositorySha256": "708cca3ead670d1cd27577caa0b8f5100cbb781a3c226781256193ab5d65aa75",
+      "matchesProduction": true,
+      "allowedDifference": null
+    },
+    {
+      "path": "src/plugin-draft.mjs",
+      "productionSha256": "7c0121e2c850b3e388fa7a0be2229f1f599afbaf0866be930190ac0182263154",
+      "repositorySha256": "7c0121e2c850b3e388fa7a0be2229f1f599afbaf0866be930190ac0182263154",
+      "matchesProduction": true,
+      "allowedDifference": null
+    },
+    {
+      "path": "src/policy.mjs",
+      "productionSha256": "e908e51fecae4dabbc2b11845be87d2fd820847de9b4f3f19225861e3e0df3c9",
+      "repositorySha256": "e908e51fecae4dabbc2b11845be87d2fd820847de9b4f3f19225861e3e0df3c9",
+      "matchesProduction": true,
+      "allowedDifference": null
+    },
+    {
+      "path": "src/queue.mjs",
+      "productionSha256": "9b593104ba670d2473ceb29780b2b797c9a6b60658d722bca31c9f7f92e1ca05",
+      "repositorySha256": "9b593104ba670d2473ceb29780b2b797c9a6b60658d722bca31c9f7f92e1ca05",
+      "matchesProduction": true,
+      "allowedDifference": null
+    },
+    {
+      "path": "src/resource.mjs",
+      "productionSha256": "91230de413b2b490114dc0d2094db8f65f622b3e6065b2fb2176618528a9c67e",
+      "repositorySha256": "91230de413b2b490114dc0d2094db8f65f622b3e6065b2fb2176618528a9c67e",
+      "matchesProduction": true,
+      "allowedDifference": null
+    },
+    {
+      "path": "src/runtime.mjs",
+      "productionSha256": "4f50689e5985d1152e5315fc9d02086d6a5cf9b4df01f0a6c39796a678da3e0b",
+      "repositorySha256": "4f50689e5985d1152e5315fc9d02086d6a5cf9b4df01f0a6c39796a678da3e0b",
+      "matchesProduction": true,
+      "allowedDifference": null
+    },
+    {
+      "path": "src/store.mjs",
+      "productionSha256": "85fc07ed02ca9eec831da1fedee4631ce4e643a2c4104b09479791c49d2b88ab",
+      "repositorySha256": "85fc07ed02ca9eec831da1fedee4631ce4e643a2c4104b09479791c49d2b88ab",
+      "matchesProduction": true,
+      "allowedDifference": null
+    },
+    {
+      "path": "src/webhook.mjs",
+      "productionSha256": "c6ccf3b56644f1ace2177b3fa43a1dad9529eb343b077f33c9b62bd2d3a4f807",
+      "repositorySha256": "c6ccf3b56644f1ace2177b3fa43a1dad9529eb343b077f33c9b62bd2d3a4f807",
+      "matchesProduction": true,
+      "allowedDifference": null
+    },
+    {
+      "path": "src/worker.mjs",
+      "productionSha256": "518af4d4f88415209deaf43156fce6f6bbb8d38018b9731684fe972fdaed76b6",
+      "repositorySha256": "518af4d4f88415209deaf43156fce6f6bbb8d38018b9731684fe972fdaed76b6",
+      "matchesProduction": true,
+      "allowedDifference": null
+    },
+    {
+      "path": "api/index.mjs",
+      "productionSha256": "8966e3cad4a8ebb2576b818044318f6f082a482b706cc96f1f13d84d223f7548",
+      "repositorySha256": "8966e3cad4a8ebb2576b818044318f6f082a482b706cc96f1f13d84d223f7548",
+      "matchesProduction": true,
+      "allowedDifference": null
+    },
+    {
+      "path": "api/queue.mjs",
+      "productionSha256": "dd1e565ac5267a9251fc1f039784677fb3f9f57b253e5ca90f2eba6d21630773",
+      "repositorySha256": "dd1e565ac5267a9251fc1f039784677fb3f9f57b253e5ca90f2eba6d21630773",
+      "matchesProduction": true,
+      "allowedDifference": null
+    },
+    {
+      "path": "legacy/diagnostic.mjs",
+      "productionSha256": "d5c39fc117a88bc6fee2a7e0fea5859b385b80662096740a2bd95a15897eacc7",
+      "repositorySha256": "d5c39fc117a88bc6fee2a7e0fea5859b385b80662096740a2bd95a15897eacc7",
+      "matchesProduction": true,
+      "allowedDifference": null
+    },
+    {
+      "path": "legacy/index.mjs",
+      "productionSha256": "9053a5d1a0c0137ebd5847949e25dfb6431c94bb6c78f536336334a7361f82d4",
+      "repositorySha256": "9053a5d1a0c0137ebd5847949e25dfb6431c94bb6c78f536336334a7361f82d4",
+      "matchesProduction": true,
+      "allowedDifference": null
+    }
+  ],
+  "registeredPluginId": "plugins_6ad4eb02c02881918521c780c92f07b0",
+  "registeredPluginReleaseId": "pluginrel_6ad4eb03955c819192be4c0cd8ab4d90",
+  "pluginDifferences": [
+    "optional author email omitted"
+  ],
+  "noProductionCodeOrSettingsChanged": true
+}

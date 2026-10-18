@@ -1,0 +1,19 @@
+{
+  "interface": {
+    "capabilities": [],
+    "category": "Productivity",
+    "developerName": "Arav Jain",
+    "displayName": "Jarvis Friday Bridge",
+    "longDescription": "Use the existing Vercel-hosted bridge through the Jarvis MCP endpoint.",
+    "shortDescription": "Connect Jarvis and Friday",
+    "defaultPrompt": null
+  },
+  "name": "rn-jarvis-friday-bridge",
+  "version": "0.1.0",
+  "description": "Connect Jarvis to the Vercel-hosted Friday bridge.",
+  "author": {
+    "name": "Arav Jain"
+  },
+  "keywords": [],
+  "mcpServers": "./.mcp.json"
+}

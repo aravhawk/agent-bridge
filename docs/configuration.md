@@ -1,0 +1,86 @@
+# Configuration and preserved boundaries
+
+## Public OAuth settings
+
+Issuer: `https://musical-bee-9978.clerk.accounts.dev`.
+Authorization: issuer plus `/oauth/authorize`; token: issuer plus `/oauth/token`.
+Both clients are public, token endpoint authentication `none`, required S256,
+provider-hosted consent, JWT access tokens and Include Audience enabled.
+No client secret belongs in this repository. DCR/CIMD and device grants are off.
+
+| Native side | Public client ID | Requested scopes | Exact resource audience |
+|---|---|---|---|
+| Friday | `jtwi71bhdmkGqilW` | `bridge:send:jarvis bridge:ack:friday offline_access` | Production origin + `/bridge/friday/mcp` |
+| Jarvis | `f58dfaNi1qX2vtdx` | `bridge:ack:jarvis bridge:send:friday offline_access` | Production origin + `/bridge/jarvis/mcp` |
+
+Friday's callback is `https://www.cursor.com/agents/mcp/oauth/callback`.
+The native ChatGPT form displayed
+`https://chatgpt.com/connector_platform_oauth_redirect`, matching Jarvis's saved
+callback. Always compare the actual native management value before changing an
+allowlist. Public client IDs and resource URLs are not credentials.
+
+Jarvis uses OIDC disabled and no identity/metadata scopes. Custom directional
+scopes are intentionally not advertised globally, but assigned to each client.
+Actual native Friday authentication and five-tool discovery were verified;
+Jarvis's native grant and authenticated Events readiness remain pending.
+
+## Runtime storage and gates
+
+Vercel injects `DATABASE_URL` from the existing isolated Neon integration in
+Production only. Never pull it into a local `.env`, copy it from the dashboard,
+or commit it. TLS must be verified and the hostname must be a Neon host.
+
+The real allowed subject is pinned through sensitive Production configuration.
+Do not copy the subject or its configured digest into the repository. Configure
+one of `BRIDGE_ALLOWED_SUBJECT` or `BRIDGE_ALLOWED_SUBJECT_SHA256`, never both.
+`BRIDGE_OAUTH_SCOPE_CLAIM=scope` matches the verified provider contract.
+
+`BRIDGE_OAUTH_CONTRACT_VERIFIED` is true in the existing Production runtime.
+The example file remains closed by default. These flags must remain false until
+the corresponding acceptance work is complete:
+
+```text
+BRIDGE_DELIVERY_ENABLED=false
+BRIDGE_SUBSCRIPTIONS_ENABLED=false
+BRIDGE_AUTH_DIAGNOSTIC=false
+BRIDGE_AUTH_TIMING_DIAGNOSTIC=false
+BRIDGE_RPC_SHAPE_DIAGNOSTIC=false
+```
+
+Flags alone cannot enable delivery. The default runtime still requires an
+actual current-access/revocation adapter and a supported Friday sender binding.
+Native callback configuration requires a securely supplied32-byte AES-GCM
+protector key. No placeholder allow-all adapter, relay or polling listener is
+acceptable. Do not generate a new credential merely to inspect a setup flow.
+
+## Native receivers
+
+Jarvis must discover MCP2026-07-28 Events, list `bridge.message.received`, and
+establish a native persistent subscription with arguments `recipient:"jarvis"`
+and `ttlMs:null`. The host supplies its callback URL and signing secret in the
+authenticated handshake. Never ask for that secret in chat.
+
+The current Friday UI exposes a Routines list and the existing email routine's
+pause toggle, but no usable pre-creation webhook form. Its guide documents POST
+and a persistent URL/sender-key capability, but not the exact body/auth/replay
+contract or a safe direct credential handoff to Vercel. No incoming webhook
+routine/key has been created for this bridge. Do not assume a generic xAI
+webhook format applies to the Bot app or repeat the unusable panel-copy path.
+
+Keep existing routines/subscriptions enabled unless explicitly instructed
+otherwise. No schedule or random test should be armed before both native
+receivers and the subscription are verified. Test credential refresh only
+after the actual native access token expires, without extracting a token or
+changing its lifetime.
+
+## Publishing and deployment
+
+Only project source and nonsecret configuration belong here. Do not add message
+histories, session dumps, browser state, screenshots, environment pulls, real
+callback secrets, auth URLs containing flow parameters, or unrelated artifacts.
+The history audit prints rule names and paths, never matching secret values.
+
+CI uses no deployment secret and runs no remote/native test. Existing Vercel
+GitHub permissions can see this private repository. Linking must target the
+existing isolated project; if a new GitHub/Vercel installation grant appears,
+review its exact scope before accepting it. Do not create another Vercel project.

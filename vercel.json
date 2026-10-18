@@ -1,0 +1,14 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "regions": ["iad1"],
+  "functions": {
+    "api/queue.mjs": {
+      "maxDuration": 60,
+      "experimentalTriggers": [{ "type": "queue/v2beta", "topic": "rn-jarvis-friday-synthetic-20261018", "maxDeliveries": 20 }]
+    },
+    "api/index.mjs": { "maxDuration": 60 }
+  },
+  "rewrites": [
+    { "source": "/((?!api/queue).*)", "destination": "/api/index" }
+  ]
+}
