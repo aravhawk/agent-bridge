@@ -1,39 +1,44 @@
-import { createHash } from 'node:crypto';
-import { SCOPES } from './policy.mjs';
-import { ISSUER, resourceFor } from './resource.mjs';
+import { BridgeError, SCOPES, VERIFIED_AUTHORIZATION } from './policy.mjs';
+import { resourceFor } from './resource.mjs';
 
-const digest = value => createHash('sha256').update(value).digest('hex');
-export const JARVIS_CLIENT_ID = 'f58dfaNi1qX2vtdx';
-
-// readCurrentGrant is a trusted provider integration, never caller-supplied
-// metadata or a saved JWT assertion. It must read current grant/revocation facts
-// on each call. An absent reader is a closed configuration, not an allow-all.
-export function createJarvisAccessAllowed({ subject, subjectHash, readCurrentGrant,
-  clock = Date.now } = {}) {
-  const pinned = (typeof subject === 'string' && !!subject && !subjectHash) ||
-    (!subject && /^[a-f0-9]{64}$/.test(subjectHash || ''));
-  const configured = !!pinned && typeof readCurrentGrant === 'function';
-  const check = async ({ owner, recipient } = {}) => {
-    if (!configured || recipient !== 'jarvis' || typeof owner !== 'string' || !/^[a-f0-9]{64}$/.test(owner)) return false;
-    const now = clock();
-    try {
-      const grant = await readCurrentGrant(Object.freeze({ issuer: ISSUER,
-        clientId: JARVIS_CLIENT_ID, resource: resourceFor('jarvis'),
-        requiredScope: SCOPES.jarvis.ack, owner }));
-      if (!grant || grant.active !== true || grant.revoked !== false ||
-          grant.issuer !== ISSUER || grant.clientId !== JARVIS_CLIENT_ID ||
-          grant.resource !== resourceFor('jarvis') || typeof grant.subject !== 'string' ||
-          (subject ? grant.subject !== subject : digest(grant.subject) !== subjectHash) ||
-          !Array.isArray(grant.scopes) || !grant.scopes.includes(SCOPES.jarvis.ack) ||
-          !Number.isSafeInteger(grant.expiresAt) || grant.expiresAt <= clock() ||
-          !Number.isSafeInteger(grant.checkedAt) || grant.checkedAt < now - 30000 ||
-          grant.checkedAt > now + 5000) return false;
-      return owner === digest(JSON.stringify([ISSUER, resourceFor('jarvis'), grant.subject, 'jarvis']));
-    } catch {
-      // Never propagate provider errors, credentials, identities or raw claims.
-      return false;
+const hash = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+export function verifiedLease(principal, policyId, now) {
+  const authorization = principal?.[VERIFIED_AUTHORIZATION];
+  if (!hash(policyId) || authorization?.policyId !== policyId ||
+      !Number.isSafeInteger(authorization.expiresAt) || authorization.expiresAt <= now ||
+      principal?.role !== 'jarvis' || !hash(principal.principalKey) ||
+      !principal.scopes?.includes(SCOPES.jarvis.ack)) throw new BridgeError('authorization_lease_required', 403);
+  return { owner: principal.principalKey, recipient: 'jarvis', resource: resourceFor('jarvis'),
+    scope: SCOPES.jarvis.ack, policyId, tokenExpiresAt: authorization.expiresAt };
+}
+export function resourceDenied(state, owner) {
+  if (state.resourceDenials !== undefined && (!state.resourceDenials || typeof state.resourceDenials !== 'object' || Array.isArray(state.resourceDenials))) return true;
+  return Object.hasOwn(state.resourceDenials || {}, owner);
+}
+export function validLeaseMetadata(subscription, policyId) {
+  const a = subscription?.authorization;
+  return !!a && hash(policyId) && a.policyId === policyId && hash(subscription.owner) &&
+    /^sub_[a-f0-9]{64}$/.test(subscription.id || '') && subscription.name === 'bridge.message.received' &&
+    subscription.arguments?.recipient === 'jarvis' && Object.keys(subscription.arguments).length === 1 &&
+    a.owner === subscription.owner && a.recipient === 'jarvis' && subscription.recipient === 'jarvis' &&
+    a.resource === resourceFor('jarvis') && a.scope === SCOPES.jarvis.ack &&
+    Number.isSafeInteger(a.tokenExpiresAt) && Number.isSafeInteger(subscription.expiresAt) &&
+    subscription.expiresAt <= a.tokenExpiresAt;
+}
+export function subscriptionAccessAllowed(state, subscription, policyId, now) {
+  return validLeaseMetadata(subscription, policyId) && subscription.status === 'active' &&
+    subscription.active === true && !resourceDenied(state, subscription.owner) &&
+    subscription.expiresAt > now && subscription.authorization.tokenExpiresAt > now;
+}
+// Operator-only application API. Never exposed through MCP or request fields.
+// Denial is durable, resource/owner scoped, and no renewal path deletes it.
+export async function denyResourceAccess(store, owner, now = Date.now()) {
+  if (!hash(owner)) throw new BridgeError('invalid_resource_owner', 400);
+  await store.transaction(state => {
+    state.resourceDenials ||= {};
+    state.resourceDenials[owner] = { resource: resourceFor('jarvis'), recipient: 'jarvis', status: 'denied', deniedAt: now };
+    for (const sub of Object.values(state.subscriptions)) {
+      if (sub.owner === owner && sub.recipient === 'jarvis') { sub.active = false; sub.status = 'denied'; }
     }
-  };
-  Object.defineProperty(check, 'configured', { value: configured });
-  return check;
+  });
 }

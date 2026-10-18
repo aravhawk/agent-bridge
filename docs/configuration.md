@@ -49,27 +49,41 @@ with `{}` through that same connector. Do not replace this with the public
 health endpoint or count `message_not_found` as successful tool execution.
 No OAuth reconnection or expanded grant is required by this backend change.
 
-`src/access.mjs` implements a Jarvis-only current-access adapter. Every check
-requires a trusted `readCurrentGrant` integration and matches the pinned
-subject, issuer, client `f58dfaNi1qX2vtdx`, exact Jarvis resource, acknowledgment
-scope, active/unrevoked state, future expiry and freshly checked facts. The
-owner must match the verified principal digest. Wrong or absent facts and
-provider errors return false. Facts are never accepted from tool arguments or
-saved JWT assertions, and no raw identity, token or provider error is logged.
+`src/access.mjs` implements bounded Jarvis authorization leases and durable
+resource denial. The existing verifier checks signature, issuer, audience,
+pinned subject and scopes; it passes only verified token expiry and a policy
+fingerprint internally. Tokens and raw claims are never stored in subscriptions.
+No Clerk backend credential or custom grant-reader API is required.
 
-The reader contract returns `{active, revoked, issuer, clientId, resource,
-subject, scopes, checkedAt, expiresAt}` internally; timestamps are epoch
-milliseconds. It must query an authoritative current grant/revocation source on
-each call. The adapter does not establish that source or create a credential.
-Production currently has no reader bound and reports
-`currentAccessCheckConfigured:false`; therefore subscriptions and delivery
-remain closed. Do not bind a placeholder reader or treat signature validity
-as current OAuth revocation evidence. A supported provider read source and any
-required least-privilege credential must be reviewed before provisioning it.
+Every subscription is finite. The deadline is the earliest of the requested
+TTL (one day when omitted, seven-day server cap when null), the seven-day
+maximum, and the verified JWT expiration. There is no minimum-TTL extension or
+clock-tolerance extension. A refresh with the same verified expiration cannot
+extend the saved deadline; a later verified expiration can. Older tokens,
+legacy subscriptions without authorization metadata and changed policy/owner
+bindings fail closed. The callback challenge and final save recheck expiry and
+durable denial. The worker checks owner, recipient, resource, scope, status,
+pinned policy, hard expiry and denial before sending and at final commit.
 
-The adapter is checked before native subscription callback/storage work and
-again by the worker before Jarvis delivery. It deliberately denies Friday
-delivery; that requires a separately verified sender/access binding.
+Resource denial is server-owned state in the existing aggregate's optional
+`resourceDenials` map. The operator-only `denyResourceAccess` application helper
+persists the denial and deactivates that owner's Jarvis subscriptions. It is
+not exposed as a new MCP/admin endpoint. Renewals never erase denial, and
+unsubscribe writes a durable inactive tombstone even if callback verification
+is in flight. No database schema migration or separate store is needed.
+
+This is the signed-JWT expiry model, not instant provider introspection: Clerk
+revocation alone cannot instantly invalidate an already issued JWT. Local
+resource denial and unsubscribe stop this bridge immediately; otherwise the
+finite lease ends no later than token expiry. See [Clerk token formats](https://clerk.com/docs/guides/development/machine-auth/token-formats).
+A network request already in flight cannot be recalled; the final worker fence
+prevents late completion from recording revoked/expired authority as accepted.
+
+[Native subscription renewal](https://developers.openai.com/plugins/build/mcp-events#refresh-a-subscription)
+uses `events/subscribe` again before the finite `refreshBefore`, even when the
+client requested `ttlMs:null`. Live native OAuth refresh and native subscription
+renewal remain separate unverified tests. Neither discovery nor local tests
+prove that the host renewed the live subscription.
 
 ## Runtime storage and gates
 
@@ -95,16 +109,17 @@ BRIDGE_RPC_SHAPE_DIAGNOSTIC=false
 ```
 
 Flags alone cannot enable delivery. The default runtime still requires an
-authoritative current-grant reader for the access adapter and a supported Friday sender binding.
-Native callback configuration requires a securely supplied32-byte AES-GCM
+valid JWT-bound lease metadata, callback protection and a supported Friday sender/access binding.
+Native callback configuration requires a securely supplied 32-byte AES-GCM
 protector key. No placeholder allow-all adapter, relay or polling listener is
 acceptable. Do not generate a new credential merely to inspect a setup flow.
 
 ## Native receivers
 
 Jarvis must discover MCP2026-07-28 Events, list `bridge.message.received`, and
-establish a native persistent subscription with arguments `recipient:"jarvis"`
-and `ttlMs:null`. The host supplies its callback URL and signing secret in the
+establish a native subscription with arguments `recipient:"jarvis"` and
+`ttlMs:null`. The server grants a finite token-bounded `refreshBefore`; the host
+must renew using fresh verified authority. The host supplies its callback URL and signing secret in the
 authenticated handshake. Never ask for that secret in chat.
 
 The current Friday UI exposes a Routines list and the existing email routine's

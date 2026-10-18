@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { BridgeError, SCOPES } from './policy.mjs';
 import { callbackUrl, validSecret, signedHeaders } from './webhook.mjs';
+import { verifiedLease, resourceDenied, validLeaseMetadata, subscriptionAccessAllowed } from './access.mjs';
 
 const fail = (code, status = 400) => { throw new BridgeError(code, status); };
 export const EVENT_NAME = 'bridge.message.received';
@@ -33,13 +34,10 @@ function identity(principal, params, subscribing) {
   const id = 'sub_' + digest(JSON.stringify([principal.principalKey, url, EVENT_NAME, { recipient: 'jarvis' }]));
   return { id, url };
 }
-export function isActive(subscription, now) {
-  return subscription?.active && (subscription.expiresAt === null || now < subscription.expiresAt);
-}
-
 export class NativeEvents {
-  constructor({ store, protector, transport, enabled = false, clock = Date.now }) {
+  constructor({ store, protector, transport, policyId, enabled = false, clock = Date.now }) {
     this.store = store; this.protector = protector; this.transport = transport; this.enabled = enabled; this.clock = clock;
+    this.policyId = policyId;
   }
   list(principal, params = {}) {
     authorizeRecipient(principal, 'jarvis'); ownKeys(params, ['cursor'], []);
@@ -51,12 +49,26 @@ export class NativeEvents {
     if (!this.enabled || !this.store || !this.protector || !this.transport) fail('events_not_enabled', 503);
     const secret = validSecret(params.delivery.secret);
     const now = this.clock();
-    const ttl = params.ttlMs === null ? null : params.ttlMs === undefined ? 86400000 : params.ttlMs;
-    if (ttl !== null && (!Number.isSafeInteger(ttl) || ttl <= 0)) fail('invalid_params');
-    const expiresAt = ttl === null ? null : now + Math.max(60000, Math.min(ttl, 7 * 86400000));
+    const authorization = verifiedLease(principal, this.policyId, now);
+    const ttl = params.ttlMs === null ? 7 * 86400000 : params.ttlMs === undefined ? 86400000 : params.ttlMs;
+    if (!Number.isSafeInteger(ttl) || ttl <= 0) fail('invalid_params');
+    const requestedUntil = Math.min(now + Math.min(ttl, 7 * 86400000), authorization.tokenExpiresAt);
+    const deadline = (state, existing, at) => {
+      verifiedLease(principal, this.policyId, at);
+      if (resourceDenied(state, principal.principalKey)) fail('access_revoked', 403);
+      if (existing && (!validLeaseMetadata(existing, this.policyId) || existing.owner !== principal.principalKey))
+        fail('authorization_lease_required', 403);
+      if (existing && (existing.status !== 'active' || !existing.active)) fail('subscription_inactive', 403);
+      if (existing && authorization.tokenExpiresAt < existing.authorization.tokenExpiresAt) fail('stale_authorization', 403);
+      const until = existing && authorization.tokenExpiresAt === existing.authorization.tokenExpiresAt
+        ? Math.min(requestedUntil, existing.expiresAt) : requestedUntil;
+      if (until <= at) fail('subscription_expired', 409);
+      return until;
+    };
     const fingerprint = digest(secret);
     const cached = await this.store.transaction(s => {
       const existing = s.subscriptions[id];
+      deadline(s, existing, this.clock());
       return existing?.verifiedUntil > now && existing.fingerprint === fingerprint && existing.active;
     });
     if (!cached) {
@@ -80,28 +92,31 @@ export class NativeEvents {
       }
     }
     // A slow verification cannot activate a subscription after its lifetime.
-    const savedAt = this.clock();
-    if (expiresAt !== null && expiresAt <= savedAt) fail('subscription_expired', 409);
-    await this.store.transaction(s => {
+    const expiresAt = await this.store.transaction(s => {
+      const savedAt = this.clock();
       const old = s.subscriptions[id];
+      const until = deadline(s, old, savedAt);
       let previous = [];
       if (old?.fingerprint !== fingerprint && old?.sealed) {
         const prior = this.protector.open(old.sealed, id);
         previous = [{ secret: prior.secret, until: savedAt + 300000 }];
       } else if (old?.sealed) previous = this.protector.open(old.sealed, id).previous || [];
       const sealed = this.protector.seal({ url, secret, previous: previous.filter(x => x.until > savedAt) }, id);
+      deadline(s, old, this.clock());
       s.subscriptions[id] = { id, owner: principal.principalKey, recipient: 'jarvis', name: EVENT_NAME,
-        arguments: { recipient: 'jarvis' }, active: true, expiresAt, sealed, fingerprint,
+        arguments: { recipient: 'jarvis' }, active: true, status: 'active', expiresAt: until, authorization, sealed, fingerprint,
         verifiedUntil: savedAt + 300000 };
+      return until;
     });
-    return { id, refreshBefore: expiresAt === null ? null : new Date(expiresAt).toISOString(), cursor: null, truncated: false };
+    return { id, refreshBefore: new Date(expiresAt).toISOString(), cursor: null, truncated: false };
   }
   async unsubscribe(principal, params) {
     const { id } = identity(principal, params, false);
     if (!this.store) fail('storage_configuration_required', 503);
     await this.store.transaction(s => {
       const subscription = s.subscriptions[id];
-      if (subscription?.owner === principal.principalKey) subscription.active = false;
+      if (subscription?.owner === principal.principalKey) { subscription.active = false; subscription.status = 'unsubscribed'; }
+      else if (!subscription) s.subscriptions[id] = { id, owner: principal.principalKey, recipient: 'jarvis', active: false, status: 'unsubscribed' };
     });
     return {};
   }
@@ -110,7 +125,7 @@ export class NativeEvents {
 // Called only inside a message transaction, after its durable identity exists.
 export function appendDeliveryJobs(state, envelope, now) {
   const destinations = envelope.to === 'jarvis'
-    ? Object.values(state.subscriptions).filter(sub => sub.recipient === 'jarvis' && isActive(sub, now))
+    ? Object.values(state.subscriptions).filter(sub => subscriptionAccessAllowed(state, sub, sub.authorization?.policyId, now))
     : [{ id: 'friday', recipient: 'friday' }];
   const jobIds = [];
   for (const sub of destinations) {

@@ -13,6 +13,11 @@ export const SCOPES = Object.freeze({
   friday: { probe: 'bridge:send:jarvis', ack: 'bridge:ack:friday' },
   jarvis: { probe: 'bridge:send:friday', ack: 'bridge:ack:jarvis' },
 });
+export const VERIFIED_AUTHORIZATION = Symbol('verified bridge authorization');
+export function authorizationPolicyId({ issuer, audience, subject, subjectHash, role, scopeClaim = 'scope', algorithms = ['RS256'] }) {
+  const pin = subject ? createHash('sha256').update(subject).digest('hex') : subjectHash;
+  return createHash('sha256').update(JSON.stringify([issuer, audience, pin, role, scopeClaim, algorithms])).digest('hex');
+}
 
 // JWT audience and scope-claim settings must be confirmed against Clerk's actual
 // issued test token via safe SDK output before enabling a live route. Values in
@@ -53,7 +58,11 @@ export function createAccessVerifier({ issuer, audience, subject, subjectHash, r
     }
     // Return minimal verified policy context, never the token or full claims.
     const principalKey = createHash('sha256').update(JSON.stringify([issuer, audience, payload.sub, role])).digest('hex');
-    return Object.freeze({ role, scopes: Object.freeze([...new Set(scopes)]), principalKey });
+    const principal = { role, scopes: Object.freeze([...new Set(scopes)]), principalKey };
+    // Internal expiry only. Hard subscription deadlines never inherit tolerance.
+    Object.defineProperty(principal, VERIFIED_AUTHORIZATION, { value: Object.freeze({ expiresAt: payload.exp * 1000,
+      policyId: authorizationPolicyId({ issuer, audience, subject, subjectHash, role, scopeClaim, algorithms }) }) });
+    return Object.freeze(principal);
   };
 }
 

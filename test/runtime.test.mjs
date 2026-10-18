@@ -129,9 +129,9 @@ test('runtime requires real subject/claim contract, verifies audience, and block
   const wrong = await rt.handler('jarvis')(request('/bridge/jarvis/mcp', { headers: { ...headers, authorization: `Bearer ${token}` } }));
   assert.equal(wrong.status, 401);
 });
-test('runtime checks current Jarvis grant before persistent subscription while sends and queue remain disabled', async () => {
+test('runtime bounds Jarvis subscription by verified expiry and durable denial while sends and queue remain disabled', async () => {
   const { publicKey, privateKey } = await generateKeyPair('RS256');
-  let document = emptyState(), challenges = 0, queueSends = 0, revoked = false;
+  let document = emptyState(), challenges = 0, queueSends = 0;
   class FakePool {
     on() {}
     async connect() { return { release() {}, async query(sql, params) {
@@ -145,9 +145,6 @@ test('runtime checks current Jarvis grant before persistent subscription while s
     BRIDGE_SUBSCRIPTION_STORAGE_KEY: randomBytes(32).toString('base64'),
     DATABASE_URL: 'postgresql://fixture:fixture@fixture.neon.tech/neondb?sslmode=require' },
     Pool: FakePool, keyResolver: publicKey,
-    readCurrentGrant: async query => ({ active: true, revoked, issuer: ISSUER,
-      clientId: query.clientId, resource: resourceFor('jarvis'), subject: 'fixture-subject',
-      scopes: ['bridge:ack:jarvis'], checkedAt: Date.now(), expiresAt: Date.now() + 60000 }),
     queueClient: { async send() { queueSends++; } }, transportFactory: () => async (_url, req) => {
       challenges++; const body = JSON.parse(req.body); assert.equal(body.type, 'verification');
       return { status: 200, body: JSON.stringify({ challenge: body.challenge }) };
@@ -159,10 +156,10 @@ test('runtime checks current Jarvis grant before persistent subscription while s
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) }));
   const subscribed = await (await rpc('events/subscribe', { name: 'bridge.message.received', arguments: { recipient: 'jarvis' },
     delivery: { mode: 'webhook', url: 'https://callback.example.test/events', secret: 'whsec_' + randomBytes(32).toString('base64') }, ttlMs: null })).json();
-  assert.equal(subscribed.result.refreshBefore, null); assert.equal(challenges, 1);
+  assert.ok(Date.parse(subscribed.result.refreshBefore) <= Date.now() + 300000); assert.equal(challenges, 1);
   assert.equal(Object.keys(document.subscriptions).length, 1);
   assert.equal(Object.values(document.subscriptions)[0].active, true);
-  revoked = true;
+  document.resourceDenials = { [Object.values(document.subscriptions)[0].owner]: { status: 'denied' } };
   const denied = await rpc('events/subscribe', { name: 'bridge.message.received', arguments: { recipient: 'jarvis' },
     delivery: { mode: 'webhook', url: 'https://callback.example.test/events', secret: 'whsec_' + randomBytes(32).toString('base64') }, ttlMs: null });
   assert.equal(denied.status, 403); assert.equal((await denied.json()).error.message, 'access_revoked');

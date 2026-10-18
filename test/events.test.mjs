@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { Webhook } from 'standardwebhooks';
-import { BridgeError, SCOPES } from '../src/policy.mjs';
+import { BridgeError, SCOPES, VERIFIED_AUTHORIZATION } from '../src/policy.mjs';
 import { MemoryStore, PostgresStore } from '../src/store.mjs';
 import { NativeEvents, EVENT_NAME } from '../src/events.mjs';
 import { Bridge } from '../src/bridge.mjs';
@@ -14,8 +14,10 @@ import { callbackUrl, validSecret, publicAddress, createPublicWebhookTransport, 
 
 // All callback domains and identities below are fake. Fake transports never
 // perform a network operation. Keys exist only in process and authorize nothing.
-const principal = role => ({ role, principalKey: (role === 'jarvis' ? 'a' : 'b').repeat(64),
-  scopes: Object.values(SCOPES[role]) });
+const policyId = 'd'.repeat(64);
+const principal = role => Object.defineProperty({ role, principalKey: (role === 'jarvis' ? 'a' : 'b').repeat(64),
+  scopes: Object.values(SCOPES[role]) }, VERIFIED_AUTHORIZATION,
+  { value: { policyId, expiresAt: Date.now() + 2 * 86400000 } });
 const jarvis = principal('jarvis'), friday = principal('friday');
 const now = Date.now();
 const secret = () => 'whsec_' + randomBytes(32).toString('base64');
@@ -36,10 +38,10 @@ async function fixture({ responseStatus = 202 } = {}) {
     return { status: data.type === 'verification' ? 200 : responseStatus,
       body: data.type === 'verification' ? JSON.stringify({ challenge: data.challenge }) : '' };
   };
-  const events = new NativeEvents({ store, protector, transport, enabled: true, clock });
+  const events = new NativeEvents({ store, protector, transport, policyId, enabled: true, clock });
   const key = secret(); const subscription = await events.subscribe(jarvis, params(key));
   const bridge = new Bridge({ store, clock });
-  return { store, protector, calls, events, key, subscription, bridge, clock,
+  return { store, protector, calls, events, key, subscription, bridge, clock, policyId,
     advance: ms => { time += ms; }, transport };
 }
 
@@ -90,7 +92,7 @@ test('mixed public/private DNS responses fail before any socket opens', async ()
 });
 test('failed callback verification never activates a subscription and returns categorized MCP error', async () => {
   const store = new MemoryStore();
-  const events = new NativeEvents({ store, protector: createProtector(randomBytes(32)), enabled: true,
+  const events = new NativeEvents({ store, protector: createProtector(randomBytes(32)), policyId, enabled: true,
     transport: async () => ({ status: 200, body: '{"challenge":"wrong"}' }) });
   await assert.rejects(events.subscribe(jarvis, params(secret())), e => e.rpcCode === -32015 && e.reason === 'challenge_failed');
   assert.deepEqual(store.snapshot().subscriptions, {});
@@ -99,7 +101,7 @@ test('verified subscription is scoped, deterministic, encrypted and cached; refr
   const f = await fixture();
   new Webhook(f.key).verify(f.calls[0].body, f.calls[0].headers);
   const first = await f.events.subscribe(jarvis, params(f.key));
-  assert.equal(first.id, f.subscription.id); assert.equal(first.refreshBefore, null); assert.equal(f.calls.length, 1);
+  assert.equal(first.id, f.subscription.id); assert.ok(Date.parse(first.refreshBefore) > now); assert.equal(f.calls.length, 1);
   const replacement = secret();
   const second = await f.events.subscribe(jarvis, params(replacement));
   assert.equal(second.id, first.id); assert.equal(f.calls.length, 2);

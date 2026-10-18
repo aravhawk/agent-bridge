@@ -89,7 +89,7 @@ ready. Refresh the managed app's tool list after a backend tool change.
 
 Jarvis's persistent native Events subscription,
 Friday's supported incoming webhook authentication/secret handoff, current
-authorization/revocation binding, callback protection key binding and the native
+callback protection key binding, supported Friday authorization and the native
 post-expiry refresh test remain separate acceptance requirements. A discovered
 tool, HTTP acceptance or caller-reported turn ID does not prove a hosted wake.
 See `docs/configuration.md` before enabling either setup or delivery.

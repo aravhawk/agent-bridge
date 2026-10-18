@@ -1,16 +1,17 @@
 import { randomUUID } from 'node:crypto';
 import { BridgeError } from './policy.mjs';
-import { isActive } from './events.mjs';
+import { subscriptionAccessAllowed } from './access.mjs';
 import { signedHeaders } from './webhook.mjs';
 
 const transient = status => status === 408 || status === 429 || (status >= 500 && status <= 599);
 const backoff = attempt => Math.min(60000, 1000 * (2 ** Math.min(attempt - 1, 6)));
 
 export class DeliveryWorker {
-  constructor({ store, protector, transport, fridaySender, accessAllowed, enabled = false, clock = Date.now,
+  constructor({ store, protector, transport, fridaySender, accessAllowed, policyId, enabled = false, clock = Date.now,
     maxAttempts = 5, leaseMs = 30000 }) {
     this.store = store; this.protector = protector; this.transport = transport; this.fridaySender = fridaySender;
     this.accessAllowed = accessAllowed; this.enabled = enabled; this.clock = clock;
+    this.policyId = policyId;
     this.maxAttempts = maxAttempts; this.leaseMs = leaseMs;
   }
   // One queue job dispatches one attempt. There is no loop, interval, timer,
@@ -26,7 +27,8 @@ export class DeliveryWorker {
         job.state = 'dead'; job.lastError = 'attempt_limit'; return null;
       }
       const sub = job.subscriptionId ? state.subscriptions[job.subscriptionId] : null;
-      if (job.subscriptionId && !isActive(sub, now)) {
+      if (job.subscriptionId && (job.recipient !== sub?.recipient || job.subscriptionId !== sub?.id ||
+          !subscriptionAccessAllowed(state, sub, this.policyId, this.clock()))) {
         job.state = 'dead'; job.lastError = 'subscription_inactive'; return null;
       }
       job.state = 'leased'; job.leaseId = randomUUID(); job.leaseUntil = now + this.leaseMs; job.attempts++;
@@ -36,10 +38,10 @@ export class DeliveryWorker {
     const { job, subscription } = claimed;
     let accepted = false; let retry = false; let code = 'delivery_configuration_required'; let status = null;
     try {
-      // Required live authorizer rechecks grants/resource access. No configured
-      // callback is trusted solely because it was subscribed in the past.
-      if (!this.accessAllowed || !(await this.accessAllowed({ owner: subscription?.owner,
-        recipient: job.recipient, subscriptionId: subscription?.id, messageId: job.messageId }))) {
+      // Jarvis uses a finite verified-token lease plus durable resource denial.
+      // Friday additionally requires its separately verified native authorizer.
+      if ((!subscription && !this.accessAllowed) || (this.accessAllowed && !(await this.accessAllowed({ owner: subscription?.owner,
+        recipient: job.recipient, subscriptionId: subscription?.id, messageId: job.messageId })))) {
         code = 'access_revoked';
       } else {
         // Recheck current DB state after asynchronous access validation. It is
@@ -49,8 +51,9 @@ export class DeliveryWorker {
           const activeJob = state.jobs[jobId];
           const activeSub = subscription ? state.subscriptions[subscription.id] : null;
           if (activeJob?.leaseId !== job.leaseId || activeJob.state !== 'leased' || activeJob.leaseUntil <= this.clock() ||
-              (subscription && !isActive(activeSub, this.clock()))) return null;
-          return { subscription: activeSub };
+              (subscription && (activeJob.recipient !== activeSub?.recipient ||
+                !subscriptionAccessAllowed(state, activeSub, this.policyId, this.clock())))) return null;
+          return { subscription: activeSub, resourceDenials: state.resourceDenials };
         });
         if (!current) code = 'subscription_inactive';
         else {
@@ -59,6 +62,8 @@ export class DeliveryWorker {
             if (!this.protector || !this.transport) throw new BridgeError('delivery_configuration_required', 503);
             const config = this.protector.open(current.subscription.sealed, subscription.id);
             const when = this.clock();
+            if (!subscriptionAccessAllowed(current, current.subscription, this.policyId, when))
+              throw new BridgeError('authorization_lease_expired', 403);
             const secrets = [config.secret, ...(config.previous || []).filter(x => x.until > when).map(x => x.secret)];
             response = await this.transport(config.url, { body: job.body,
               headers: signedHeaders({ id: job.eventId, body: job.body, secrets, subscriptionId: subscription.id, now: when }) });
@@ -81,9 +86,10 @@ export class DeliveryWorker {
     const completedAt = this.clock();
     const saved = await this.store.transaction(state => {
       const activeJob = state.jobs[jobId];
-      if (activeJob?.leaseId !== job.leaseId || activeJob.state !== 'leased') return false;
+      if (activeJob?.leaseId !== job.leaseId || activeJob.state !== 'leased' || activeJob.leaseUntil <= this.clock()) return false;
       const sub = subscription ? state.subscriptions[subscription.id] : null;
-      if (subscription && !isActive(sub, completedAt)) { accepted = false; retry = false; code = 'subscription_inactive'; }
+      if (subscription && (activeJob.recipient !== sub?.recipient ||
+          !subscriptionAccessAllowed(state, sub, this.policyId, this.clock()))) { accepted = false; retry = false; code = 'subscription_inactive'; }
       activeJob.state = accepted ? 'accepted' : retry && activeJob.attempts < this.maxAttempts ? 'pending' : 'dead';
       activeJob.lastError = code; activeJob.lastStatus = status;
       activeJob.dueAt = completedAt + backoff(activeJob.attempts);
