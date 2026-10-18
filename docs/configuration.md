@@ -80,7 +80,28 @@ histories, session dumps, browser state, screenshots, environment pulls, real
 callback secrets, auth URLs containing flow parameters, or unrelated artifacts.
 The history audit prints rule names and paths, never matching secret values.
 
-CI uses no deployment secret and runs no remote/native test. Existing Vercel
-GitHub permissions can see this private repository. Linking must target the
-existing isolated project; if a new GitHub/Vercel installation grant appears,
-review its exact scope before accepting it. Do not create another Vercel project.
+CI uses no deployment secret and runs no remote/native test. The existing
+Vercel project is connected to `aravhawk/jarvis-friday-bridge` through its
+already-authorized GitHub installation. The saved dashboard connection was
+verified after navigating away and back; no new grant or sign-in was needed.
+Production tracks `main`; Root Directory is blank (repository root), Framework
+Other, Node.js 24.x, with no build/output/install command overrides. The root's
+`api/`, `package.json` and `vercel.json` match those settings. Do not create
+another Vercel project or expand installation permissions for this setup.
+
+Linking did not start a deployment. The initial repository commit passed 59
+local/CI tests and staged/history secret scans. All 34 credential-free remote
+checks passed after linking: 11 bridge authentication/metadata/boundary checks,
+12 original health-only MCP checks and 11 rejecting OAuth diagnostic checks.
+These checks verify public behavior, tool discovery and `probe_health`, and
+that invalid or unauthenticated bridge requests fail closed. They do not prove
+native OAuth refresh, authenticated Events subscription, durable delivery or a
+hosted wake. Those remain gated by the acceptance requirements above.
+
+For a Git-triggered release, match the deployment's Git SHA to the pushed
+`main` commit and require Ready status on the same existing project. Confirm
+the canonical URL still points to that deployment, run `npm run check:remote`,
+and verify delivery/subscriptions and temporary diagnostics remain false.
+Remote reports belong in ignored `.reports/remote/`, not in Git. Investigate
+build failures only within this project's deployment configuration; never
+alter OAuth URLs, read secrets or enable delivery to make a build pass.

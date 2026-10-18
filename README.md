@@ -63,10 +63,20 @@ integration identities. Do not rename the Vercel project, aliases or clients
 merely to match this repository.
 
 Only **Arav's Projects**, team `team_rCVvKJ5rUgNP0LOPEwzfyl0z`, project
-`prj_U4y7PBcoZN3cI2bE3NLE2GZGBFIG`, is in scope. Link the repository to that
-existing project using its Git settings; do not import it as a second project.
-The root directory is this repository root. Preserve Production secrets and all
+`prj_U4y7PBcoZN3cI2bE3NLE2GZGBFIG`, is in scope. This repository is linked to
+that existing project; do not import it as a second project. Its Git settings
+now show `aravhawk/jarvis-friday-bridge` connected using the existing GitHub
+installation, with no new grant. Production tracks `main`. The root directory
+is this repository root, Framework is Other, Node.js is 24.x, and build, output
+and install commands use their defaults. Preserve Production secrets and all
 disabled delivery gates. Do not change another project's Git connection.
+
+The initial source commit passed all 59 local/CI tests and the staged/history
+secret scans. After linkage, all 34 credential-free endpoint checks passed;
+linking itself did not trigger a build. The first subsequent push to `main`
+must verify a Git deployment's exact commit, Ready status, canonical URL and
+the same endpoint checks. See `docs/configuration.md` for the verification
+limits and disabled runtime gates.
 
 ## Remaining acceptance work
 
