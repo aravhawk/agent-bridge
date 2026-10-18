@@ -41,7 +41,7 @@ These checks do not send real credentials, create grants or deliver events.
 | `schema.sql` | Existing isolated database schema; no automatic migrations |
 | `vercel.json` | Existing iad1/Node runtime and private queue configuration |
 | `.env.example` | Blank secret slots and nonsecret public connection settings |
-| `docs/source-provenance.json` | Production source reconciliation and plugin identity |
+| `docs/source-provenance.json` | Initial production source reconciliation and portable plugin identity |
 | `docs/configuration.md` | Runtime boundaries and current connection requirements |
 | `scripts/package_plugin.py` | Package the existing plugin without creating a duplicate |
 
@@ -80,7 +80,14 @@ limits and disabled runtime gates.
 
 ## Remaining acceptance work
 
-Actual Jarvis OAuth/discovery and its persistent native Events subscription,
+Jarvis native OAuth and discovery are verified through the managed custom MCP
+app. Its authenticated no-argument `bridge_health` tool checks nonsecret
+configuration readiness without storage, message or event operations. It uses
+the existing resource policy and directional scopes; no new OAuth scope is
+needed. A healthy response does not imply that delivery or subscriptions are
+ready. Refresh the managed app's tool list after a backend tool change.
+
+Jarvis's persistent native Events subscription,
 Friday's supported incoming webhook authentication/secret handoff, current
 authorization/revocation binding, callback protection key binding and the native
 post-expiry refresh test remain separate acceptance requirements. A discovered

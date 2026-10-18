@@ -21,8 +21,55 @@ allowlist. Public client IDs and resource URLs are not credentials.
 
 Jarvis uses OIDC disabled and no identity/metadata scopes. Custom directional
 scopes are intentionally not advertised globally, but assigned to each client.
-Actual native Friday authentication and five-tool discovery were verified;
-Jarvis's native grant and authenticated Events readiness remain pending.
+Actual native Friday authentication and bridge-tool discovery were verified.
+Jarvis's managed custom MCP grant, original five tools and event discovery are
+also verified. Persistent native Events subscription remains pending.
+
+Managed Jarvis plugin: `plugin_asdk_app_6ad53911909481919c20dfb6f8d3fb51`;
+connector: `asdk_app_6ad53911909481919c20dfb6f8d3fb51`. This is the connected
+custom MCP registration; the portable plugin in `plugin/` is a separate source
+package. Do not create a duplicate registration to refresh tools.
+
+## Authenticated health and current access
+
+`bridge_health` accepts `{}` and requires the existing verified resource
+identity plus at least one role-specific bridge scope. It returns successful
+MCP content containing only authenticated status, server version and nonsecret
+configuration/readiness booleans. It does not initialize the database, mutate
+state, access messages, check the grant provider, enqueue jobs or send a
+callback. Normal JWT verification retains the existing provider JWKS resolver;
+the health operation adds no outbound call. `storageConfigured` reports binding
+presence, not a database connectivity check. `subscriptionSetupEnabled` and
+`deliveryEnabled` report effective gates, not successful subscription or wake.
+
+After a deployment adding the tool, refresh the existing custom app's action
+list in its management UI (if offered), or start a new host turn and rediscover
+the existing connector. Verify `bridge_health` is exposed, then invoke it once
+with `{}` through that same connector. Do not replace this with the public
+health endpoint or count `message_not_found` as successful tool execution.
+No OAuth reconnection or expanded grant is required by this backend change.
+
+`src/access.mjs` implements a Jarvis-only current-access adapter. Every check
+requires a trusted `readCurrentGrant` integration and matches the pinned
+subject, issuer, client `f58dfaNi1qX2vtdx`, exact Jarvis resource, acknowledgment
+scope, active/unrevoked state, future expiry and freshly checked facts. The
+owner must match the verified principal digest. Wrong or absent facts and
+provider errors return false. Facts are never accepted from tool arguments or
+saved JWT assertions, and no raw identity, token or provider error is logged.
+
+The reader contract returns `{active, revoked, issuer, clientId, resource,
+subject, scopes, checkedAt, expiresAt}` internally; timestamps are epoch
+milliseconds. It must query an authoritative current grant/revocation source on
+each call. The adapter does not establish that source or create a credential.
+Production currently has no reader bound and reports
+`currentAccessCheckConfigured:false`; therefore subscriptions and delivery
+remain closed. Do not bind a placeholder reader or treat signature validity
+as current OAuth revocation evidence. A supported provider read source and any
+required least-privilege credential must be reviewed before provisioning it.
+
+The adapter is checked before native subscription callback/storage work and
+again by the worker before Jarvis delivery. It deliberately denies Friday
+delivery; that requires a separately verified sender/access binding.
 
 ## Runtime storage and gates
 
@@ -48,7 +95,7 @@ BRIDGE_RPC_SHAPE_DIAGNOSTIC=false
 ```
 
 Flags alone cannot enable delivery. The default runtime still requires an
-actual current-access/revocation adapter and a supported Friday sender binding.
+authoritative current-grant reader for the access adapter and a supported Friday sender binding.
 Native callback configuration requires a securely supplied32-byte AES-GCM
 protector key. No placeholder allow-all adapter, relay or polling listener is
 acceptable. Do not generate a new credential merely to inspect a setup flow.

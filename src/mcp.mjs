@@ -9,6 +9,7 @@ const envelopeSchema = object({ id: idSchema, testId: { const: 'RN-JARVIS-FRIDAY
 const tool = (name, description, inputSchema, readOnly = false) => ({ name, description, inputSchema,
   annotations: { readOnlyHint: readOnly, destructiveHint: false, idempotentHint: true, openWorldHint: false } });
 const tools = [
+  tool('bridge_health', 'Check authenticated bridge configuration without reading messages, storing state or sending events.', object({}), true),
   tool('bridge_send', 'Store a fixed synthetic probe for the other test assistant. No arbitrary text or actions.', envelopeSchema),
   tool('bridge_read', 'Read the stored synthetic message identified by the native received event. Never use to poll.', object({ messageId: idSchema }), true),
   tool('bridge_receipt_claim', 'Claim this received message for one hosted turn, with a short recovery lease.', object({ messageId: idSchema })),
@@ -16,8 +17,10 @@ const tools = [
     object({ messageId: idSchema, claimId: idSchema, hostedEventId: { type: ['string', 'null'], maxLength: 160 }, hostedTurnId: { type: ['string', 'null'], maxLength: 160 } })),
   tool('bridge_status', 'Inspect one known synthetic message during an explicit diagnostic. HTTP receipt alone never verifies wake.', object({ messageId: idSchema }), true),
 ];
-function allowedTools(principal) {
-  return tools.filter(t => t.name === 'bridge_send' ? principal.scopes.includes(SCOPES[principal.role].probe)
+function allowedTools(principal, health) {
+  return tools.filter(t => t.name === 'bridge_health'
+    ? typeof health === 'function' && Object.values(SCOPES[principal.role]).some(s => principal.scopes.includes(s))
+    : t.name === 'bridge_send' ? principal.scopes.includes(SCOPES[principal.role].probe)
     : t.name === 'bridge_status' || principal.scopes.includes(SCOPES[principal.role].ack));
 }
 const json = (body, status = 200) => new Response(JSON.stringify(body), { status,
@@ -56,7 +59,7 @@ async function boundedJson(request) {
 // Mount only at NEW authenticated bridge paths. This module does not alter the
 // existing health /mcp, create a provider, issue tokens, or register a plugin.
 export function createMcpHandler({ enabled = false, verify, bridge, events, scheduleJobs, resourceMetadataUrl,
-  observeValidationFailure }) {
+  observeValidationFailure, health }) {
   return async request => {
     let id = null, input, stage = 'before_authenticated_body';
     try {
@@ -95,16 +98,17 @@ export function createMcpHandler({ enabled = false, verify, bridge, events, sche
             serverInfo: { name: 'rn-jarvis-friday-synthetic-bridge', version: '0.1.0' } };
           break;
         case 'ping': ownKeys(params, [], []); result = {}; break;
-        case 'tools/list': ownKeys(params, [], []); result = { tools: allowedTools(principal) }; break;
+        case 'tools/list': ownKeys(params, [], []); result = { tools: allowedTools(principal, health) }; break;
         case 'events/list': result = events.list(principal, params); break;
         case 'events/subscribe': result = await events.subscribe(principal, params); break;
         case 'events/unsubscribe': result = await events.unsubscribe(principal, params); break;
         case 'tools/call': {
           ownKeys(params, ['name', 'arguments']);
-          if (!allowedTools(principal).some(t => t.name === params.name)) throw new BridgeError('tool_not_available', 403);
+          if (!allowedTools(principal, health).some(t => t.name === params.name)) throw new BridgeError('tool_not_available', 403);
           stage = 'tool_arguments';
           let output;
           switch (params.name) {
+            case 'bridge_health': ownKeys(params.arguments, [], []); output = await health(); break;
             case 'bridge_send': output = await bridge.send(principal, params.arguments); break;
             case 'bridge_read': output = await bridge.read(principal, params.arguments); break;
             case 'bridge_receipt_claim': authorizeRecipient(principal); output = await bridge.claim(principal, params.arguments); break;

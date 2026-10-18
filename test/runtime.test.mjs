@@ -118,18 +118,20 @@ test('runtime requires real subject/claim contract, verifies audience, and block
   const token = await new SignJWT({ scope: 'bridge:send:jarvis bridge:ack:friday' }).setProtectedHeader({ alg: 'RS256' })
     .setIssuer(ISSUER).setSubject('fixture-subject').setAudience(resourceFor('friday')).setIssuedAt().setExpirationTime('5m').sign(privateKey);
   const handler = rt.handler('friday');
-  assert.equal(new URL(poolOptions.connectionString).searchParams.get('sslmode'), 'verify-full');
+  assert.equal(poolOptions, undefined); // Discovery/health never initialize storage.
   const call = (method, params) => handler(request('/bridge/friday/mcp', { headers: { ...headers, authorization: `Bearer ${token}` },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) }));
-  assert.equal((await (await call('tools/list')).json()).result.tools.length, 5);
+  assert.equal((await (await call('tools/list')).json()).result.tools.length, 6);
   const response = await call('tools/call', { name: 'bridge_send', arguments: {} });
   assert.equal(response.status, 503); assert.equal((await response.json()).error.message, 'receiver_readiness_required');
+  const lookup = await call('tools/call', { name: 'bridge_status', arguments: { messageId: '00000000-0000-4000-8000-000000000001' } });
+  assert.equal(lookup.status, 503); assert.equal(new URL(poolOptions.connectionString).searchParams.get('sslmode'), 'verify-full');
   const wrong = await rt.handler('jarvis')(request('/bridge/jarvis/mcp', { headers: { ...headers, authorization: `Bearer ${token}` } }));
   assert.equal(wrong.status, 401);
 });
-test('runtime can verify a persistent native subscription while actual sends and queue scheduling remain disabled', async () => {
+test('runtime checks current Jarvis grant before persistent subscription while sends and queue remain disabled', async () => {
   const { publicKey, privateKey } = await generateKeyPair('RS256');
-  let document = emptyState(), challenges = 0, queueSends = 0;
+  let document = emptyState(), challenges = 0, queueSends = 0, revoked = false;
   class FakePool {
     on() {}
     async connect() { return { release() {}, async query(sql, params) {
@@ -142,7 +144,10 @@ test('runtime can verify a persistent native subscription while actual sends and
     BRIDGE_SUBSCRIPTIONS_ENABLED: 'true', BRIDGE_DELIVERY_ENABLED: 'false',
     BRIDGE_SUBSCRIPTION_STORAGE_KEY: randomBytes(32).toString('base64'),
     DATABASE_URL: 'postgresql://fixture:fixture@fixture.neon.tech/neondb?sslmode=require' },
-    Pool: FakePool, keyResolver: publicKey, accessAllowed: async () => true,
+    Pool: FakePool, keyResolver: publicKey,
+    readCurrentGrant: async query => ({ active: true, revoked, issuer: ISSUER,
+      clientId: query.clientId, resource: resourceFor('jarvis'), subject: 'fixture-subject',
+      scopes: ['bridge:ack:jarvis'], checkedAt: Date.now(), expiresAt: Date.now() + 60000 }),
     queueClient: { async send() { queueSends++; } }, transportFactory: () => async (_url, req) => {
       challenges++; const body = JSON.parse(req.body); assert.equal(body.type, 'verification');
       return { status: 200, body: JSON.stringify({ challenge: body.challenge }) };
@@ -157,6 +162,11 @@ test('runtime can verify a persistent native subscription while actual sends and
   assert.equal(subscribed.result.refreshBefore, null); assert.equal(challenges, 1);
   assert.equal(Object.keys(document.subscriptions).length, 1);
   assert.equal(Object.values(document.subscriptions)[0].active, true);
+  revoked = true;
+  const denied = await rpc('events/subscribe', { name: 'bridge.message.received', arguments: { recipient: 'jarvis' },
+    delivery: { mode: 'webhook', url: 'https://callback.example.test/events', secret: 'whsec_' + randomBytes(32).toString('base64') }, ttlMs: null });
+  assert.equal(denied.status, 403); assert.equal((await denied.json()).error.message, 'access_revoked');
+  assert.equal(challenges, 1); assert.equal(Object.keys(document.subscriptions).length, 1);
   const sent = await rpc('tools/call', { name: 'bridge_send', arguments: {} });
   assert.equal(sent.status, 503); assert.equal((await sent.json()).error.message, 'receiver_readiness_required');
   assert.deepEqual(document.messages, {}); assert.deepEqual(document.jobs, {}); assert.equal(queueSends, 0);
