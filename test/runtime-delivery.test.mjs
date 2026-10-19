@@ -12,9 +12,9 @@ import { TOPIC } from '../src/queue.mjs';
 // Fully offline native-protocol/crypto integration. FakePool and transports
 // never connect; no provider token, endpoint or credential is used or printed.
 const probeId = '00000000-0000-4000-8000-000000000021';
-async function fixture(overrides = {}) {
-  let time = Date.now(), document = emptyState();
-  const clock = () => time, queue = [], calls = [], key = 'whsec_' + randomBytes(32).toString('base64');
+async function fixture(overrides = {}, initial = {}) {
+  let time = Date.now(), document = structuredClone(initial.document || emptyState());
+  const clock = () => time, queue = [], calls = [], key = initial.key || 'whsec_' + randomBytes(32).toString('base64');
   const env = { BRIDGE_OAUTH_CONTRACT_VERIFIED: 'true', BRIDGE_ALLOWED_SUBJECT: 'fixture-subject',
     BRIDGE_SUBSCRIPTION_STORAGE_KEY: randomBytes(32).toString('base64'), BRIDGE_SUBSCRIPTIONS_ENABLED: 'true',
     BRIDGE_DELIVERY_ENABLED: 'true', DATABASE_URL: 'postgresql://fixture.neon.tech/neondb?sslmode=require',
@@ -58,7 +58,7 @@ async function fixture(overrides = {}) {
   const probe = (extra = {}) => ({ id: probeId, testId: 'RN-JARVIS-FRIDAY-SYNTHETIC', from: 'jarvis', to: 'friday',
     kind: 'probe', sentAt: new Date(time).toISOString(), marker: 'RN-SYNTHETIC-NO-ACTIONS', ...extra });
   const consume = id => rt.queueHandler()({ jobId: id }, { topicName: TOPIC, region: 'iad1', deliveryCount: 1 });
-  return { rt, env, clock, tokens, queue, calls, rpc, tool, subscribe, probe, consume,
+  return { rt, env, clock, tokens, queue, calls, rpc, tool, subscribe, probe, consume, key,
     state: () => structuredClone(document), advance: ms => { time += ms; } };
 }
 
@@ -90,6 +90,44 @@ test('real runtime wiring admits one declared probe and its single correlated AC
   assert.equal(state.messages[complete.ackMessageId].authorization.scope, 'bridge:ack:friday');
   assert.notEqual(state.messages[probeId].authorization.policyId, state.messages[complete.ackMessageId].authorization.policyId);
   for (const token of Object.values(f.tokens)) assert.equal(JSON.stringify(state).includes(token), false);
+});
+
+test('restarting in probe mode blocks unrelated queued Jarvis probes and ACKs but delivers the pinned correlated ACK', async () => {
+  const previous = await fixture({ FRIDAY_WEBHOOK_CONTRACT_VERIFIED: 'true' });
+  await previous.subscribe();
+  const oldFridayProbe = await previous.tool('friday', 'bridge_send', previous.probe({
+    id: '00000000-0000-4000-8000-000000000022', from: 'friday', to: 'jarvis' }));
+  assert.equal(oldFridayProbe.status, 200);
+  const unrelatedId = '00000000-0000-4000-8000-000000000023';
+  assert.equal((await previous.tool('jarvis', 'bridge_send', previous.probe({ id: unrelatedId }))).status, 200);
+  const oldClaim = (await previous.tool('friday', 'bridge_receipt_claim', { messageId: unrelatedId })).result.structuredContent;
+  const oldAck = (await previous.tool('friday', 'bridge_receipt_complete', { messageId: unrelatedId,
+    claimId: oldClaim.claimId, hostedEventId: null, hostedTurnId: null })).result.structuredContent;
+  assert.ok(oldAck.ackMessageId);
+  const snapshot = previous.state(); await previous.rt.close();
+
+  // Existing valid message authority, callback protector and active native
+  // lease survive deployment, but the new phase grants only the pinned pair.
+  const f = await fixture({ ...previous.env, FRIDAY_WEBHOOK_CONTRACT_VERIFIED: 'false' },
+    { document: snapshot, key: previous.key });
+  const blocked = [...snapshot.messages['00000000-0000-4000-8000-000000000022'].jobIds,
+    ...snapshot.messages[oldAck.ackMessageId].jobIds];
+  for (const id of blocked) {
+    assert.equal(snapshot.jobs[id].recipient, 'jarvis');
+    await f.consume(id);
+    assert.equal(f.state().jobs[id].state, 'dead');
+    assert.equal(f.state().jobs[id].lastError, 'access_revoked');
+  }
+  assert.equal(f.calls.length, 0);
+
+  await f.tool('jarvis', 'bridge_send', f.probe());
+  await f.consume(f.queue[0]); assert.equal(f.calls[0].recipient, 'friday');
+  const claim = (await f.tool('friday', 'bridge_receipt_claim', { messageId: probeId })).result.structuredContent;
+  const ack = (await f.tool('friday', 'bridge_receipt_complete', { messageId: probeId,
+    claimId: claim.claimId, hostedEventId: null, hostedTurnId: null })).result.structuredContent;
+  assert.ok(ack.ackMessageId); await f.consume(f.queue[1]);
+  assert.equal(f.calls[1].recipient, 'jarvis'); assert.equal(f.calls[1].body.data.messageId, ack.ackMessageId);
+  assert.equal(f.state().jobs[f.queue[1]].state, 'accepted');
 });
 
 test('probe phase rejects other new IDs and Friday-originated probes before any delivery', async () => {

@@ -121,3 +121,51 @@ test('one-probe mode blocks unrelated preexisting messages at read, claim and co
     await assert.rejects(operation(), error('contract_probe_only'));
   assert.notEqual(f.store.snapshot().receipts[f.input.id].state, 'complete');
 });
+
+// Model an asynchronous pool/row-lock wait before acquiring the synchronous
+// state transition. No storage callback itself is asynchronous.
+function waitingTransaction(store) {
+  let release, entered;
+  const waiting = new Promise(resolve => { entered = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  return { waiting, release, transaction: async operation => {
+    entered(); await gate; return store.transaction(operation);
+  } };
+}
+
+test('claim and completion recheck source expiry after a transaction-acquisition wait and never emit a late ACK', async () => {
+  for (const operation of ['claim', 'complete']) {
+    const f = fixture(); await f.bridge.send(f.sender, f.input);
+    const receiver = f.principal('friday', f.clock() + 120000);
+    const claim = operation === 'complete' ? await f.bridge.claim(receiver, { messageId: f.input.id }) : null;
+    const waiting = waitingTransaction(f.store);
+    const bridge = f.makeBridge({ store: waiting });
+    const pending = operation === 'claim' ? bridge.claim(receiver, { messageId: f.input.id })
+      : bridge.complete(receiver, { messageId: f.input.id, claimId: claim.claimId, hostedEventId: null, hostedTurnId: null });
+    const rejected = assert.rejects(pending, error('message_authorization_inactive'));
+    await waiting.waiting; f.advance(1001); waiting.release(); await rejected;
+    assert.equal(Object.keys(f.store.snapshot().messages).length, 1);
+    assert.notEqual(f.store.snapshot().receipts[f.input.id]?.state, 'complete');
+    if (operation === 'claim') assert.equal(f.store.snapshot().receipts[f.input.id], undefined);
+  }
+});
+
+test('receipt lease expiry is checked after acquiring the completion transaction', async () => {
+  const f = fixture(), who = f.principal('friday', f.clock() + 120000);
+  await f.bridge.send(f.principal('jarvis', f.clock() + 120000), f.input);
+  const claim = await f.bridge.claim(who, { messageId: f.input.id });
+  const waiting = waitingTransaction(f.store), bridge = f.makeBridge({ store: waiting });
+  const rejected = assert.rejects(bridge.complete(who, { messageId: f.input.id, claimId: claim.claimId,
+    hostedEventId: null, hostedTurnId: null }), error('stale_receipt_claim'));
+  await waiting.waiting; f.advance(60001); waiting.release(); await rejected;
+  assert.equal(Object.keys(f.store.snapshot().messages).length, 1);
+  assert.equal(f.store.snapshot().receipts[f.input.id].state, 'claimed');
+});
+
+test('new claim leases start at transaction acquisition after a valid wait', async () => {
+  const f = fixture(); await f.bridge.send(f.sender, f.input);
+  const waiting = waitingTransaction(f.store), bridge = f.makeBridge({ store: waiting });
+  const pendingClaim = bridge.claim(f.receiver, { messageId: f.input.id });
+  await waiting.waiting; f.advance(100); waiting.release(); const claim = await pendingClaim;
+  assert.equal(Date.parse(claim.leaseUntil), f.clock() + 60000);
+});

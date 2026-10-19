@@ -86,11 +86,18 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
       const message = state.messages[input.messageId];
       if (clock() >= friday.until || !messageAccessAllowed(state, message, messagePolicyIds, clock()) ||
           message.envelope.to !== input.recipient) return false;
+      const e = message.envelope;
+      // Probe scope applies to BOTH delivery legs, including jobs persisted
+      // during an earlier valid window. A current lease alone is insufficient.
+      if (friday.probeOnly && !(
+        (e.id === friday.probeId && e.kind === 'probe' && e.from === 'jarvis' && e.to === 'friday') ||
+        (e.kind === 'ack' && e.from === 'friday' && e.to === 'jarvis' && e.correlationId === friday.probeId)
+      )) return false;
       if (input.recipient === 'jarvis') {
         const sub = state.subscriptions[input.subscriptionId];
         return sub?.owner === input.owner && subscriptionAccessAllowed(state, sub, policyId, clock());
       }
-      return input.recipient === 'friday' && friday.ready && (!friday.probeOnly || input.messageId === friday.probeId);
+      return input.recipient === 'friday' && friday.ready;
     });
     const authorize = async input => (await nativeAccess(input)) && (!accessAllowed || await accessAllowed(input));
     const worker = new DeliveryWorker({ store, protector, transport, policyId, messagePolicyIds,

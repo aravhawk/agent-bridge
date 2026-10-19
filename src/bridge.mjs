@@ -69,8 +69,9 @@ export class Bridge {
     });
   }
   async claim(principal, params) {
-    ownKeys(params, ['messageId']); const now = this.clock();
+    ownKeys(params, ['messageId']);
     return this.store.transaction(state => {
+      const now = this.clock();
       const message = incoming(state, principal, params.messageId, this.probeMessageId);
       const old = state.receipts[params.messageId];
       if (old?.state === 'complete') return { duplicate: true, completed: true, ackMessageId: old.ackMessageId };
@@ -89,8 +90,8 @@ export class Bridge {
         fail('invalid_receipt_evidence');
       }
     }
-    const now = this.clock();
     return this.store.transaction(state => {
+      const now = this.clock();
       const message = incoming(state, principal, params.messageId, this.probeMessageId), original = message.envelope;
       const receipt = state.receipts[params.messageId];
       if (receipt?.owner !== principal.principalKey) fail('receipt_claim_required', 409);
