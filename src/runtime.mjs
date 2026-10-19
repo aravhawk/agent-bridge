@@ -5,7 +5,7 @@ import { createAccessVerifier, createContractObserver, BridgeError, authorizatio
 import { PostgresStore } from './store.mjs';
 import { Bridge } from './bridge.mjs';
 import { NativeEvents, authorizeRecipient } from './events.mjs';
-import { createProtector, createPublicWebhookTransport } from './webhook.mjs';
+import { createProtector, createPublicWebhookTransport, decodeStorageKey } from './webhook.mjs';
 import { DeliveryWorker } from './worker.mjs';
 import { createMcpHandler } from './mcp.mjs';
 import { createQueueAdapter } from './queue.mjs';
@@ -25,9 +25,7 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
     role: 'jarvis', subject: env.BRIDGE_ALLOWED_SUBJECT, subjectHash: env.BRIDGE_ALLOWED_SUBJECT_SHA256,
     scopeClaim: env.BRIDGE_OAUTH_SCOPE_CLAIM || 'scope' }) : null;
   function readiness() {
-    const encoded = env.BRIDGE_SUBSCRIPTION_STORAGE_KEY || '';
-    const callbackProtectorConfigured = /^[A-Za-z0-9+/]{43}=$/.test(encoded) &&
-      Buffer.from(encoded, 'base64').toString('base64') === encoded;
+    const callbackProtectorConfigured = !!decodeStorageKey(env.BRIDGE_SUBSCRIPTION_STORAGE_KEY);
     const base = contractReady && callbackProtectorConfigured && !!policyId && !!env.DATABASE_URL;
     return { storageConfigured: !!env.DATABASE_URL, callbackProtectorConfigured,
       currentAccessCheckConfigured: !!policyId,
@@ -49,9 +47,8 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
       idleTimeoutMillis: 10000, query_timeout: 10000 });
     pool.on('error', () => {}); // Never emit a credential-bearing connection error.
     store = new PostgresStore(pool); bridge = new Bridge({ store });
-    let protector;
-    const encoded = env.BRIDGE_SUBSCRIPTION_STORAGE_KEY || '';
-    if (/^[A-Za-z0-9+/]{43}=$/.test(encoded)) protector = createProtector(Buffer.from(encoded, 'base64'));
+    const storageKey = decodeStorageKey(env.BRIDGE_SUBSCRIPTION_STORAGE_KEY);
+    const protector = storageKey ? createProtector(storageKey) : undefined;
     const baseReady = contractReady && !!protector && !!policyId;
     const subscriptionSetup = baseReady && env.BRIDGE_SUBSCRIPTIONS_ENABLED === 'true';
     const delivery = baseReady && env.BRIDGE_DELIVERY_ENABLED === 'true' && typeof fridaySender === 'function' && typeof accessAllowed === 'function';

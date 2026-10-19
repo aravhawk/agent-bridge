@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { generateKeyPair, SignJWT } from 'jose';
 import { createRuntime } from '../src/runtime.mjs';
 import { ISSUER, resourceFor } from '../src/resource.mjs';
+import { decodeStorageKey, createProtector } from '../src/webhook.mjs';
 
 const digest = value => createHash('sha256').update(value).digest('hex');
 const subject = 'fixture-jarvis-subject';
@@ -67,4 +68,20 @@ test('gate flags alone cannot report subscription or delivery ready', async () =
     headers: { ...headers, authorization: 'Bearer ' + token },
     body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'events/subscribe', params: {} }) }));
   assert.equal(denied.status, 503); assert.equal((await denied.json()).error.message, 'events_not_enabled');
+});
+test('outer secret-entry whitespace normalizes consistently without accepting malformed or wrong-length keys', async () => {
+  const canonical = Buffer.alloc(32, 17).toString('base64');
+  for (const value of [canonical, canonical + '\n', ' \r\n' + canonical + '\r\n ']) {
+    const key = decodeStorageKey(value); assert.equal(key.length, 32);
+    const protector = createProtector(key), sealed = protector.seal({ fixture: true }, 'fixture-context');
+    assert.deepEqual(protector.open(sealed, 'fixture-context'), { fixture: true });
+    const { handler, sign } = await fixture({ BRIDGE_SUBSCRIPTION_STORAGE_KEY: value });
+    const out = JSON.parse((await (await handler(rpc(await sign()))).json()).result.content[0].text);
+    assert.equal(out.readiness.callbackProtectorConfigured, true);
+    assert.equal(out.readiness.subscriptionSetupEnabled, false); assert.equal(out.readiness.deliveryEnabled, false);
+    assert.equal(JSON.stringify(out).includes(canonical), false);
+  }
+  for (const value of [undefined, '', 7, 'not-base64', Buffer.alloc(31).toString('base64'),
+    Buffer.alloc(33).toString('base64'), canonical.slice(0, 10) + '\n' + canonical.slice(10),
+    canonical.slice(0, -2) + 'B=']) assert.equal(decodeStorageKey(value), undefined);
 });

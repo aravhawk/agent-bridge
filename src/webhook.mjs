@@ -96,6 +96,15 @@ export function createPublicWebhookTransport({ enabled = false, resolve = lookup
 
 // No key is generated for deployment here. A provided 32-byte key must arrive
 // through approved project Secret storage. Fixture tests use ephemeral keys.
+// Secret-entry tools commonly preserve a final newline. Normalize only outer
+// whitespace, then require canonical base64 for exactly 32 bytes in both paths.
+export function decodeStorageKey(value) {
+  if (typeof value !== 'string') return undefined;
+  const encoded = value.trim();
+  if (!/^[A-Za-z0-9+/]{43}=$/.test(encoded)) return undefined;
+  const key = Buffer.from(encoded, 'base64');
+  return key.length === 32 && key.toString('base64') === encoded ? key : undefined;
+}
 export function createProtector(key) {
   if (!(key instanceof Uint8Array) || key.length !== 32) fail('storage_key_required', 503);
   const storageKey = Buffer.from(key);
