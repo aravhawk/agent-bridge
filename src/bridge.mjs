@@ -5,6 +5,16 @@ import { appendDeliveryJobs, authorizeRecipient, ownKeys } from './events.mjs';
 const fail = (code, status = 400) => { throw new BridgeError(code, status); };
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 function messageId(value) { if (typeof value !== 'string' || !uuid.test(value)) fail('invalid_message_id'); }
+function admitProbe(state, role, now) {
+  // The verifier binds each of the two sender roles to its pinned identity.
+  // Fixed role slots avoid caller-chosen bucket keys or unbounded limiter state.
+  // This runs under the same durable row lock as message/job creation, so cold
+  // starts and concurrent function instances cannot each grant a fresh budget.
+  const admissions = state.probeAdmissions ||= {};
+  const recent = (admissions[role] || []).filter(at => at > now - 60000);
+  if (recent.length >= 10) fail('probe_rate_limited', 429);
+  admissions[role] = [...recent, now];
+}
 function incoming(state, principal, id) {
   authorizeRecipient(principal); messageId(id);
   const message = state.messages[id];
@@ -36,6 +46,10 @@ export class Bridge {
       // still conflicts, and a new stale ID is rejected.
       const saved = typeof input.id === 'string' && state.messages[input.id.toLowerCase()];
       const { envelope, hash } = validateEnvelope(input, principal, saved ? Date.parse(input.sentAt) : this.clock());
+      // Exact retransmissions stay idempotent even at the limit or after the
+      // freshness window; changed bodies still take insert's conflict path.
+      // Failed insertion rolls this admission back with the transaction.
+      if (!saved) admitProbe(state, principal.role, this.clock());
       return insert(state, envelope, hash, this.clock());
     });
   }

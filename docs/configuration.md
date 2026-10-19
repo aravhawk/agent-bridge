@@ -23,7 +23,8 @@ Jarvis uses OIDC disabled and no identity/metadata scopes. Custom directional
 scopes are intentionally not advertised globally, but assigned to each client.
 Actual native Friday authentication and bridge-tool discovery were verified.
 Jarvis's managed custom MCP grant, original five tools and event discovery are
-also verified. Persistent native Events subscription remains pending.
+also verified. Jarvis's signed native Events callback and persisted active
+subscription were verified on October 19; live renewal remains untested.
 
 Managed Jarvis plugin: `plugin_asdk_app_6ad53911909481919c20dfb6f8d3fb51`;
 connector: `asdk_app_6ad53911909481919c20dfb6f8d3fb51`. This is the connected
@@ -97,12 +98,11 @@ one of `BRIDGE_ALLOWED_SUBJECT` or `BRIDGE_ALLOWED_SUBJECT_SHA256`, never both.
 `BRIDGE_OAUTH_SCOPE_CLAIM=scope` matches the verified provider contract.
 
 `BRIDGE_OAUTH_CONTRACT_VERIFIED` is true in the existing Production runtime.
-The example file remains closed by default. These flags must remain false until
-the corresponding acceptance work is complete:
+The example file remains closed by default. The current approved gates are:
 
 ```text
 BRIDGE_DELIVERY_ENABLED=false
-BRIDGE_SUBSCRIPTIONS_ENABLED=false
+BRIDGE_SUBSCRIPTIONS_ENABLED=true
 BRIDGE_AUTH_DIAGNOSTIC=false
 BRIDGE_AUTH_TIMING_DIAGNOSTIC=false
 BRIDGE_RPC_SHAPE_DIAGNOSTIC=false
@@ -113,6 +113,33 @@ valid JWT-bound lease metadata, callback protection and a supported Friday sende
 Native callback configuration requires a securely supplied 32-byte AES-GCM
 protector key. No placeholder allow-all adapter, relay or polling listener is
 acceptable. Do not generate a new credential merely to inspect a setup flow.
+
+Subscription setup enables only the signed callback verification handshake;
+it does not enable message writes or application delivery. Preserve the current
+subscription gate while completing Friday receiver acceptance.
+
+## Probe admission and idempotence
+
+New probe IDs are limited to 10 per rolling 60 seconds for each authenticated
+sender role. The JWT verifier binds each of the two fixed role slots to the
+configured pinned subject and exact resource audience. Admission timestamps
+are stored in the existing durable aggregate under the same row lock as message
+and job creation: at most two arrays of 10 timestamps, no new service, schema,
+credential or platform rule. Concurrent function instances and restarts share
+the budget; failed insertions roll back their admission.
+
+Exact canonical retransmissions remain idempotent, including at a full budget
+or after the five-minute freshness window. Changed content for a saved ID still
+conflicts. New stale/future envelopes, unknown fields and invalid directional
+scopes fail before admission. An admitted probe may generate only its existing
+atomic single receipt ACK; ACK completion does not spend fresh-probe admission
+and cannot generate an ACK-of-ACK. A fresh-ID overflow returns HTTP 429 with
+`probe_rate_limited`, creates no message/job and makes no scheduling request.
+
+This caps accepted fresh probes, not all authenticated HTTP/duplicate traffic.
+The 32 KiB body limit, aggregate capacity limit, five actual delivery attempts
+and 20 queue-callback budget remain separate bounds. No random test is armed;
+its `sentAt` must be generated when it fires to satisfy five-minute freshness.
 
 ## Native receivers
 
@@ -163,7 +190,8 @@ hosted wake. Those remain gated by the acceptance requirements above.
 For a Git-triggered release, match the deployment's Git SHA to the pushed
 `main` commit and require Ready status on the same existing project. Confirm
 the canonical URL still points to that deployment, run `npm run check:remote`,
-and verify delivery/subscriptions and temporary diagnostics remain false.
+and verify delivery and temporary diagnostics remain false while the approved
+Jarvis subscription setup gate remains true.
 Remote reports belong in ignored `.reports/remote/`, not in Git. Investigate
 build failures only within this project's deployment configuration; never
 alter OAuth URLs, read secrets or enable delivery to make a build pass.

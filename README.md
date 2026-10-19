@@ -7,8 +7,9 @@ tests, schema and Vercel configuration.
 
 The backend accepts only the fixed synthetic envelope. Native receivers,
 subscription readiness and delivery bindings must be verified before sends.
-Delivery and subscription setup are currently disabled. No random wake test is
-armed. OAuth credentials remain in the native clients/provider; database and
+Delivery is disabled. Jarvis subscription setup is enabled and its signed
+callback/persisted subscription was verified on October 19. No random wake test
+is armed. OAuth credentials remain in the native clients/provider; database and
 runtime secrets remain in the isolated Vercel project's Production environment.
 
 ## Develop and check
@@ -87,9 +88,9 @@ the existing resource policy and directional scopes; no new OAuth scope is
 needed. A healthy response does not imply that delivery or subscriptions are
 ready. Refresh the managed app's tool list after a backend tool change.
 
-Jarvis's persistent native Events subscription,
-Friday's supported incoming webhook authentication/secret handoff, current
-callback protection key binding, supported Friday authorization and the native
+Jarvis's signed native Events subscription and callback protection are verified.
+Friday's supported incoming webhook authentication/secret handoff,
+supported Friday authorization and the native
 post-expiry refresh test remain separate acceptance requirements. A discovered
 tool, HTTP acceptance or caller-reported turn ID does not prove a hosted wake.
 See `docs/configuration.md` before enabling either setup or delivery.
