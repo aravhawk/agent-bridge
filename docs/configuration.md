@@ -29,6 +29,12 @@ fragment. A development issuer or unrelated domain is rejected. There is no
 assumed production issuer/client ID in source. The fixture identity used by
 unit tests is not a deployed or proposed provider configuration.
 
+During Clerk setup, select the subdomain-scoped Secondary application when
+offered. A Primary application may use clerk.aravhawk.com, which is outside this
+issuer constraint. Confirm the actual issuer from production metadata before
+native grants; stop if a compatible setup is unavailable instead of weakening
+the constraint or guessing DNS records.
+
 Pin the real new production user's subject using BRIDGE_ALLOWED_SUBJECT_SHA256
 as a Production Secret; do not reuse the development instance's subject pin.
 Never put raw tokens, user IDs, login flows or Secret values in source/reports.
@@ -42,7 +48,11 @@ checks real JWT signature, issuer, role audience, subject and scopes. Bootstrap
 cannot list/subscribe to events or read/write message data; authenticated
 unsubscribe remains available to honor withdrawal. It never issues/echoes tokens
 or logs claims. Require successful native health under BOTH actual clients
-before attesting the OAuth contract and refreshing the same app's tools.
+before attesting the OAuth contract and refreshing the same app's tools. Health
+accepts at least one appropriate directional scope; it does not prove both send
+AND ACK scopes. Independently verify both required scopes for each actual
+grant/token without exposing tokens/claims before attestation. If that proof is
+unavailable in the supported native flow, keep the OAuth contract unattested.
 
 Normal v1 catalog: seven Jarvis tools, six Friday tools. There is no synthetic
 bridge_send. bridge_message_send handles bounded data; read/receipt/status tools

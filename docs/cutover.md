@@ -39,6 +39,11 @@ do not treat an open-ended approval as permission for unknown replacements.
    Record the exact resulting issuer/public metadata and required auth DNS
    records from the real Domains UI. Arav edits those DNS records himself.
    Provider DNS values are unavailable before creation and must not be guessed.
+   When offered, select a subdomain-scoped **Secondary application**. A Primary
+   application may produce `clerk.aravhawk.com`, which v1 deliberately rejects.
+   Verify that the ACTUAL issuer is beneath `jarvis-friday-bridge.aravhawk.com`
+   before creating native grants. If the required setup is unavailable, stop;
+   do not weaken the issuer constraint or assume a different hostname will work.
 2. Create two provided PUBLIC OAuth clients with required S256 PKCE, no client
    Secret/token-endpoint authentication, and JWT exact-resource audiences.
    Jarvis audience is the canonical origin + `/bridge/jarvis/mcp`, scopes
@@ -64,8 +69,12 @@ do not treat an open-ended approval as permission for unknown replacements.
    webhook. A new webhook/key binding is a separate concrete access action.
 5. Configure actual public issuer with all gates false. Connect both actual
    native clients and invoke authenticated bridge_health under their respective
-   audiences/pins/scopes. Bootstrap exposes health only. Prove actual JWT issuer,
-   scope and audience compatibility without logging tokens/claims. Only then
+   audiences/pins/scopes. Bootstrap exposes health only. Successful health proves
+   at least one appropriate directional scope, not both send AND ACK scopes.
+   Independently verify both required directional scopes on each actual client's
+   grant/token before attestation, without exposing tokens/claims. If the native
+   flow cannot supply that proof, leave the contract unattested. Prove actual JWT
+   issuer and audience compatibility without logging tokens/claims. Only then
    attest BRIDGE_OAUTH_CONTRACT_VERIFIED=true and refresh those same apps' tools.
 6. Create one final v1 native Jarvis subscription/receiver automation and one
    dedicated Friday receiver **jarvis-friday-bridge-inbox** under the policies in
@@ -98,9 +107,12 @@ Sources: [Clerk production setup](https://clerk.com/docs/guides/development/depl
 
 ## Final migration and cleanup gates
 
-Before deploying, verify review approval for the exact immutable diff and run
-the credential-free canonical boundary checks. Link/deploy only the NEW project
-with an explicit team/project check. Default aliases reject authenticated MCP.
+Before deploying, verify review approval for the exact immutable diff. Link and
+make the first CLOSED deployment only on the NEW project with an explicit
+team/project check. After that deployment and canonical DNS/TLS readiness, run
+the credential-free canonical HTTP boundary checks. Do not claim HTTP checks
+against an undeployed canonical service. Repeat with actual public issuer/auth
+flags after their setup, before grants/activation. Default aliases reject MCP.
 No environment dump, old-project redeploy or main-branch overwrite is needed.
 
 After successful final native two-way verification, inventory every obsolete

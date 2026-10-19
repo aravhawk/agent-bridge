@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { resourceFor } from '../src/resource.mjs';
 import { SCOPES } from '../src/policy.mjs';
@@ -20,10 +23,24 @@ test('v1 portable template has clean identity/canonical audiences and no old or 
   assert.deepEqual(new Set(auth.baseScopes), new Set([SCOPES.jarvis.ack, SCOPES.jarvis.probe, 'offline_access']));
   assert.equal(auth.oidcEnabled, false); assert.equal(read('.codex-plugin/plugin.json').version, VERSION);
 });
-test('packaging requires actual public metadata and rejects old provider targets before creating an archive', () => {
+test('packaging fixture stays temporary and preserves any prepared release artifact', () => {
   const cwd = new URL('..', import.meta.url);
-  assert.notEqual(spawnSync('python3', ['scripts/package_plugin.py'], { cwd }).status, 0);
-  assert.notEqual(spawnSync('python3', ['scripts/package_plugin.py', '--issuer', 'https://old.clerk.accounts.dev', '--jarvis-client-id', 'FIXTURE_PUBLIC_CLIENT'], { cwd }).status, 0);
-  const result = spawnSync('python3', ['scripts/package_plugin.py', '--issuer', ISSUER, '--jarvis-client-id', 'FIXTURE_PUBLIC_CLIENT'], { cwd });
-  assert.equal(result.status, 0, result.stderr.toString());
+  const release = new URL('../.reports/plugin-' + VERSION + '.zip', import.meta.url);
+  const fingerprint = () => existsSync(release) ? createHash('sha256').update(readFileSync(release)).digest('hex') : null;
+  const before = fingerprint();
+  const temporary = mkdtempSync(join(tmpdir(), 'jarvis-friday-package-test-'));
+  const output = join(temporary, 'fixture.zip');
+  const run = args => spawnSync('python3', ['scripts/package_plugin.py', '--output', output, ...args], { cwd });
+  try {
+    assert.notEqual(run([]).status, 0);
+    assert.notEqual(run(['--issuer', 'https://old.clerk.accounts.dev', '--jarvis-client-id', 'FIXTURE_PUBLIC_CLIENT']).status, 0);
+    assert.equal(existsSync(output), false);
+    const result = run(['--issuer', ISSUER, '--jarvis-client-id', 'FIXTURE_PUBLIC_CLIENT']);
+    assert.equal(result.status, 0, result.stderr.toString());
+    assert.equal(existsSync(output), true);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+  assert.equal(existsSync(temporary), false);
+  assert.equal(fingerprint(), before, 'tests must never create or overwrite the default release ZIP');
 });
