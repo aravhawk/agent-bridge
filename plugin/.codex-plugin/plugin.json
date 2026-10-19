@@ -8,9 +8,9 @@
     "shortDescription": "Connect Jarvis and Friday",
     "defaultPrompt": null
   },
-  "name": "rn-jarvis-friday-bridge",
-  "version": "0.1.0",
-  "description": "Connect Jarvis to the Vercel-hosted Friday bridge.",
+  "name": "jarvis-friday-bridge",
+  "version": "1.0.0",
+  "description": "Private inbox messaging between Jarvis and Friday.",
   "author": {
     "name": "Arav Jain"
   },

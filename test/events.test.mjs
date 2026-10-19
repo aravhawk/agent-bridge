@@ -8,8 +8,8 @@ import { MemoryStore, PostgresStore } from '../src/store.mjs';
 import { NativeEvents, EVENT_NAME } from '../src/events.mjs';
 import { Bridge } from '../src/bridge.mjs';
 import { DeliveryWorker, reconcileOutbox } from '../src/worker.mjs';
-import { createMcpHandler } from '../src/mcp.mjs';
-import { preparePrivatePlugin } from '../src/plugin-draft.mjs';
+import { createMcpHandler } from './fixtures/rollback-mcp.mjs';
+import { preparePrivatePlugin } from './fixtures/rollback-plugin-draft.mjs';
 import { callbackUrl, validSecret, publicAddress, createPublicWebhookTransport, createProtector } from '../src/webhook.mjs';
 
 // All callback domains and identities below are fake. Fake transports never

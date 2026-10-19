@@ -9,7 +9,8 @@ import { DeliveryWorker } from '../src/worker.mjs';
 import { createProtector } from '../src/webhook.mjs';
 import { VERIFIED_AUTHORIZATION, createAccessVerifier } from '../src/policy.mjs';
 import { denyResourceAccess, subscriptionAccessAllowed } from '../src/access.mjs';
-import { ISSUER, resourceFor } from '../src/resource.mjs';
+import { resourceFor } from '../src/resource.mjs';
+import { ISSUER } from './fixtures/provider.mjs';
 
 function fixture() {
   let time = 1000000;

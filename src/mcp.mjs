@@ -1,16 +1,13 @@
+import { VERSION } from './release.mjs';
 import { BridgeError, SCOPES } from './policy.mjs';
 import { ownKeys, authorizeRecipient } from './events.mjs';
 
 const idSchema = { type: 'string', format: 'uuid' };
 const object = properties => ({ type: 'object', properties, required: Object.keys(properties), additionalProperties: false });
-const envelopeSchema = object({ id: idSchema, testId: { const: 'RN-JARVIS-FRIDAY-SYNTHETIC' },
-  from: { enum: ['friday', 'jarvis'] }, to: { enum: ['friday', 'jarvis'] }, kind: { const: 'probe' },
-  sentAt: { type: 'string', format: 'date-time' }, marker: { const: 'RN-SYNTHETIC-NO-ACTIONS' } });
 const tool = (name, description, inputSchema, readOnly = false) => ({ name, description, inputSchema,
   annotations: { readOnlyHint: readOnly, destructiveHint: false, idempotentHint: true, openWorldHint: false } });
 const tools = [
   tool('bridge_health', 'Check authenticated bridge configuration without reading messages, storing state or sending events.', object({}), true),
-  tool('bridge_send', 'Store a fixed synthetic probe for the other test assistant. No arbitrary text or actions.', envelopeSchema),
   tool('bridge_read', 'Read the stored message identified by the native received event. Never use to poll.', object({ messageId: idSchema }), true),
   tool('bridge_receipt_claim', 'Claim this received message for one hosted turn, with a short recovery lease.', object({ messageId: idSchema })),
   tool('bridge_receipt_complete', 'Complete the claimed receipt and atomically enqueue one ACK for a source message. ACKs are terminal. Supplied host IDs require independent verification.',
@@ -24,10 +21,10 @@ const dailySendTool = tool('bridge_message_send',
     sentAt: { type: 'string', format: 'date-time' }, expiresAt: { type: 'string', format: 'date-time' },
     threadId: idSchema, route: { const: 'inbox' }, text: { type: 'string', minLength: 1, maxLength: 4096 } }));
 const subscriptionStatusTool = tool('bridge_subscription_status', 'Inspect your Jarvis subscription activity and renewal timestamps. No callback URL or secret is returned.', object({}), true);
-function allowedTools(principal, health, dailyEnabled) {
-  return [...tools, ...(dailyEnabled ? [dailySendTool, ...(principal.role === 'jarvis' ? [subscriptionStatusTool] : [])] : [])].filter(t => t.name === 'bridge_health'
+function allowedTools(principal, health, dailyEnabled, healthOnly) {
+  return [...tools, ...(dailyEnabled ? [dailySendTool, ...(principal.role === 'jarvis' ? [subscriptionStatusTool] : [])] : [])].filter(t => !healthOnly || t.name === 'bridge_health').filter(t => t.name === 'bridge_health'
     ? typeof health === 'function' && Object.values(SCOPES[principal.role]).some(s => principal.scopes.includes(s))
-    : ['bridge_send', 'bridge_message_send'].includes(t.name) ? principal.scopes.includes(SCOPES[principal.role].probe)
+    : t.name === 'bridge_message_send' ? principal.scopes.includes(SCOPES[principal.role].probe)
     : t.name === 'bridge_status' || principal.scopes.includes(SCOPES[principal.role].ack));
 }
 const json = (body, status = 200) => new Response(JSON.stringify(body), { status,
@@ -63,10 +60,10 @@ async function boundedJson(request) {
   }
 }
 
-// Mount only at NEW authenticated bridge paths. This module does not alter the
-// existing health /mcp, create a provider, issue tokens, or register a plugin.
+// Mount only at the canonical authenticated role paths. This resource server
+// never creates a provider, issues tokens or registers a native plugin.
 export function createMcpHandler({ enabled = false, verify, bridge, events, scheduleJobs, resourceMetadataUrl,
-  observeValidationFailure, health, dailyEnabled = false }) {
+  observeValidationFailure, health, dailyEnabled = true, healthOnly = false }) {
   return async request => {
     let id = null, input, stage = 'before_authenticated_body';
     try {
@@ -96,29 +93,28 @@ export function createMcpHandler({ enabled = false, verify, bridge, events, sche
         case 'server/discover':
           ownKeys(params, [], []);
           result = { resultType: 'complete', supportedVersions: ['2026-07-28'],
-            capabilities: { tools: {}, ...(principal.role === 'jarvis' && principal.scopes.includes(SCOPES.jarvis.ack) ? { events: {} } : {}) } };
+            capabilities: { tools: {}, ...(!healthOnly && principal.role === 'jarvis' && principal.scopes.includes(SCOPES.jarvis.ack) ? { events: {} } : {}) } };
           break;
         case 'initialize':
           ownKeys(params, ['protocolVersion', 'capabilities', 'clientInfo']);
           if (!['2025-03-26', '2025-06-18', '2025-11-25', '2026-07-28'].includes(params.protocolVersion)) throw new BridgeError('unsupported_protocol', 400);
           result = { protocolVersion: params.protocolVersion, capabilities: { tools: {} },
-            serverInfo: { name: 'jarvis-friday-bridge', version: '0.2.0' } };
+            serverInfo: { name: 'jarvis-friday-bridge', version: VERSION } };
           break;
         case 'ping': ownKeys(params, [], []); result = {}; break;
-        case 'tools/list': ownKeys(params, [], []); result = { tools: allowedTools(principal, health, dailyEnabled) }; break;
-        case 'events/list': result = events.list(principal, params); break;
-        case 'events/subscribe': result = await events.subscribe(principal, params); break;
+        case 'tools/list': ownKeys(params, [], []); result = { tools: allowedTools(principal, health, dailyEnabled, healthOnly) }; break;
+        case 'events/list': if (healthOnly) throw new BridgeError('provider_contract_verification_required', 503); result = events.list(principal, params); break;
+        case 'events/subscribe': if (healthOnly) throw new BridgeError('provider_contract_verification_required', 503); result = await events.subscribe(principal, params); break;
         case 'events/unsubscribe': result = await events.unsubscribe(principal, params); break;
         case 'tools/call': {
           ownKeys(params, ['name', 'arguments']);
-          if (!allowedTools(principal, health, dailyEnabled).some(t => t.name === params.name)) throw new BridgeError('tool_not_available', 403);
+          if (!allowedTools(principal, health, dailyEnabled, healthOnly).some(t => t.name === params.name)) throw new BridgeError('tool_not_available', 403);
           stage = 'tool_arguments';
           let output;
           switch (params.name) {
             case 'bridge_health': ownKeys(params.arguments, [], []); output = await health(); break;
             case 'bridge_subscription_status': output = await events.status(principal, params.arguments); break;
             case 'bridge_message_send': output = await bridge.sendMessage(principal, params.arguments); break;
-            case 'bridge_send': output = await bridge.send(principal, params.arguments); break;
             case 'bridge_read': output = await bridge.read(principal, params.arguments); break;
             case 'bridge_receipt_claim': authorizeRecipient(principal); output = await bridge.claim(principal, params.arguments); break;
             case 'bridge_receipt_complete': authorizeRecipient(principal); output = await bridge.complete(principal, params.arguments); break;
@@ -138,7 +134,7 @@ export function createMcpHandler({ enabled = false, verify, bridge, events, sche
     } catch (error) {
       const safe = error instanceof BridgeError;
       if (safe && stage === 'tool_arguments' && error.code === 'message_not_found') {
-        // An absent synthetic message is a tool execution failure, not a broken
+        // An absent message is a tool execution failure, not a broken
         // HTTP connection. Preserve the explicit error and never invent a hit.
         const failure = { error: 'message_not_found' };
         return json({ jsonrpc: '2.0', id, result: { isError: true, structuredContent: failure,

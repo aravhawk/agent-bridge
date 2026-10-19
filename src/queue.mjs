@@ -1,7 +1,8 @@
+import { QUEUE_TOPIC } from './release.mjs';
 import { dailyMessage, retainMessages, CONTENT_RETENTION_MS } from './messages.mjs';
 import { BridgeError } from './policy.mjs';
 
-export const TOPIC = 'rn-jarvis-friday-synthetic-20261018';
+export const TOPIC = QUEUE_TOPIC;
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const idPattern = /^job_[a-f0-9]{64}$/;
 class RetryJob extends Error {

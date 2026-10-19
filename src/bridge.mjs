@@ -7,14 +7,14 @@ import { verifiedMessageAuthorization, messageAccessAllowed, testEnvelopeAllowed
 const fail = (code, status = 400) => { throw new BridgeError(code, status); };
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 function messageId(value) { if (typeof value !== 'string' || !uuid.test(value)) fail('invalid_message_id'); }
-function admitProbe(state, role, now) {
+function admitMessage(state, role, now) {
   // The verifier binds each of the two sender roles to its pinned identity.
   // Fixed role slots avoid caller-chosen bucket keys or unbounded limiter state.
   // This runs under the same durable row lock as message/job creation, so cold
   // starts and concurrent function instances cannot each grant a fresh budget.
   const admissions = state.probeAdmissions ||= {};
   const recent = (admissions[role] || []).filter(at => at > now - 60000);
-  if (recent.length >= 10) fail('probe_rate_limited', 429);
+  if (recent.length >= 10) fail('message_rate_limited', 429);
   admissions[role] = [...recent, now];
 }
 function incoming(state, principal, id, probeMessageId, probeSender) {
@@ -61,7 +61,7 @@ export class Bridge {
       // Exact retransmissions stay idempotent even at the limit or after the
       // freshness window; changed bodies still take insert's conflict path.
       // Failed insertion rolls this admission back with the transaction.
-      if (!saved) admitProbe(state, principal.role, this.clock());
+      if (!saved) admitMessage(state, principal.role, this.clock());
       return insert(state, envelope, hash, this.clock(), authorization);
     });
   }
@@ -85,7 +85,7 @@ export class Bridge {
         const pending = state.messagePreparations[validated.envelope.id];
         if (pending && pending.hash !== validated.hash) fail('message_id_conflict', 409);
         if (!pending) {
-          admitProbe(state, principal.role, now); // Bound native queue publication too.
+          admitMessage(state, principal.role, now); // Bound native queue publication too.
           state.messagePreparations[validated.envelope.id] = { hash: validated.hash, until: now + 60000 };
         }
       }

@@ -1,37 +1,47 @@
+import { isIP } from 'node:net';
 import { SCOPES } from './policy.mjs';
+import { CANONICAL_ORIGIN, SERVICE_NAME, VERSION } from './release.mjs';
 
-export const ORIGIN = 'https://rn-jarvis-friday-discovery-20261018.vercel.app';
-export const ISSUER = 'https://musical-bee-9978.clerk.accounts.dev';
-export const JWKS = ISSUER + '/.well-known/jwks.json';
+export const ORIGIN = CANONICAL_ORIGIN;
 export const resourceFor = role => `${ORIGIN}/bridge/${role}/mcp`;
 export const metadataFor = role => `${ORIGIN}/.well-known/oauth-protected-resource/bridge/${role}/mcp`;
 const roles = ['friday', 'jarvis'];
 const json = (body, status = 200, headers = {}) => Response.json(body, { status, headers: {
   'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...headers,
 } });
-const challenge = role => json({ error: 'unauthorized' }, 401, {
-  'www-authenticate': `Bearer resource_metadata="${metadataFor(role)}"`,
-});
-
-// Public discovery describes only the real, pre-registered provider. This
-// server cannot register clients, authorize grants, issue or refresh tokens.
-export function createResourceRouter({ legacy, getHandler }) {
+// Required operator configuration obtained from the actual approved provider.
+// No guessed issuer, development fallback, request-selected key URL or issuer.
+export function providerConfiguration(value) {
+  try {
+    if (typeof value !== 'string' || value.trim() !== value) return null;
+    const u = new URL(value);
+    if (value !== u.origin || u.protocol !== 'https:' || u.username || u.password || u.search || u.hash ||
+        u.pathname !== '/' || u.port || !u.hostname.endsWith('.' + new URL(ORIGIN).hostname) || isIP(u.hostname) ||
+        /(?:^|\.)(?:localhost|local|internal)$/.test(u.hostname)) return null;
+    return Object.freeze({ issuer: u.origin, jwks: u.origin + '/.well-known/jwks.json' });
+  } catch { return null; }
+}
+export function createResourceRouter({ getHandler, getProvider = () => providerConfiguration(process.env.BRIDGE_OAUTH_ISSUER) }) {
   return async request => {
     const url = new URL(request.url);
+    if (['/', '/health'].includes(url.pathname) && request.method === 'GET') return json({ status: 'ok', service: SERVICE_NAME,
+      version: VERSION, authenticationRequired: true });
     const role = roles.find(r => url.pathname === `/bridge/${r}/mcp`);
     const metadataRole = roles.find(r => url.pathname === `/.well-known/oauth-protected-resource/bridge/${r}/mcp`);
-    if (!role && !metadataRole) return legacy(request);
+    if ((!role && !metadataRole) || url.origin !== ORIGIN) return json({ error: 'not_found' }, 404);
     const origin = request.headers.get('origin');
-    if (origin && origin !== url.origin) return json({ error: 'forbidden_origin' }, 403);
+    if (origin && origin !== ORIGIN) return json({ error: 'forbidden_origin' }, 403);
     if (metadataRole) {
       if (request.method !== 'GET') return json({ error: 'method_not_allowed' }, 405, { allow: 'GET' });
-      return json({ resource: resourceFor(metadataRole), authorization_servers: [ISSUER],
+      const provider = getProvider();
+      if (!provider) return json({ error: 'identity_provider_not_configured' }, 503);
+      return json({ resource: resourceFor(metadataRole), authorization_servers: [provider.issuer],
         bearer_methods_supported: ['header'], scopes_supported: Object.values(SCOPES[metadataRole]),
-        resource_name: `RN Jarvis Friday Synthetic Bridge — ${metadataRole}` });
+        resource_name: `${SERVICE_NAME} — ${metadataRole}` });
     }
-    // Authentication discovery must work before secrets/subject configuration.
-    // The presence of a header alone never authorizes a request.
-    if (!request.headers.get('authorization')) return challenge(role);
+    if (!request.headers.get('authorization')) return json({ error: 'unauthorized' }, 401, {
+      'www-authenticate': `Bearer resource_metadata="${metadataFor(role)}"`,
+    });
     if (request.method !== 'POST') return json({ error: 'method_not_allowed' }, 405, { allow: 'POST' });
     try { return await (await getHandler(role))(request); }
     catch { return json({ error: 'bridge_configuration_required' }, 503); }

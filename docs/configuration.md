@@ -1,246 +1,109 @@
-# Configuration and preserved boundaries
+# Jarvis Friday Bridge v1.0.0 configuration
 
-This document describes the preserved synthetic-mode baseline. For the gated
-0.2.0 daily-use candidate, use [daily-use.md](daily-use.md), including native
-receiver migration, finite renewal, retention cleanup and rollback requirements.
+## Fixed service identity
 
-## Public OAuth settings
+Origin: `https://jarvis-friday-bridge.aravhawk.com`.
+Only this origin accepts authenticated MCP and resource metadata. Default Vercel
+aliases may expose public liveness but do not accept MCP credentials. Request
+headers cannot select the issuer, JWKS, role, callback, destination or audience.
 
-Issuer: `https://musical-bee-9978.clerk.accounts.dev`.
-Authorization: issuer plus `/oauth/authorize`; token: issuer plus `/oauth/token`.
-Both clients are public, token endpoint authentication `none`, required S256,
-provider-hosted consent, JWT access tokens and Include Audience enabled.
-No client secret belongs in this repository. DCR/CIMD and device grants are off.
-
-| Native side | Public client ID | Requested scopes | Exact resource audience |
+| Client | Resource audience | Directional scopes | Existing native callback to confirm in actual final form |
 |---|---|---|---|
-| Friday | `jtwi71bhdmkGqilW` | `bridge:send:jarvis bridge:ack:friday offline_access` | Production origin + `/bridge/friday/mcp` |
-| Jarvis | `f58dfaNi1qX2vtdx` | `bridge:ack:jarvis bridge:send:friday offline_access` | Production origin + `/bridge/jarvis/mcp` |
+| Jarvis | Origin + `/bridge/jarvis/mcp` | bridge:send:friday, bridge:ack:jarvis, offline_access | https://chatgpt.com/connector_platform_oauth_redirect |
+| Friday | Origin + `/bridge/friday/mcp` | bridge:send:jarvis, bridge:ack:friday, offline_access | https://www.cursor.com/agents/mcp/oauth/callback |
 
-Friday's callback is `https://www.cursor.com/agents/mcp/oauth/callback`.
-The native ChatGPT form displayed
-`https://chatgpt.com/connector_platform_oauth_redirect`, matching Jarvis's saved
-callback. Always compare the actual native management value before changing an
-allowlist. Public client IDs and resource URLs are not credentials.
+Both clients are public, provided registrations, token authentication none,
+required S256 PKCE and provider-hosted consent. JWT access tokens must include
+the exact resource audience. No client Secret, DCR/CIMD, device grant, OIDC
+identity scopes or provider-admin API key is required by this resource server.
+Callbacks above are the previously observed native values; recheck the actual
+new client flow before saving an allowlist. Do not guess replacements.
 
-Jarvis uses OIDC disabled and no identity/metadata scopes. Custom directional
-scopes are intentionally not advertised globally, but assigned to each client.
-Actual native Friday authentication and bridge-tool discovery were verified.
-Jarvis's managed custom MCP grant, original five tools and event discovery are
-also verified. Jarvis's signed native Events callback and persisted active
-subscription were verified on October 19; live renewal remains untested.
+## Provider identity and bootstrap
 
-Managed Jarvis plugin: `plugin_asdk_app_6ad53911909481919c20dfb6f8d3fb51`;
-connector: `asdk_app_6ad53911909481919c20dfb6f8d3fb51`. This is the connected
-custom MCP registration; the portable plugin in `plugin/` is a separate source
-package. Do not create a duplicate registration to refresh tools.
+BRIDGE_OAUTH_ISSUER is required and blank by default. Obtain the exact HTTPS
+origin from the new approved Clerk production instance's live metadata; verify
+issuer/JWKS endpoints after DNS/TLS. It must be beneath the service's namespace
+(`*.jarvis-friday-bridge.aravhawk.com`), without credentials, path, query, port or
+fragment. A development issuer or unrelated domain is rejected. There is no
+assumed production issuer/client ID in source. The fixture identity used by
+unit tests is not a deployed or proposed provider configuration.
 
-## Authenticated health and current access
+Pin the real new production user's subject using BRIDGE_ALLOWED_SUBJECT_SHA256
+as a Production Secret; do not reuse the development instance's subject pin.
+Never put raw tokens, user IDs, login flows or Secret values in source/reports.
+The displayed provider subject can be hashed locally without printing it and
+only the digest saved to the approved new Secret target. Actual sign-in or
+credential entry remains a native/human flow. No fabricated allow-all pin.
 
-`bridge_health` accepts `{}` and requires the existing verified resource
-identity plus at least one role-specific bridge scope. It returns successful
-MCP content containing only authenticated status, server version and nonsecret
-configuration/readiness booleans. It does not initialize the database, mutate
-state, access messages, check the grant provider, enqueue jobs or send a
-callback. Normal JWT verification retains the existing provider JWKS resolver;
-the health operation adds no outbound call. `storageConfigured` reports binding
-presence, not a database connectivity check. `subscriptionSetupEnabled` and
-`deliveryEnabled` report effective gates, not successful subscription or wake.
+Once provider + pin are configured, the resource can expose authenticated
+bridge_health alone even while BRIDGE_OAUTH_CONTRACT_VERIFIED=false. It still
+checks real JWT signature, issuer, role audience, subject and scopes. Bootstrap
+cannot list/subscribe to events or read/write message data; authenticated
+unsubscribe remains available to honor withdrawal. It never issues/echoes tokens
+or logs claims. Require successful native health under BOTH actual clients
+before attesting the OAuth contract and refreshing the same app's tools.
 
-After a deployment adding the tool, refresh the existing custom app's action
-list in its management UI (if offered), or start a new host turn and rediscover
-the existing connector. Verify `bridge_health` is exposed, then invoke it once
-with `{}` through that same connector. Do not replace this with the public
-health endpoint or count `message_not_found` as successful tool execution.
-No OAuth reconnection or expanded grant is required by this backend change.
+Normal v1 catalog: seven Jarvis tools, six Friday tools. There is no synthetic
+bridge_send. bridge_message_send handles bounded data; read/receipt/status tools
+are scoped; Jarvis additionally has safe bridge_subscription_status metadata.
+An authenticated health result proves neither DB connectivity nor native wake.
 
-`src/access.mjs` implements bounded Jarvis authorization leases and durable
-resource denial. The existing verifier checks signature, issuer, audience,
-pinned subject and scopes; it passes only verified token expiry and a policy
-fingerprint internally. Tokens and raw claims are never stored in subscriptions.
-No Clerk backend credential or custom grant-reader API is required.
+## New project Secret/config bindings
 
-Every subscription is finite. The deadline is the earliest of the requested
-TTL (one day when omitted, seven-day server cap when null), the seven-day
-maximum, and the verified JWT expiration. There is no minimum-TTL extension or
-clock-tolerance extension. A refresh with the same verified expiration cannot
-extend the saved deadline; a later verified expiration can. Older tokens,
-legacy subscriptions without authorization metadata and changed policy/owner
-bindings fail closed. The callback challenge and final save recheck expiry and
-durable denial. The worker checks owner, recipient, resource, scope, status,
-pinned policy, hard expiry and denial before sending and at final commit.
+Only Production on project prj_rTBPrIoODxpC1A6sS2OQtlvc7cqE, Arav's Projects.
+Do not pull environment files or copy/decrypt old project secrets.
 
-Resource denial is server-owned state in the existing aggregate's optional
-`resourceDenials` map. The operator-only `denyResourceAccess` application helper
-persists the denial and deactivates that owner's Jarvis subscriptions. It is
-not exposed as a new MCP/admin endpoint. Renewals never erase denial, and
-unsubscribe writes a durable inactive tombstone even if callback verification
-is in flight. No database schema migration or separate store is needed.
+- DATABASE_URL: native Neon integration Secret for a NEW isolated database;
+  verified TLS (`verify-full`), Neon hostname, poolmax2. Apply schema.sql only
+  after approval to the new empty database. No auto-migration or memory fallback.
+- BRIDGE_SUBSCRIPTION_STORAGE_KEY: fresh32-byte key, stored as a sensitive
+  Production Secret. Protects native callback data with AES-GCM and ID-bound AAD.
+- FRIDAY_WEBHOOK_URL / FRIDAY_WEBHOOK_KEY: dedicated new receiver binding, saved
+  through approved private transfer. Never ask for either in chat or reveal it.
+- BRIDGE_ALLOWED_SUBJECT_SHA256: new production identity pin, Secret.
+- BRIDGE_OAUTH_ISSUER / BRIDGE_OAUTH_SCOPE_CLAIM=scope: verified public provider
+  contract. No Clerk backend Secret key is needed or copied into the backend.
 
-This is the signed-JWT expiry model, not instant provider introspection: Clerk
-revocation alone cannot instantly invalidate an already issued JWT. Local
-resource denial and unsubscribe stop this bridge immediately; otherwise the
-finite lease ends no later than token expiry. See [Clerk token formats](https://clerk.com/docs/guides/development/machine-auth/token-formats).
-A network request already in flight cannot be recalled; the final worker fence
-prevents late completion from recording revoked/expired authority as accepted.
-
-[Native subscription renewal](https://developers.openai.com/plugins/build/mcp-events#refresh-a-subscription)
-uses `events/subscribe` again before the finite `refreshBefore`, even when the
-client requested `ttlMs:null`. Live native OAuth refresh and native subscription
-renewal remain separate unverified tests. Neither discovery nor local tests
-prove that the host renewed the live subscription.
-
-## Runtime storage and gates
-
-Vercel injects `DATABASE_URL` from the existing isolated Neon integration in
-Production only. Never pull it into a local `.env`, copy it from the dashboard,
-or commit it. TLS must be verified and the hostname must be a Neon host.
-
-The real allowed subject is pinned through sensitive Production configuration.
-Do not copy the subject or its configured digest into the repository. Configure
-one of `BRIDGE_ALLOWED_SUBJECT` or `BRIDGE_ALLOWED_SUBJECT_SHA256`, never both.
-`BRIDGE_OAUTH_SCOPE_CLAIM=scope` matches the verified provider contract.
-
-`BRIDGE_OAUTH_CONTRACT_VERIFIED` is true in the existing Production runtime.
-The example file remains closed by default. The current approved gates are:
+Closed defaults:
 
 ```text
+BRIDGE_OAUTH_CONTRACT_VERIFIED=false
+BRIDGE_SUBSCRIPTIONS_ENABLED=false
 BRIDGE_DELIVERY_ENABLED=false
-BRIDGE_SUBSCRIPTIONS_ENABLED=true
-BRIDGE_AUTH_DIAGNOSTIC=false
-BRIDGE_AUTH_TIMING_DIAGNOSTIC=false
-BRIDGE_RPC_SHAPE_DIAGNOSTIC=false
-```
-
-Flags alone cannot enable delivery. The runtime requires valid JWT-bound
-message and subscription authority, callback protection and the saved Friday
-sender binding plus the following operator-only configuration:
-
-```text
-FRIDAY_RECEIVER_ID=jarvis-friday-test-receiver
-FRIDAY_TEST_AUTHORIZED_UNTIL=<ISO timestamp at most six hours ahead>
+BRIDGE_RECEIVER_POLICY=
+FRIDAY_RECEIVER_ID=jarvis-friday-bridge-inbox
 FRIDAY_WEBHOOK_CONTRACT_VERIFIED=false
-FRIDAY_CONTRACT_PROBE_MESSAGE_ID=<one reserved canonical UUID>
-BRIDGE_TEST_PROBE_SENDER=jarvis
 ```
 
-The exact existing receiver and finite operator window are required in both
-probe and verified modes. The window expires without a scheduled cleanup.
-Before native body mapping and hosted wake are proven, keep the contract flag
-false: only the pinned Jarvis-originated probe and its correlated receipt/ACK
-are allowed. After independent native evidence, the operator may set the
-contract flag true for the bounded synthetic test. Verification never removes
-delivery pinning: the legacy-named FRIDAY_CONTRACT_PROBE_MESSAGE_ID is mandatory
-in both modes. BRIDGE_TEST_PROBE_SENDER selects jarvis or friday (omission keeps
-the original jarvis default; invalid/blank values fail closed). Both API/receipt
-scope and every worker authority fence allow only that exact sender's selected
-probe and the opposite sender's correlated ACK. An unrelated queued job from
-an earlier valid window is blocked in either direction. Friday-originated mode
-requires verified transport because its generated return ACK reaches Friday.
-The global delivery flag still defaults false; subscription setup is separate.
+After native health/contract proof, subscription setup can be enabled separately
+from delivery. Native ChatGPT creates exactly one new v1 subscription with its
+own callback/secret. Its lease is capped by verified JWT expiry. Same-token
+renewal cannot extend expiry; later verified token expiry can. Denial and
+unsubscribe tombstones survive renewal/restart. No provider introspection or
+immortal lease is claimed. Verify actual native renewal and exact subscription
+identity before transport activation; metadata count alone does not prove it.
 
-Run the user's sequence one leg at a time: first pin the Friday-originated
-probe, wait for the native Jarvis receipt/user report, then coordinate and pin
-the Jarvis-originated reverse leg. Do not arm both source timers together.
+Delivery additionally requires verified Friday binding/contract and attested
+inbox-v1 policies on BOTH receivers, then global delivery true. New grants and
+these activations require the specifically reviewed action-time bundle. A flag
+is an operator attestation, not independent evidence. Do not reuse old test
+windows, IDs, grants, callbacks or activation approvals for the changed realm.
 
-Every new probe and ACK stores only verified owner digest, role, exact resource,
-directional scope, policy fingerprint and token expiration. Message authority
-ends at the earlier of that JWT expiration and its original operator window.
-An exact duplicate with a fresh JWT or later window cannot extend it. Missing
-legacy metadata, mismatched policy/resource/scope/role, expiry and durable owner
-denial stop delivery even if an injected supplemental access adapter says yes.
-The worker checks before claiming, after asynchronous authorization, immediately
-before transport and at final commit. Receipt claim/completion also checks the
-original source authority before generating an ACK. No raw token is persisted.
+## Public metadata/package checks
 
-Health adds only `fridaySenderConfigured`, `fridayTestAuthorizationConfigured`,
-`fridayContractVerified`, `fridayProbeModeConfigured` and `testDeliveryPinned` booleans. These perform
-no receiver or database call and cannot establish live wake or token refresh.
-The status tool exposes sanitized transport counts, immutable first outcome and
-last numeric status/error to inspect the known message without raw runtime logs.
-Native callback configuration requires a securely supplied 32-byte AES-GCM
-protector key. No placeholder allow-all adapter, relay or polling listener is
-acceptable. Do not generate a new credential merely to inspect a setup flow.
+`npm run check:remote` expects an unconfigured, closed v1 deployment. After
+actual verified issuer setup, use `python3 scripts/check_v1.py --issuer <actual>`;
+after JWT policy is configured add `--auth-configured`. These compare public
+metadata and send only an invalid nonsecret fixture, never a real token/event.
 
-Subscription setup enables only the signed callback verification handshake;
-it does not enable message writes or application delivery. Preserve the current
-subscription gate while completing Friday receiver acceptance.
+Portable plugin source is v1.0.0 with an explicitly non-live MCP template. Render
+only after obtaining actual approved public client metadata:
 
-## Probe admission and idempotence
+```sh
+python3 scripts/package_plugin.py --issuer <actual-issuer-origin> --jarvis-client-id <actual-public-id>
+```
 
-New probe IDs are limited to 10 per rolling 60 seconds for each authenticated
-sender role. The JWT verifier binds each of the two fixed role slots to the
-configured pinned subject and exact resource audience. Admission timestamps
-are stored in the existing durable aggregate under the same row lock as message
-and job creation: at most two arrays of 10 timestamps, no new service, schema,
-credential or platform rule. Concurrent function instances and restarts share
-the budget; failed insertions roll back their admission.
-
-Exact canonical retransmissions remain idempotent, including at a full budget
-or after the five-minute freshness window. Changed content for a saved ID still
-conflicts. New stale/future envelopes, unknown fields and invalid directional
-scopes fail before admission. An admitted probe may generate only its existing
-atomic single receipt ACK; ACK completion does not spend fresh-probe admission
-and cannot generate an ACK-of-ACK. A fresh-ID overflow returns HTTP 429 with
-`probe_rate_limited`, creates no message/job and makes no scheduling request.
-
-This caps accepted fresh probes, not all authenticated HTTP/duplicate traffic.
-The 32 KiB body limit, aggregate capacity limit, five actual delivery attempts
-and 20 queue-callback budget remain separate bounds. No random test is armed;
-its `sentAt` must be generated when it fires to satisfy five-minute freshness.
-
-## Native receivers
-
-Jarvis must discover MCP2026-07-28 Events, list `bridge.message.received`, and
-establish a native subscription with arguments `recipient:"jarvis"` and
-`ttlMs:null`. The server grants a finite token-bounded `refreshBefore`; the host
-must renew using fresh verified authority. The host supplies its callback URL and signing secret in the
-authenticated handshake. Never ask for that secret in chat.
-
-The existing Friday webhook-only `Jarvis Friday Test Receiver` has been created
-and remains paused before test activation. Native field-navigation links open
-its actual credential form; the ordinary Routines list does not. The human
-saved its URL and Bearer key directly as Production Secrets. Do not reopen or
-copy their values into a transcript. Native guide/get and the form establish
-POST with Bearer authentication, but not body mapping or replay/response
-semantics. See [the bounded empirical test](friday-wire-contract.md).
-
-Keep existing routines/subscriptions enabled unless explicitly instructed
-otherwise. No schedule or random test should be armed before both native
-receivers and the subscription are verified. Test credential refresh only
-after the actual native access token expires, without extracting a token or
-changing its lifetime.
-
-## Publishing and deployment
-
-Only project source and nonsecret configuration belong here. Do not add message
-histories, session dumps, browser state, screenshots, environment pulls, real
-callback secrets, auth URLs containing flow parameters, or unrelated artifacts.
-The history audit prints rule names and paths, never matching secret values.
-
-CI uses no deployment secret and runs no remote/native test. The existing
-Vercel project is connected to `aravhawk/jarvis-friday-bridge` through its
-already-authorized GitHub installation. The saved dashboard connection was
-verified after navigating away and back; no new grant or sign-in was needed.
-Production tracks `main`; Root Directory is blank (repository root), Framework
-Other, Node.js 24.x, with no build/output/install command overrides. The root's
-`api/`, `package.json` and `vercel.json` match those settings. Do not create
-another Vercel project or expand installation permissions for this setup.
-
-Linking did not start a deployment. The initial repository commit passed 59
-local/CI tests and staged/history secret scans. All 34 credential-free remote
-checks passed after linking: 11 bridge authentication/metadata/boundary checks,
-12 original health-only MCP checks and 11 rejecting OAuth diagnostic checks.
-These checks verify public behavior, tool discovery and `probe_health`, and
-that invalid or unauthenticated bridge requests fail closed. They do not prove
-native OAuth refresh, authenticated Events subscription, durable delivery or a
-hosted wake. Those remain gated by the acceptance requirements above.
-
-For a Git-triggered release, match the deployment's Git SHA to the pushed
-`main` commit and require Ready status on the same existing project. Confirm
-the canonical URL still points to that deployment, run `npm run check:remote`,
-and verify delivery and temporary diagnostics remain false while the approved
-Jarvis subscription setup gate remains true.
-Remote reports belong in ignored `.reports/remote/`, not in Git. Investigate
-build failures only within this project's deployment configuration; never
-alter OAuth URLs, read secrets or enable delivery to make a build pass.
+Output stays in ignored .reports/. Rendering does not install a plugin, create
+a grant or replace the actual native custom MCP registration. Do not install
+unresolved templates or create duplicate registrations to refresh discovery.

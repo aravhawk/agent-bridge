@@ -3,7 +3,7 @@
   "author": {
     "name": "Arav Jain"
   },
-  "description": "Connect Jarvis to the Vercel-hosted Friday bridge.",
+  "description": "Private inbox messaging between Jarvis and Friday.",
   "extensions": {
     "com.openai": {
       "interface": {
@@ -16,6 +16,6 @@
       }
     }
   },
-  "name": "rn-jarvis-friday-bridge",
-  "version": "0.1.0"
+  "name": "jarvis-friday-bridge",
+  "version": "1.0.0"
 }

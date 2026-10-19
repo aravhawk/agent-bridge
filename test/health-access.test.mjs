@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { generateKeyPair, SignJWT } from 'jose';
 import { createRuntime } from '../src/runtime.mjs';
-import { ISSUER, resourceFor } from '../src/resource.mjs';
+import { resourceFor } from '../src/resource.mjs';
+import { ISSUER } from './fixtures/provider.mjs';
 import { decodeStorageKey, createProtector } from '../src/webhook.mjs';
 
 const digest = value => createHash('sha256').update(value).digest('hex');
@@ -16,7 +17,7 @@ const rpc = (token, name = 'bridge_health', args = {}) => new Request(resourceFo
 });
 async function fixture(extra = {}) {
   const { publicKey, privateKey } = await generateKeyPair('RS256');
-  const env = { BRIDGE_OAUTH_CONTRACT_VERIFIED: 'true', BRIDGE_ALLOWED_SUBJECT: subject, ...extra };
+  const env = { BRIDGE_OAUTH_ISSUER: ISSUER, BRIDGE_OAUTH_CONTRACT_VERIFIED: 'true', BRIDGE_ALLOWED_SUBJECT: subject, ...extra };
   const rt = createRuntime({ env, keyResolver: publicKey,
     Pool: class { constructor() { assert.fail('health must not create a pool'); } },
     queueClient: { send() { assert.fail('health must not enqueue'); } },
@@ -34,10 +35,9 @@ test('authenticated health succeeds with no storage, network transport, queue or
   assert.equal(response.status, 200);
   const result = (await response.json()).result;
   assert.notEqual(result.isError, true);
-  assert.deepEqual(JSON.parse(result.content[0].text), { status: 'ok', authenticated: true, serverVersion: '0.2.0',
+  assert.deepEqual(JSON.parse(result.content[0].text), { status: 'ok', authenticated: true, serverVersion: '1.0.0',
     readiness: { storageConfigured: false, callbackProtectorConfigured: false, currentAccessCheckConfigured: true,
-      fridaySenderConfigured: false, fridayTestAuthorizationConfigured: false,
-      fridayContractVerified: false, fridayProbeModeConfigured: false, testDeliveryPinned: false, dailyMessagesConfigured: false,
+      fridaySenderConfigured: false, receiverPolicyVerified: false, fridayContractVerified: false,
       subscriptionSetupEnabled: false, deliveryEnabled: false } });
   const output = JSON.stringify(result);
   for (const value of [token, subject, owner, 'private-health@example.test', 'private-claim']) assert.equal(output.includes(value), false);
