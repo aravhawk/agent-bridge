@@ -53,6 +53,21 @@ after restart/reclaim. Timeout or 5xx does not authorize another exploratory
 POST; record that result as failed/inconclusive. This mode does not create a
 public probe endpoint or provide the worker's independent accessAllowed binding.
 
+After invoking transport, the adapter marks sanitized evidence on an internal
+non-enumerable Symbol that JSON/HTTP input cannot supply. In probe mode the
+worker treats its first 2xx/4xx/5xx/timeout result as terminal immediately,
+without scheduling a second attempt. A committed `firstTransportOutcome`
+retains timestamp, worker-attempt number, numeric status or null, safe error
+code and terminal flag. Later callbacks/restarts cannot overwrite it. Normal
+verified delivery keeps its existing retry policy while preserving its first
+transport evidence separately from the latest status/error.
+
+`attempts` counts worker claims. `transportAttempts` counts adapter transport
+invocations whose outcomes reached the valid worker commit fence, not queue
+callbacks or guaranteed HTTP requests received by Friday. DNS/TLS failure may
+prevent any HTTP send. A crash/expired lease before that commit remains
+inconclusive; do not invent an outcome or bypass lease fencing to save it.
+
 ## Exact single empirical probe, only after activation approval
 
 1. Keep the existing Jarvis MCP event subscription enabled. Verify its lease

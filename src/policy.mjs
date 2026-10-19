@@ -14,6 +14,8 @@ export const SCOPES = Object.freeze({
   jarvis: { probe: 'bridge:send:friday', ack: 'bridge:ack:jarvis' },
 });
 export const VERIFIED_AUTHORIZATION = Symbol('verified bridge authorization');
+// Internal adapter evidence; JSON requests and HTTP bodies cannot supply it.
+export const DELIVERY_TRANSPORT_OUTCOME = Symbol('delivery transport outcome');
 export function authorizationPolicyId({ issuer, audience, subject, subjectHash, role, scopeClaim = 'scope', algorithms = ['RS256'] }) {
   const pin = subject ? createHash('sha256').update(subject).digest('hex') : subjectHash;
   return createHash('sha256').update(JSON.stringify([issuer, audience, pin, role, scopeClaim, algorithms])).digest('hex');

@@ -1,4 +1,4 @@
-import { BridgeError } from './policy.mjs';
+import { BridgeError, DELIVERY_TRANSPORT_OUTCOME } from './policy.mjs';
 import { EVENT_NAME, digest, ownKeys } from './events.mjs';
 import { callbackUrl, createPublicWebhookTransport } from './webhook.mjs';
 
@@ -38,6 +38,8 @@ export function createFridaySender({ enabled = false, contractVerified = false,
     destination = callbackUrl(endpoint);
   } catch { fail('friday_sender_configuration_required'); }
   const post = transport || createPublicWebhookTransport({ enabled: true });
+  const observed = (result, error = null) => Object.defineProperty(result, DELIVERY_TRANSPORT_OUTCOME,
+    { value: Object.freeze({ terminal: probeOnly, error }) });
   let probeAttempted = false;
   return async job => {
     const body = candidateBody(job);
@@ -53,11 +55,12 @@ export function createFridaySender({ enabled = false, contractVerified = false,
         headers: { 'content-type': 'application/json', authorization: 'Bearer ' + secret } });
     } catch (error) {
       const transient = ['callback_timeout', 'callback_transport_failed', 'callback_dns_failed'].includes(error?.code);
-      fail(transient ? error.code : 'friday_transport_failed');
+      const code = transient ? error.code : 'friday_transport_failed';
+      throw observed(new BridgeError(code, 503), code);
     }
     if (!Number.isInteger(response?.status) || response.status < 100 || response.status > 599) {
-      fail('friday_transport_invalid');
+      throw observed(new BridgeError('friday_transport_invalid', 503), 'friday_transport_invalid');
     }
-    return { status: response.status }; // Transport evidence only, never wake proof.
+    return observed({ status: response.status }); // Transport evidence only, never wake proof.
   };
 }

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { BridgeError } from './policy.mjs';
+import { BridgeError, DELIVERY_TRANSPORT_OUTCOME } from './policy.mjs';
 import { subscriptionAccessAllowed } from './access.mjs';
 import { signedHeaders } from './webhook.mjs';
 
@@ -23,6 +23,11 @@ export class DeliveryWorker {
       const job = state.jobs[jobId];
       if (!job || ['accepted', 'dead'].includes(job.state) || job.dueAt > now ||
           (job.state === 'leased' && job.leaseUntil > now)) return null;
+      if (job.firstTransportOutcome?.terminal === true) {
+        const status = job.firstTransportOutcome.status;
+        job.state = status >= 200 && status < 300 ? 'accepted' : 'dead';
+        return null; // Restore a committed one-shot result without another send.
+      }
       if (job.attempts >= this.maxAttempts) {
         job.state = 'dead'; job.lastError = 'attempt_limit'; return null;
       }
@@ -37,6 +42,7 @@ export class DeliveryWorker {
     if (!claimed) return { attempted: false };
     const { job, subscription } = claimed;
     let accepted = false; let retry = false; let code = 'delivery_configuration_required'; let status = null;
+    let transportOutcome = null;
     try {
       // Jarvis uses a finite verified-token lease plus durable resource denial.
       // Friday additionally requires its separately verified native authorizer.
@@ -72,16 +78,19 @@ export class DeliveryWorker {
             response = await this.fridaySender(job);
           }
           status = response.status;
+          transportOutcome = response[DELIVERY_TRANSPORT_OUTCOME] || null;
           accepted = status >= 200 && status < 300;
-          retry = !accepted && transient(status);
-          code = accepted ? null : retry ? 'transient_http' : 'permanent_http';
+          retry = !accepted && transient(status) && transportOutcome?.terminal !== true;
+          code = accepted ? null : transient(status) ? 'transient_http' : 'permanent_http';
         }
       }
     } catch (error) {
       // Transport failures are retryable. Configuration, encryption and public
       // address rejection require repair and must not consume repeat requests.
-      retry = ['callback_timeout', 'callback_transport_failed', 'callback_dns_failed'].includes(error?.code);
-      code = retry ? 'transport_transient' : 'delivery_configuration_required';
+      transportOutcome = error?.[DELIVERY_TRANSPORT_OUTCOME] || null;
+      const transientError = ['callback_timeout', 'callback_transport_failed', 'callback_dns_failed'].includes(error?.code);
+      retry = transientError && transportOutcome?.terminal !== true;
+      code = transientError ? 'transport_transient' : 'delivery_configuration_required';
     }
     const completedAt = this.clock();
     const saved = await this.store.transaction(state => {
@@ -90,6 +99,14 @@ export class DeliveryWorker {
       const sub = subscription ? state.subscriptions[subscription.id] : null;
       if (subscription && (activeJob.recipient !== sub?.recipient ||
           !subscriptionAccessAllowed(state, sub, this.policyId, this.clock()))) { accepted = false; retry = false; code = 'subscription_inactive'; }
+      if (transportOutcome) {
+        // Worker claims/queue callbacks are not HTTP sends. Count only adapter
+        // transport invocations with a fenced outcome; DNS/TLS failure may mean
+        // no request reached the receiver. Never overwrite the first evidence.
+        activeJob.transportAttempts = (activeJob.transportAttempts || 0) + 1;
+        activeJob.firstTransportOutcome ||= { at: completedAt, workerAttempt: job.attempts,
+          status, error: transportOutcome.error || code, terminal: transportOutcome.terminal === true };
+      }
       activeJob.state = accepted ? 'accepted' : retry && activeJob.attempts < this.maxAttempts ? 'pending' : 'dead';
       activeJob.lastError = code; activeJob.lastStatus = status;
       activeJob.dueAt = completedAt + backoff(activeJob.attempts);
