@@ -1,4 +1,4 @@
-import { dailyMessage, validateMessage, retainMessages, reserveMessage, checkMessageCapacity, MESSAGE_PROTOCOL } from './messages.mjs';
+import { dailyMessage, validateMessage, retainMessages, reserveMessage, checkMessageCapacity, MESSAGE_PROTOCOL, MESSAGE_TTL_MS } from './messages.mjs';
 import { randomUUID } from 'node:crypto';
 import { BridgeError, validateEnvelope, SCOPES } from './policy.mjs';
 import { appendDeliveryJobs, authorizeRecipient, ownKeys } from './events.mjs';
@@ -165,7 +165,8 @@ export class Bridge {
         ackMessageId = randomUUID();
         const { envelope, hash } = dailyMessage(original) ? validateMessage({ protocol: MESSAGE_PROTOCOL,
           id: ackMessageId, from: principal.role, to: original.from, kind: 'ack', sentAt: new Date(now).toISOString(),
-          expiresAt: original.expiresAt, threadId: original.threadId, route: original.route, correlationId: original.id }, principal, now)
+          expiresAt: new Date(Math.min(Date.parse(original.expiresAt), now + MESSAGE_TTL_MS)).toISOString(),
+          threadId: original.threadId, route: original.route, correlationId: original.id }, principal, now)
           : validateEnvelope({ id: ackMessageId, testId: original.testId,
             from: principal.role, to: original.from, kind: 'ack', sentAt: new Date(now).toISOString(),
             correlationId: original.id, marker: original.marker }, principal, now);

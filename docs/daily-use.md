@@ -60,7 +60,9 @@ prearmed dispatcher survives a crash before the subsequent direct job enqueue.
 Before receipt completion, reserve an original-ID dispatcher for its correlated
 ACK; receipt + one ACK + ACK jobs then commit atomically. Duplicate completion
 returns the same ACK. ACK completion never emits another ACK. ACKs contain no
-text and share the source retention deadline and correlation/thread/route.
+text and share the source retention deadline and correlation/thread/route. Their
+expiry is the earlier of source expiry and one hour after ACK creation, so
+permitted future source timestamps cannot invalidate immediate completion.
 
 Existing worker fencing checks source authorization and recipient subscription
 before claim, after asynchronous access checking, immediately before transport
@@ -77,13 +79,22 @@ that reply; this phase does not promise exactly-once external side effects.
 ## Bounded retention and capacity
 
 Daily content/jobs/receipts become inaccessible after 24 hours. Their managed
-queue cleanup is reserved before content commit, and removes them even while
+queue cleanup is reserved before content commit and, when delivered, removes
+them even while
 application delivery is off. Keep BRIDGE_DAILY_ENABLED=true during an emergency
 BRIDGE_DELIVERY_ENABLED=false shutdown to allow these already reserved cleanup
 callbacks to finish; callbacks cannot deliver application events while off.
-Native queue outages can delay physical cleanup; no request can read expired
-content, and subsequent authenticated storage transitions also prune it. Do not
-roll back the cleanup-capable code until existing retention work has completed.
+Physical cleanup is BEST EFFORT, not a finite deletion guarantee. Its queue item
+shares the twenty-callback poison budget and has about one hour of TTL beyond
+its scheduled delivery. Sustained database/queue failures can exhaust or expire
+that sole item and leave expired plaintext stored indefinitely while idle.
+Another successful cleanup or authenticated storage transition prunes it, but
+there is no independent cleanup sweeper or overdue-cleanup alert in this phase.
+No request can read content after the 24-hour cutoff, and hard capacity
+backpressure still bounds stored content count/size. Do not promise a physical
+erasure deadline; stricter retention requires a separately reviewed recovery
+mechanism and visibility. Do not roll back the cleanup-capable code until
+existing retention work has completed.
 
 Hash-only ID/kind/expiry tombstones prevent replay for seven days, with one
 further delayed cleanup. Exact duplicates during that period do not recreate

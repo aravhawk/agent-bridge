@@ -318,3 +318,19 @@ test('real runtime delivers daily source and native signed ACK, then retains cle
   assert.equal(f.document().messages[m.id], undefined); assert.equal(f.document().messages[ackId], undefined);
   assert.equal(f.posts.length, before);
 });
+
+test('future-skew completion caps ACK lifetime while preserving the receiver JWT authority limit', async () => {
+  const f = fixture(); await f.events.subscribe(jarvis, f.subscription);
+  const m = f.message('jarvis', { sentAt: new Date(start + 60000).toISOString(), expiresAt: new Date(start + 3660000).toISOString() });
+  const receiver = who('friday', start + 30000);
+  await f.bridge.sendMessage(jarvis, m);
+  const claim = await f.bridge.claim(receiver, { messageId: m.id });
+  const done = await complete(f.bridge, receiver, m.id, claim.claimId);
+  const ack = (await f.bridge.read(jarvis, { messageId: done.ackMessageId })).envelope;
+  assert.equal(ack.sentAt, new Date(start).toISOString());
+  assert.equal(ack.expiresAt, new Date(start + 3600000).toISOString());
+  assert.ok(Date.parse(ack.expiresAt) <= Date.parse(m.expiresAt));
+  assert.equal(f.store.snapshot().messages[ack.id].authorization.expiresAt, start + 30000);
+  const ackClaim = await f.bridge.claim(jarvis, { messageId: ack.id });
+  assert.equal((await complete(f.bridge, jarvis, ack.id, ackClaim.claimId)).ackMessageId, null);
+});
