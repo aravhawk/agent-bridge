@@ -1,7 +1,7 @@
 import { runtime } from '../src/runtime.mjs';
 let consumer;
 export default { async fetch(request) {
-  if (process.env.BRIDGE_DELIVERY_ENABLED !== 'true') {
+  if (process.env.BRIDGE_DELIVERY_ENABLED !== 'true' && process.env.BRIDGE_DAILY_ENABLED !== 'true') {
     return Response.json({ error: 'delivery_not_enabled' }, { status: 503 });
   }
   // queue/v2beta consumers have no public URL. Preserve the trusted internal

@@ -1,3 +1,4 @@
+import { dailyMessage, validateMessage, retainMessages, reserveMessage, checkMessageCapacity, MESSAGE_PROTOCOL } from './messages.mjs';
 import { randomUUID } from 'node:crypto';
 import { BridgeError, validateEnvelope, SCOPES } from './policy.mjs';
 import { appendDeliveryJobs, authorizeRecipient, ownKeys } from './events.mjs';
@@ -29,17 +30,20 @@ function insert(state, envelope, hash, now, authorization) {
   if (saved) return { messageId: envelope.id, queued: true, duplicate: true, jobIds: saved.jobIds };
   if (envelope.kind === 'ack') {
     const probe = state.messages[envelope.correlationId]?.envelope;
-    if (probe?.kind !== 'probe' || probe.from !== envelope.to || probe.to !== envelope.from) fail('invalid_correlation', 409);
+    if (!probe || probe.kind === 'ack' || (dailyMessage(envelope) !== dailyMessage(probe)) ||
+        (dailyMessage(envelope) && (probe.threadId !== envelope.threadId || probe.route !== envelope.route)) || probe.from !== envelope.to || probe.to !== envelope.from) fail('invalid_correlation', 409);
   }
+  const retainUntil = dailyMessage(envelope) ? reserveMessage(state, envelope, hash, now) : undefined;
   const jobIds = appendDeliveryJobs(state, envelope, now);
   if (envelope.to === 'jarvis' && !jobIds.length) fail('recipient_subscription_required', 503);
-  state.messages[envelope.id] = { envelope, hash, storedAt: now, jobIds, authorization };
+  state.messages[envelope.id] = { envelope, hash, storedAt: now, jobIds, authorization, ...(retainUntil ? { retainUntil } : {}) };
   return { messageId: envelope.id, queued: true, duplicate: false, jobIds };
 }
 
 export class Bridge {
-  constructor({ store, clock = Date.now, probeMessageId, probeSender = 'jarvis', messagePolicyIds, deliveryUntil = Infinity }) {
-    this.store = store; this.clock = clock; this.probeMessageId = probeMessageId;
+  constructor({ store, clock = Date.now, probeMessageId, probeSender = 'jarvis', messagePolicyIds, deliveryUntil = Infinity, dailyEnabled = false, prepareMessage, prepareReceipt }) {
+    this.prepareMessage = prepareMessage; this.prepareReceipt = prepareReceipt;
+    this.store = store; this.clock = clock; this.dailyEnabled = dailyEnabled; this.probeMessageId = probeMessageId;
     this.probeSender = probeSender;
     this.messagePolicyIds = messagePolicyIds; this.deliveryUntil = deliveryUntil;
   }
@@ -61,17 +65,62 @@ export class Bridge {
       return insert(state, envelope, hash, this.clock(), authorization);
     });
   }
+  async sendMessage(principal, input) {
+    if (!this.dailyEnabled) fail('daily_messages_not_enabled', 503);
+    if (input?.kind === 'ack') fail('use_receipt_complete_for_ack');
+    // Reserve native backend work BEFORE creating any content. If publishing
+    // fails, no new message is saved. The queued dispatcher tolerates an early
+    // callback and a failed DB commit without waking a recipient for absent data.
+    const preparation = await this.store.transaction(state => {
+      retainMessages(state, this.clock());
+      const prior = state.messages[input?.id?.toLowerCase?.()] || state.messageIds?.[input?.id?.toLowerCase?.()];
+      const validated = validateMessage(input, principal, prior ? Date.parse(input.sentAt) : this.clock());
+      if (prior?.hash !== undefined && prior.hash !== validated.hash) fail('message_id_conflict', 409);
+      if (!prior) {
+        verifiedMessageAuthorization(principal, validated.envelope, this.clock(), this.deliveryUntil);
+        checkMessageCapacity(state);
+        const now = this.clock();
+        state.messagePreparations ||= {};
+        for (const [id, entry] of Object.entries(state.messagePreparations)) if (entry.until <= now) delete state.messagePreparations[id];
+        const pending = state.messagePreparations[validated.envelope.id];
+        if (pending && pending.hash !== validated.hash) fail('message_id_conflict', 409);
+        if (!pending) {
+          admitProbe(state, principal.role, now); // Bound native queue publication too.
+          state.messagePreparations[validated.envelope.id] = { hash: validated.hash, until: now + 60000 };
+        }
+      }
+      return { id: validated.envelope.id, fresh: !prior };
+    });
+    if (preparation.fresh && this.prepareMessage) await this.prepareMessage(preparation.id);
+    return this.store.transaction(state => {
+      const now = this.clock(); retainMessages(state, now);
+      const id = typeof input?.id === 'string' ? input.id.toLowerCase() : '';
+      const prior = state.messages[id] || state.messageIds?.[id];
+      const { envelope, hash } = validateMessage(input, principal, prior ? Date.parse(input.sentAt) : now);
+      if (prior && prior.hash !== hash) fail('message_id_conflict', 409);
+      if (prior) return state.messages[id]
+        ? { messageId: id, queued: true, duplicate: true, jobIds: state.messages[id].jobIds }
+        : { messageId: id, queued: false, duplicate: true, expired: true, jobIds: [] };
+      if (Date.parse(envelope.expiresAt) <= now) fail('message_expired', 403);
+      const authorization = verifiedMessageAuthorization(principal, envelope, now, this.deliveryUntil);
+      delete state.messagePreparations?.[envelope.id];
+      return insert(state, envelope, hash, now, authorization);
+    });
+  }
   async read(principal, params) {
     ownKeys(params, ['messageId']);
     return this.store.transaction(state => {
+      retainMessages(state, this.clock());
       const message = incoming(state, principal, params.messageId, this.probeMessageId, this.probeSender);
-      return { envelope: message.envelope, receivedAt: new Date(message.storedAt).toISOString() };
+      return { envelope: message.envelope, ...(dailyMessage(message.envelope) ? { authority: 'peer_data_requires_user_workflow',
+        expired: Date.parse(message.envelope.expiresAt) <= this.clock() } : {}), receivedAt: new Date(message.storedAt).toISOString() };
     });
   }
   async claim(principal, params) {
     ownKeys(params, ['messageId']);
     return this.store.transaction(state => {
       const now = this.clock();
+      retainMessages(state, this.clock());
       const message = incoming(state, principal, params.messageId, this.probeMessageId, this.probeSender);
       const old = state.receipts[params.messageId];
       if (old?.state === 'complete') return { duplicate: true, completed: true, ackMessageId: old.ackMessageId };
@@ -90,8 +139,19 @@ export class Bridge {
         fail('invalid_receipt_evidence');
       }
     }
+    if (this.prepareReceipt) {
+      const prepare = await this.store.transaction(state => {
+        const message = incoming(state, principal, params.messageId, this.probeMessageId, this.probeSender);
+        const receipt = state.receipts[params.messageId];
+        if (receipt?.owner !== principal.principalKey || receipt.claimId !== params.claimId) fail('receipt_claim_required', 409);
+        if (receipt.state === 'complete') return false;
+        if (receipt.leaseUntil <= this.clock() || !messageAccessAllowed(state, message, this.messagePolicyIds, this.clock())) fail('stale_receipt_claim', 409);
+        return dailyMessage(message.envelope) && message.envelope.kind !== 'ack';
+      });
+      if (prepare) await this.prepareReceipt(params.messageId);
+    }
     return this.store.transaction(state => {
-      const now = this.clock();
+      const now = this.clock(); retainMessages(state, now);
       const message = incoming(state, principal, params.messageId, this.probeMessageId, this.probeSender), original = message.envelope;
       const receipt = state.receipts[params.messageId];
       if (receipt?.owner !== principal.principalKey) fail('receipt_claim_required', 409);
@@ -100,12 +160,15 @@ export class Bridge {
       if (!messageAccessAllowed(state, message, this.messagePolicyIds, now)) fail('message_authorization_inactive', 403);
       if (receipt.claimId !== params.claimId || receipt.leaseUntil <= now) fail('stale_receipt_claim', 409);
       let ackMessageId = null; let jobIds = [];
-      if (original.kind === 'probe') {
+      if (original.kind !== 'ack') {
         // All ACK creation, receipt completion, and outbound jobs commit together.
         ackMessageId = randomUUID();
-        const { envelope, hash } = validateEnvelope({ id: ackMessageId, testId: original.testId,
-          from: principal.role, to: original.from, kind: 'ack', sentAt: new Date(now).toISOString(),
-          correlationId: original.id, marker: original.marker }, principal, now);
+        const { envelope, hash } = dailyMessage(original) ? validateMessage({ protocol: MESSAGE_PROTOCOL,
+          id: ackMessageId, from: principal.role, to: original.from, kind: 'ack', sentAt: new Date(now).toISOString(),
+          expiresAt: original.expiresAt, threadId: original.threadId, route: original.route, correlationId: original.id }, principal, now)
+          : validateEnvelope({ id: ackMessageId, testId: original.testId,
+            from: principal.role, to: original.from, kind: 'ack', sentAt: new Date(now).toISOString(),
+            correlationId: original.id, marker: original.marker }, principal, now);
         ({ jobIds } = insert(state, envelope, hash, now, verifiedMessageAuthorization(principal, envelope, now, this.deliveryUntil)));
       }
       state.receipts[params.messageId] = { ...receipt, state: 'complete', completedAt: now,
@@ -119,6 +182,7 @@ export class Bridge {
     ownKeys(params, ['messageId']); messageId(params.messageId);
     if (!principal?.scopes?.some(x => Object.values(SCOPES[principal.role] || {}).includes(x))) fail('insufficient_scope', 403);
     return this.store.transaction(state => {
+      retainMessages(state, this.clock());
       const message = state.messages[params.messageId];
       if (!message || ![message.envelope.from, message.envelope.to].includes(principal.role)) fail('message_not_found', 404);
       const receipt = state.receipts[params.messageId];

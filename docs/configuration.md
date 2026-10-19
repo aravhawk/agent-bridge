@@ -1,5 +1,9 @@
 # Configuration and preserved boundaries
 
+This document describes the preserved synthetic-mode baseline. For the gated
+0.2.0 daily-use candidate, use [daily-use.md](daily-use.md), including native
+receiver migration, finite renewal, retention cleanup and rollback requirements.
+
 ## Public OAuth settings
 
 Issuer: `https://musical-bee-9978.clerk.accounts.dev`.

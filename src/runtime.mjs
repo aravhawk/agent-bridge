@@ -1,4 +1,5 @@
 import pg from 'pg';
+import { dailyMessage } from './messages.mjs';
 import { createRemoteJWKSet } from 'jose';
 import { QueueClient } from '@vercel/queue';
 import { createAccessVerifier, createContractObserver, BridgeError, authorizationPolicyId } from './policy.mjs';
@@ -43,17 +44,28 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
         (contractVerified || probeSender === 'jarvis'),
       probeOnly: !contractVerified && !!probeId };
   }
+  function dailyConfiguration() {
+    const requested = env.BRIDGE_DAILY_ENABLED === 'true';
+    // Explicit reviewed receiver-policy attestation, never learned from a peer
+    // payload or inferred from credential presence/HTTP transport acceptance.
+    const ready = requested && env.BRIDGE_DAILY_RECEIVER_POLICY === 'inbox-v1' &&
+      env.FRIDAY_WEBHOOK_CONTRACT_VERIFIED === 'true' &&
+      env.FRIDAY_RECEIVER_ID === 'jarvis-friday-test-receiver' &&
+      fridaySenderConfigured({ endpoint: env.FRIDAY_WEBHOOK_URL, secret: env.FRIDAY_WEBHOOK_KEY });
+    return { requested, ready };
+  }
   function readiness() {
     const callbackProtectorConfigured = !!decodeStorageKey(env.BRIDGE_SUBSCRIPTION_STORAGE_KEY);
     const base = contractReady && callbackProtectorConfigured && !!policyId && !!env.DATABASE_URL;
-    const friday = fridayConfiguration();
+    const friday = fridayConfiguration(), daily = dailyConfiguration();
     return { storageConfigured: !!env.DATABASE_URL, callbackProtectorConfigured,
       currentAccessCheckConfigured: !!policyId,
       subscriptionSetupEnabled: !!base && env.BRIDGE_SUBSCRIPTIONS_ENABLED === 'true',
       fridaySenderConfigured: friday.senderConfigured, fridayTestAuthorizationConfigured: friday.authorized,
       fridayContractVerified: friday.contractVerified, fridayProbeModeConfigured: friday.ready && friday.probeOnly,
-      testDeliveryPinned: friday.ready,
-      deliveryEnabled: !!base && env.BRIDGE_DELIVERY_ENABLED === 'true' && friday.ready };
+      testDeliveryPinned: !daily.requested && friday.ready,
+      dailyMessagesConfigured: daily.ready,
+      deliveryEnabled: !!base && env.BRIDGE_DELIVERY_ENABLED === 'true' && (daily.requested ? daily.ready : friday.ready) };
   }
   function configure() {
     if (store) return;
@@ -70,9 +82,13 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
       idleTimeoutMillis: 10000, query_timeout: 10000 });
     pool.on('error', () => {}); // Never emit a credential-bearing connection error.
     store = new PostgresStore(pool);
-    const friday = fridayConfiguration();
-    bridge = new Bridge({ store, clock, messagePolicyIds, deliveryUntil: friday.authorized ? friday.until : 0,
-      probeMessageId: friday.probeId, probeSender: friday.probeSender });
+    const friday = fridayConfiguration(), daily = dailyConfiguration();
+    const deliveryUntil = daily.requested ? Infinity : friday.until;
+    const probeId = daily.requested ? undefined : friday.probeId;
+    bridge = new Bridge({ store, clock, messagePolicyIds, deliveryUntil: daily.ready ? Infinity : friday.authorized ? friday.until : 0, dailyEnabled: daily.ready,
+      probeMessageId: probeId, probeSender: friday.probeSender,
+      prepareMessage: daily.ready ? id => queue.prepareMessage(id) : undefined,
+      prepareReceipt: daily.ready ? id => queue.prepareReceipt(id) : undefined });
     const storageKey = decodeStorageKey(env.BRIDGE_SUBSCRIPTION_STORAGE_KEY);
     const protector = storageKey ? createProtector(storageKey) : undefined;
     const baseReady = contractReady && !!protector && !!policyId;
@@ -83,25 +99,25 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
     // native subscription must be verifiable BEFORE event sends are enabled.
     events = new NativeEvents({ store, protector, transport, policyId, clock, enabled: subscriptionSetup });
     const nativeSender = delivery ? fridaySender || createFridaySender({ enabled: true,
-      contractVerified: friday.contractVerified, probeMessageId: friday.probeId,
+      contractVerified: friday.contractVerified, probeMessageId: probeId,
       endpoint: env.FRIDAY_WEBHOOK_URL, secret: env.FRIDAY_WEBHOOK_KEY, transport }) : undefined;
     const nativeAccess = async input => store.transaction(state => {
       const message = state.messages[input.messageId];
-      if (clock() >= friday.until || !messageAccessAllowed(state, message, messagePolicyIds, clock()) ||
+      if (clock() >= deliveryUntil || !messageAccessAllowed(state, message, messagePolicyIds, clock()) ||
           message.envelope.to !== input.recipient) return false;
       // Verification controls transport mode, never whether scope is enforced.
-      if (!testEnvelopeAllowed(message.envelope, friday.probeId, friday.probeSender)) return false;
+      if (daily.requested ? !dailyMessage(message.envelope) : !testEnvelopeAllowed(message.envelope, probeId, friday.probeSender)) return false;
       if (input.recipient === 'jarvis') {
         const sub = state.subscriptions[input.subscriptionId];
         return sub?.owner === input.owner && subscriptionAccessAllowed(state, sub, policyId, clock());
       }
-      return input.recipient === 'friday' && friday.ready;
+      return input.recipient === 'friday' && (daily.requested ? daily.ready : friday.ready);
     });
     const authorize = async input => (await nativeAccess(input)) && (!accessAllowed || await accessAllowed(input));
     const worker = new DeliveryWorker({ store, protector, transport, policyId, messagePolicyIds,
-      probeMessageId: friday.probeId, probeSender: friday.probeSender,
-      clock, deliveryUntil: friday.until, accessAllowed: authorize, fridaySender: nativeSender, enabled: delivery });
-    queue = createQueueAdapter({ client, store, worker, clock, enabled: delivery });
+      probeMessageId: probeId, probeSender: friday.probeSender,
+      clock, deliveryUntil, accessAllowed: authorize, fridaySender: nativeSender, enabled: delivery });
+    queue = createQueueAdapter({ client, store, worker, clock, enabled: delivery, maintenanceEnabled: daily.requested });
   }
   return {
     handler(role) {
@@ -124,10 +140,11 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
       // otherwise valid token can discover the resource's scoped tools.
       const blocked = async () => { throw new BridgeError('receiver_readiness_required', 503); };
       const run = method => async (...args) => {
-        if (['send', 'claim', 'complete'].includes(method) && !readiness().deliveryEnabled) return blocked();
+        if (['send', 'sendMessage', 'claim', 'complete'].includes(method) && !readiness().deliveryEnabled) return blocked();
+        if (method === 'send' && dailyConfiguration().requested) throw new BridgeError('synthetic_mode_required', 403);
         configure(); return bridge[method](...args);
       };
-      const operations = Object.fromEntries(['send', 'claim', 'complete', 'read', 'status'].map(m => [m, run(m)]));
+      const operations = Object.fromEntries(['send', 'sendMessage', 'claim', 'complete', 'read', 'status'].map(m => [m, run(m)]));
       const lazyEvents = {
         list: (...args) => new NativeEvents({}).list(...args),
         subscribe: async (...args) => {
@@ -136,9 +153,11 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
           configure(); return events.subscribe(...args);
         },
         unsubscribe: async (...args) => { configure(); return events.unsubscribe(...args); },
+        status: async (...args) => { configure(); return events.status(...args); },
       };
       return createMcpHandler({ enabled: true, verify, bridge: operations, events: lazyEvents,
-        health: () => ({ status: 'ok', authenticated: true, serverVersion: '0.1.0', readiness: readiness() }),
+        dailyEnabled: dailyConfiguration().requested,
+        health: () => ({ status: 'ok', authenticated: true, serverVersion: '0.2.0', readiness: readiness() }),
         scheduleJobs: async ids => {
           if (!readiness().deliveryEnabled) throw new BridgeError('queue_not_enabled', 503);
           configure(); return queue.scheduleJobs(ids);
@@ -149,7 +168,10 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
     queueHandler() {
       configure();
       return client.handleCallback(async (...args) => {
-        if (!readiness().deliveryEnabled) throw new BridgeError('delivery_not_enabled', 503);
+        const payload = args[0];
+        const cleanup = dailyConfiguration().requested && payload && Object.keys(payload).length === 1 &&
+          /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(payload.cleanupMessageId || '');
+        if (!readiness().deliveryEnabled && !cleanup) throw new BridgeError('delivery_not_enabled', 503);
         return queue.consume(...args);
       }, { visibilityTimeoutSeconds: 60, retry: queue.retry });
     },

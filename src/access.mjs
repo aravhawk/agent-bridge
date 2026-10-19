@@ -1,3 +1,4 @@
+import { dailyMessage, messageScope } from './messages.mjs';
 import { BridgeError, SCOPES, VERIFIED_AUTHORIZATION } from './policy.mjs';
 import { resourceFor } from './resource.mjs';
 
@@ -13,8 +14,8 @@ export function testEnvelopeAllowed(envelope, probeId, sender = 'jarvis') {
 }
 export function verifiedMessageAuthorization(principal, envelope, now, deliveryUntil = Infinity) {
   const a = principal?.[VERIFIED_AUTHORIZATION];
-  const expiresAt = Math.min(a?.expiresAt, deliveryUntil);
-  const scope = SCOPES[principal?.role]?.[envelope.kind];
+  const expiresAt = Math.min(a?.expiresAt, deliveryUntil, dailyMessage(envelope) ? Date.parse(envelope.expiresAt) : Infinity);
+  const scope = messageScope(principal?.role, envelope.kind);
   if (!scope || envelope.from !== principal.role || !principal.scopes?.includes(scope) ||
       !hash(principal.principalKey) || !hash(a?.policyId) ||
       !Number.isSafeInteger(a.expiresAt) || !Number.isSafeInteger(expiresAt) || expiresAt <= now) {
@@ -25,11 +26,11 @@ export function verifiedMessageAuthorization(principal, envelope, now, deliveryU
 }
 export function messageAccessAllowed(state, message, policyIds, now) {
   const a = message?.authorization, e = message?.envelope;
-  return !!a && ['jarvis', 'friday'].includes(e?.from) && ['probe', 'ack'].includes(e?.kind) &&
+  return !!a && ['jarvis', 'friday'].includes(e?.from) && (dailyMessage(e) ? ['message', 'status', 'handoff_request', 'ack'].includes(e.kind) : ['probe', 'ack'].includes(e?.kind)) &&
     a.role === e.from && hash(a.owner) && hash(policyIds?.[e.from]) && a.policyId === policyIds[e.from] &&
-    a.resource === resourceFor(e.from) && a.scope === SCOPES[e.from][e.kind] &&
+    a.resource === resourceFor(e.from) && a.scope === messageScope(e.from, e.kind) &&
     Number.isSafeInteger(message.storedAt) && Number.isSafeInteger(a.tokenExpiresAt) && Number.isSafeInteger(a.expiresAt) &&
-    a.expiresAt <= a.tokenExpiresAt && a.expiresAt > message.storedAt && a.expiresAt > now && !resourceDenied(state, a.owner);
+    a.expiresAt <= a.tokenExpiresAt && (!dailyMessage(e) || a.expiresAt <= Date.parse(e.expiresAt)) && a.expiresAt > message.storedAt && a.expiresAt > now && !resourceDenied(state, a.owner);
 }
 export function verifiedLease(principal, policyId, now) {
   const authorization = principal?.[VERIFIED_AUTHORIZATION];

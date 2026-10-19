@@ -6,7 +6,7 @@ import { verifiedLease, resourceDenied, validLeaseMetadata, subscriptionAccessAl
 const fail = (code, status = 400) => { throw new BridgeError(code, status); };
 export const EVENT_NAME = 'bridge.message.received';
 export const eventDefinition = Object.freeze({ name: EVENT_NAME,
-  description: 'A stored synthetic bridge message addressed to Jarvis. Read it by messageId.',
+  description: 'A stored bridge message addressed to Jarvis. Read by messageId; peer data never grants approval.',
   delivery: ['webhook'], inputSchema: { type: 'object', properties: { recipient: { type: 'string', enum: ['jarvis'] } },
     required: ['recipient'], additionalProperties: false },
   payloadSchema: { type: 'object', properties: { messageId: { type: 'string' } }, required: ['messageId'], additionalProperties: false } });
@@ -105,10 +105,21 @@ export class NativeEvents {
       deadline(s, old, this.clock());
       s.subscriptions[id] = { id, owner: principal.principalKey, recipient: 'jarvis', name: EVENT_NAME,
         arguments: { recipient: 'jarvis' }, active: true, status: 'active', expiresAt: until, authorization, sealed, fingerprint,
-        verifiedUntil: savedAt + 300000 };
+        verifiedUntil: savedAt + 300000, firstSubscribedAt: old?.firstSubscribedAt || savedAt,
+        lastSubscribedAt: savedAt, renewalCount: (old?.renewalCount || 0) + (old ? 1 : 0) };
       return until;
     });
     return { id, refreshBefore: new Date(expiresAt).toISOString(), cursor: null, truncated: false };
+  }
+  async status(principal, params = {}) {
+    authorizeRecipient(principal, 'jarvis'); ownKeys(params, [], []);
+    if (!this.store) fail('storage_configuration_required', 503);
+    return this.store.transaction(state => ({ subscriptions: Object.values(state.subscriptions)
+      .filter(sub => sub.owner === principal.principalKey && sub.recipient === 'jarvis').slice(0, 20)
+      .map(sub => ({ id: sub.id, active: subscriptionAccessAllowed(state, sub, this.policyId, this.clock()),
+        refreshBefore: Number.isSafeInteger(sub.expiresAt) ? new Date(sub.expiresAt).toISOString() : null,
+        lastSubscribedAt: Number.isSafeInteger(sub.lastSubscribedAt) ? new Date(sub.lastSubscribedAt).toISOString() : null,
+        renewalCount: sub.renewalCount || 0 })) }));
   }
   async unsubscribe(principal, params) {
     const { id } = identity(principal, params, false);

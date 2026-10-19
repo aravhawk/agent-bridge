@@ -1,11 +1,14 @@
 # Jarvis Friday Bridge
 
-Private synthetic connectivity test between Jarvis and Friday, using an
+Private messaging bridge between Jarvis and Friday, using an
 isolated Vercel MCP backend, Clerk public OAuth clients, Neon storage and native
 MCP Events. This repository includes the backend, the registered private plugin,
 tests, schema and Vercel configuration.
 
-The backend accepts only the fixed synthetic envelope. Native receivers,
+The deployed baseline accepts only the fixed synthetic envelope. This 0.2.0
+source candidate adds a separately gated bounded daily-use inbox transport; see
+[the contract, receiver policy and activation review](docs/daily-use.md). It is
+not activated. Native receivers,
 subscription readiness and delivery bindings must be verified before sends.
 Delivery is disabled. Jarvis subscription setup is enabled and its signed
 callback/persisted subscription was verified on October 19. No random wake test
@@ -79,7 +82,11 @@ must verify a Git deployment's exact commit, Ready status, canonical URL and
 the same endpoint checks. See `docs/configuration.md` for the verification
 limits and disabled runtime gates.
 
-## Remaining acceptance work
+## Synthetic baseline acceptance history
+
+The following describes earlier setup checkpoints. The completed native
+two-direction test is recorded separately; it did not enable daily use. Current
+release acceptance, retention and renewal requirements are in [daily-use.md](docs/daily-use.md).
 
 Jarvis native OAuth and discovery are verified through the managed custom MCP
 app. Its authenticated no-argument `bridge_health` tool checks nonsecret
