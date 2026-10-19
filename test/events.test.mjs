@@ -40,7 +40,7 @@ async function fixture({ responseStatus = 202 } = {}) {
   };
   const events = new NativeEvents({ store, protector, transport, policyId, enabled: true, clock });
   const key = secret(); const subscription = await events.subscribe(jarvis, params(key));
-  const bridge = new Bridge({ store, clock });
+  const bridge = new Bridge({ store, clock, messagePolicyIds: { jarvis: policyId, friday: policyId } });
   return { store, protector, calls, events, key, subscription, bridge, clock, policyId,
     advance: ms => { time += ms; }, transport };
 }

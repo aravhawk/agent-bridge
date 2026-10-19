@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { BridgeError, validateEnvelope, SCOPES } from './policy.mjs';
 import { appendDeliveryJobs, authorizeRecipient, ownKeys } from './events.mjs';
+import { verifiedMessageAuthorization, messageAccessAllowed } from './access.mjs';
 
 const fail = (code, status = 400) => { throw new BridgeError(code, status); };
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
@@ -15,13 +16,15 @@ function admitProbe(state, role, now) {
   if (recent.length >= 10) fail('probe_rate_limited', 429);
   admissions[role] = [...recent, now];
 }
-function incoming(state, principal, id) {
+function incoming(state, principal, id, probeMessageId) {
   authorizeRecipient(principal); messageId(id);
   const message = state.messages[id];
   if (!message || message.envelope.to !== principal.role) fail('message_not_found', 404);
+  if (probeMessageId && id !== probeMessageId &&
+      !(message.envelope.kind === 'ack' && message.envelope.correlationId === probeMessageId)) fail('contract_probe_only', 403);
   return message;
 }
-function insert(state, envelope, hash, now) {
+function insert(state, envelope, hash, now, authorization) {
   const saved = state.messages[envelope.id];
   if (saved && saved.hash !== hash) fail('message_id_conflict', 409);
   if (saved) return { messageId: envelope.id, queued: true, duplicate: true, jobIds: saved.jobIds };
@@ -31,12 +34,15 @@ function insert(state, envelope, hash, now) {
   }
   const jobIds = appendDeliveryJobs(state, envelope, now);
   if (envelope.to === 'jarvis' && !jobIds.length) fail('recipient_subscription_required', 503);
-  state.messages[envelope.id] = { envelope, hash, storedAt: now, jobIds };
+  state.messages[envelope.id] = { envelope, hash, storedAt: now, jobIds, authorization };
   return { messageId: envelope.id, queued: true, duplicate: false, jobIds };
 }
 
 export class Bridge {
-  constructor({ store, clock = Date.now }) { this.store = store; this.clock = clock; }
+  constructor({ store, clock = Date.now, probeMessageId, messagePolicyIds, deliveryUntil = Infinity }) {
+    this.store = store; this.clock = clock; this.probeMessageId = probeMessageId;
+    this.messagePolicyIds = messagePolicyIds; this.deliveryUntil = deliveryUntil;
+  }
   async send(principal, input) {
     // ACK is only emitted by the atomic completion operation, never separately.
     if (input?.kind !== 'probe') fail('use_receipt_complete_for_ack');
@@ -46,26 +52,29 @@ export class Bridge {
       // still conflicts, and a new stale ID is rejected.
       const saved = typeof input.id === 'string' && state.messages[input.id.toLowerCase()];
       const { envelope, hash } = validateEnvelope(input, principal, saved ? Date.parse(input.sentAt) : this.clock());
+      if (this.probeMessageId && (envelope.id !== this.probeMessageId || envelope.from !== 'jarvis')) fail('contract_probe_only', 403);
+      const authorization = saved ? undefined : verifiedMessageAuthorization(principal, envelope, this.clock(), this.deliveryUntil);
       // Exact retransmissions stay idempotent even at the limit or after the
       // freshness window; changed bodies still take insert's conflict path.
       // Failed insertion rolls this admission back with the transaction.
       if (!saved) admitProbe(state, principal.role, this.clock());
-      return insert(state, envelope, hash, this.clock());
+      return insert(state, envelope, hash, this.clock(), authorization);
     });
   }
   async read(principal, params) {
     ownKeys(params, ['messageId']);
     return this.store.transaction(state => {
-      const message = incoming(state, principal, params.messageId);
+      const message = incoming(state, principal, params.messageId, this.probeMessageId);
       return { envelope: message.envelope, receivedAt: new Date(message.storedAt).toISOString() };
     });
   }
   async claim(principal, params) {
     ownKeys(params, ['messageId']); const now = this.clock();
     return this.store.transaction(state => {
-      incoming(state, principal, params.messageId);
+      const message = incoming(state, principal, params.messageId, this.probeMessageId);
       const old = state.receipts[params.messageId];
       if (old?.state === 'complete') return { duplicate: true, completed: true, ackMessageId: old.ackMessageId };
+      if (!messageAccessAllowed(state, message, this.messagePolicyIds, now)) fail('message_authorization_inactive', 403);
       if (old?.leaseUntil > now) fail('receipt_busy', 409);
       const claimId = randomUUID();
       state.receipts[params.messageId] = { state: 'claimed', owner: principal.principalKey,
@@ -82,11 +91,12 @@ export class Bridge {
     }
     const now = this.clock();
     return this.store.transaction(state => {
-      const original = incoming(state, principal, params.messageId).envelope;
+      const message = incoming(state, principal, params.messageId, this.probeMessageId), original = message.envelope;
       const receipt = state.receipts[params.messageId];
       if (receipt?.owner !== principal.principalKey) fail('receipt_claim_required', 409);
       if (receipt.state === 'complete') return { completed: true, duplicate: true,
         ackMessageId: receipt.ackMessageId, evidenceStatus: 'reported_requires_independent_host_confirmation' };
+      if (!messageAccessAllowed(state, message, this.messagePolicyIds, now)) fail('message_authorization_inactive', 403);
       if (receipt.claimId !== params.claimId || receipt.leaseUntil <= now) fail('stale_receipt_claim', 409);
       let ackMessageId = null; let jobIds = [];
       if (original.kind === 'probe') {
@@ -95,7 +105,7 @@ export class Bridge {
         const { envelope, hash } = validateEnvelope({ id: ackMessageId, testId: original.testId,
           from: principal.role, to: original.from, kind: 'ack', sentAt: new Date(now).toISOString(),
           correlationId: original.id, marker: original.marker }, principal, now);
-        ({ jobIds } = insert(state, envelope, hash, now));
+        ({ jobIds } = insert(state, envelope, hash, now, verifiedMessageAuthorization(principal, envelope, now, this.deliveryUntil)));
       }
       state.receipts[params.messageId] = { ...receipt, state: 'complete', completedAt: now,
         ackMessageId, hostedEventId: params.hostedEventId, hostedTurnId: params.hostedTurnId,
@@ -113,7 +123,9 @@ export class Bridge {
       const receipt = state.receipts[params.messageId];
       return { messageId: params.messageId,
         deliveries: message.jobIds.map(id => ({ eventId: state.jobs[id].eventId, state: state.jobs[id].state,
-          attempts: state.jobs[id].attempts })), receiptCompleted: receipt?.state === 'complete',
+          attempts: state.jobs[id].attempts, transportAttempts: state.jobs[id].transportAttempts ?? null,
+          firstTransportOutcome: state.jobs[id].firstTransportOutcome || null,
+          lastStatus: state.jobs[id].lastStatus ?? null, lastError: state.jobs[id].lastError ?? null })), receiptCompleted: receipt?.state === 'complete',
         ackMessageId: receipt?.ackMessageId || null,
         evidenceStatus: receipt?.evidenceStatus || 'no_hosted_receipt', wakeVerified: false };
     });

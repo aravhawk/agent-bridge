@@ -89,8 +89,9 @@ needed. A healthy response does not imply that delivery or subscriptions are
 ready. Refresh the managed app's tool list after a backend tool change.
 
 Jarvis's signed native Events subscription and callback protection are verified.
-Friday's supported incoming webhook authentication/secret handoff,
-supported Friday authorization and the native
+Friday's actual Bearer authentication and direct human Secret handoff are
+verified. Its finite source-JWT/operator-window delivery binding is wired behind
+disabled gates; native webhook body mapping, hosted wake and the native
 post-expiry refresh test remain separate acceptance requirements. A discovered
 tool, HTTP acceptance or caller-reported turn ID does not prove a hosted wake.
 See `docs/configuration.md` before enabling either setup or delivery.

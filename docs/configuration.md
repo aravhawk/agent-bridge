@@ -108,8 +108,40 @@ BRIDGE_AUTH_TIMING_DIAGNOSTIC=false
 BRIDGE_RPC_SHAPE_DIAGNOSTIC=false
 ```
 
-Flags alone cannot enable delivery. The default runtime still requires an
-valid JWT-bound lease metadata, callback protection and a supported Friday sender/access binding.
+Flags alone cannot enable delivery. The runtime requires valid JWT-bound
+message and subscription authority, callback protection and the saved Friday
+sender binding plus the following operator-only configuration:
+
+```text
+FRIDAY_RECEIVER_ID=jarvis-friday-test-receiver
+FRIDAY_TEST_AUTHORIZED_UNTIL=<ISO timestamp at most six hours ahead>
+FRIDAY_WEBHOOK_CONTRACT_VERIFIED=false
+FRIDAY_CONTRACT_PROBE_MESSAGE_ID=<one reserved canonical UUID>
+```
+
+The exact existing receiver and finite operator window are required in both
+probe and verified modes. The window expires without a scheduled cleanup.
+Before native body mapping and hosted wake are proven, keep the contract flag
+false: only the pinned Jarvis-originated probe and its correlated receipt/ACK
+are allowed. After independent native evidence, the operator may set the
+contract flag true for the bounded synthetic two-direction test. The global
+delivery flag still defaults false, and the subscription setup gate is separate.
+
+Every new probe and ACK stores only verified owner digest, role, exact resource,
+directional scope, policy fingerprint and token expiration. Message authority
+ends at the earlier of that JWT expiration and its original operator window.
+An exact duplicate with a fresh JWT or later window cannot extend it. Missing
+legacy metadata, mismatched policy/resource/scope/role, expiry and durable owner
+denial stop delivery even if an injected supplemental access adapter says yes.
+The worker checks before claiming, after asynchronous authorization, immediately
+before transport and at final commit. Receipt claim/completion also checks the
+original source authority before generating an ACK. No raw token is persisted.
+
+Health adds only `fridaySenderConfigured`, `fridayTestAuthorizationConfigured`,
+`fridayContractVerified` and `fridayProbeModeConfigured` booleans. These perform
+no receiver or database call and cannot establish live wake or token refresh.
+The status tool exposes sanitized transport counts, immutable first outcome and
+last numeric status/error to inspect the known message without raw runtime logs.
 Native callback configuration requires a securely supplied 32-byte AES-GCM
 protector key. No placeholder allow-all adapter, relay or polling listener is
 acceptable. Do not generate a new credential merely to inspect a setup flow.
@@ -149,12 +181,13 @@ establish a native subscription with arguments `recipient:"jarvis"` and
 must renew using fresh verified authority. The host supplies its callback URL and signing secret in the
 authenticated handshake. Never ask for that secret in chat.
 
-The current Friday UI exposes a Routines list and the existing email routine's
-pause toggle, but no usable pre-creation webhook form. Its guide documents POST
-and a persistent URL/sender-key capability, but not the exact body/auth/replay
-contract or a safe direct credential handoff to Vercel. No incoming webhook
-routine/key has been created for this bridge. Do not assume a generic xAI
-webhook format applies to the Bot app or repeat the unusable panel-copy path.
+The existing Friday webhook-only `Jarvis Friday Test Receiver` has been created
+and remains paused before test activation. Native field-navigation links open
+its actual credential form; the ordinary Routines list does not. The human
+saved its URL and Bearer key directly as Production Secrets. Do not reopen or
+copy their values into a transcript. Native guide/get and the form establish
+POST with Bearer authentication, but not body mapping or replay/response
+semantics. See [the bounded empirical test](friday-wire-contract.md).
 
 Keep existing routines/subscriptions enabled unless explicitly instructed
 otherwise. No schedule or random test should be armed before both native

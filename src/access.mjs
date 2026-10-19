@@ -2,6 +2,26 @@ import { BridgeError, SCOPES, VERIFIED_AUTHORIZATION } from './policy.mjs';
 import { resourceFor } from './resource.mjs';
 
 const hash = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+export function verifiedMessageAuthorization(principal, envelope, now, deliveryUntil = Infinity) {
+  const a = principal?.[VERIFIED_AUTHORIZATION];
+  const expiresAt = Math.min(a?.expiresAt, deliveryUntil);
+  const scope = SCOPES[principal?.role]?.[envelope.kind];
+  if (!scope || envelope.from !== principal.role || !principal.scopes?.includes(scope) ||
+      !hash(principal.principalKey) || !hash(a?.policyId) ||
+      !Number.isSafeInteger(a.expiresAt) || !Number.isSafeInteger(expiresAt) || expiresAt <= now) {
+    throw new BridgeError('message_authorization_required', 403);
+  }
+  return { owner: principal.principalKey, role: principal.role, resource: resourceFor(principal.role),
+    scope, policyId: a.policyId, tokenExpiresAt: a.expiresAt, expiresAt };
+}
+export function messageAccessAllowed(state, message, policyIds, now) {
+  const a = message?.authorization, e = message?.envelope;
+  return !!a && ['jarvis', 'friday'].includes(e?.from) && ['probe', 'ack'].includes(e?.kind) &&
+    a.role === e.from && hash(a.owner) && hash(policyIds?.[e.from]) && a.policyId === policyIds[e.from] &&
+    a.resource === resourceFor(e.from) && a.scope === SCOPES[e.from][e.kind] &&
+    Number.isSafeInteger(message.storedAt) && Number.isSafeInteger(a.tokenExpiresAt) && Number.isSafeInteger(a.expiresAt) &&
+    a.expiresAt <= a.tokenExpiresAt && a.expiresAt > message.storedAt && a.expiresAt > now && !resourceDenied(state, a.owner);
+}
 export function verifiedLease(principal, policyId, now) {
   const authorization = principal?.[VERIFIED_AUTHORIZATION];
   if (!hash(policyId) || authorization?.policyId !== policyId ||

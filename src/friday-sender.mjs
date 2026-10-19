@@ -4,10 +4,20 @@ import { callbackUrl, createPublicWebhookTransport } from './webhook.mjs';
 
 const fail = (code, status = 503) => { throw new BridgeError(code, status); };
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
+function destinationFor({ endpoint, secret }) {
+  try {
+    if (typeof endpoint !== 'string' || typeof secret !== 'string' ||
+        !/^[\x21-\x7e]{1,4096}$/.test(secret)) throw Error();
+    return callbackUrl(endpoint);
+  } catch { fail('friday_sender_configuration_required'); }
+}
+export function fridaySenderConfigured(options) {
+  try { destinationFor(options); return true; } catch { return false; }
+}
 
 // Candidate mirrors the existing Friday outbox body and saved receiver prompt.
-// Native docs have NOT established its acceptance/context mapping. No runtime
-// imports this adapter until the authorized one-job probe verifies that fact.
+// Native docs have NOT established its acceptance/context mapping. Runtime
+// gating permits only the authorized one-job probe until native proof exists.
 function candidateBody(job) {
   try {
     if (job?.recipient !== 'friday' || !uuid.test(job.messageId || '') ||
@@ -31,12 +41,7 @@ export function createFridaySender({ enabled = false, contractVerified = false,
   if (!enabled) fail('delivery_not_enabled');
   const probeOnly = contractVerified !== true;
   if (probeOnly && !uuid.test(probeMessageId || '')) fail('friday_native_contract_unverified');
-  let destination;
-  try {
-    if (typeof endpoint !== 'string' || typeof secret !== 'string' ||
-        !/^[\x21-\x7e]{1,4096}$/.test(secret)) throw Error();
-    destination = callbackUrl(endpoint);
-  } catch { fail('friday_sender_configuration_required'); }
+  const destination = destinationFor({ endpoint, secret });
   const post = transport || createPublicWebhookTransport({ enabled: true });
   const observed = (result, error = null) => Object.defineProperty(result, DELIVERY_TRANSPORT_OUTCOME,
     { value: Object.freeze({ terminal: probeOnly, error }) });

@@ -24,9 +24,11 @@ function fixture() {
   const params = { name: EVENT_NAME, arguments: { recipient: 'jarvis' }, ttlMs: null,
     delivery: { mode: 'webhook', url: 'https://callback.example.test/lease', secret } };
   const tokenExpiry = time + 3600000;
-  const who = principal(tokenExpiry), bridge = new Bridge({ store, clock });
+  const who = principal(tokenExpiry), bridge = new Bridge({ store, clock, messagePolicyIds: { jarvis: policyId, friday: policyId } });
   const subscribe = (p = who, extra = {}) => events.subscribe(p, { ...params, ...extra });
-  const queue = async () => bridge.send({ role: 'friday', principalKey: 'b'.repeat(64), scopes: ['bridge:send:jarvis'] },
+  const sender = Object.defineProperty({ role: 'friday', principalKey: 'b'.repeat(64), scopes: ['bridge:send:jarvis'] },
+    VERIFIED_AUTHORIZATION, { value: { policyId, expiresAt: tokenExpiry } });
+  const queue = async () => bridge.send(sender,
     { id: randomUUID(), testId: 'RN-JARVIS-FRIDAY-SYNTHETIC', from: 'friday', to: 'jarvis', kind: 'probe',
       sentAt: new Date(clock()).toISOString(), marker: 'RN-SYNTHETIC-NO-ACTIONS' });
   return { clock, policyId, owner, principal, who, tokenExpiry, store, calls, protector, transport, events, params,

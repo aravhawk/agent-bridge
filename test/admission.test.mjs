@@ -18,7 +18,7 @@ const code = (name, status) => e => e instanceof BridgeError && e.code === name 
 function fixture(snapshot) {
   let time = start;
   const store = new MemoryStore(snapshot), clock = () => time;
-  return { store, clock, bridge: new Bridge({ store, clock }), advance: ms => { time += ms; },
+  return { store, clock, bridge: new Bridge({ store, clock, messagePolicyIds: { jarvis: policyId, friday: policyId } }), advance: ms => { time += ms; },
     probe: (role = 'jarvis', extra = {}) => ({ id: randomUUID(), testId: 'RN-JARVIS-FRIDAY-SYNTHETIC',
       from: role, to: role === 'jarvis' ? 'friday' : 'jarvis', kind: 'probe',
       sentAt: new Date(time).toISOString(), marker: 'RN-SYNTHETIC-NO-ACTIONS', ...extra }) };

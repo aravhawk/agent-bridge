@@ -21,11 +21,12 @@ JSON schema or field mapping into webhook_event, replay/idempotency headers,
 response status codes, or whether acceptance means queued versus executed.
 Do not substitute a generic Cursor/Grok Automations API specification.
 
-## Prepared adapter
+## Gated runtime adapter
 
-`src/friday-sender.mjs` is NOT imported by the production runtime. It requires
-trusted server activation plus either verified contract evidence or one fixed
-probe message ID. Its transport reuses the existing public-DNS/TLS-pinned HTTPS
+`src/friday-sender.mjs` is wired into the production runtime behind the global
+delivery gate, exact receiver ID, saved Secret binding and a finite operator
+window no longer than six hours. It requires either verified contract evidence
+or one fixed probe message ID. Its transport reuses the existing public-DNS/TLS-pinned HTTPS
 implementation with no redirect following and bounded timeout/response size.
 Destination and Bearer key are closed-over server configuration; caller data
 cannot choose headers or a URL. Responses expose only status, never body text,
@@ -51,7 +52,10 @@ stored probe, only job.attempts===1 may send, and an in-process attempt is spent
 before transport begins. The durable worker attempt count blocks a second send
 after restart/reclaim. Timeout or 5xx does not authorize another exploratory
 POST; record that result as failed/inconclusive. This mode does not create a
-public probe endpoint or provide the worker's independent accessAllowed binding.
+public probe endpoint. The runtime independently validates each source message's
+JWT-bound authority and original operator deadline; Jarvis delivery additionally
+requires the current native subscription lease. Supplemental adapters cannot
+bypass those checks. The same checks fence late transport completion.
 
 After invoking transport, the adapter marks sanitized evidence on an internal
 non-enumerable Symbol that JSON/HTTP input cannot supply. In probe mode the
@@ -72,16 +76,17 @@ inconclusive; do not invent an outcome or bypass lease fencing to save it.
 
 1. Keep the existing Jarvis MCP event subscription enabled. Verify its lease
    remains active for the test window; do not disable it during cleanup.
-2. Complete a genuine Friday delivery access binding and reviewed runtime
-   wiring. Current default runtime still has no fridaySender/accessAllowed and
-   fails closed; this adapter alone does not remove that requirement. Never
-   supply an allow-all placeholder or treat a copied receiver key as proof of
-   ongoing native authorization.
+2. Independently review the gated runtime wiring and stage the exact receiver,
+   finite operator deadline and one fixed probe ID while delivery remains off.
+   Verify both native connections and the current Jarvis subscription lease.
+   Never supply an allow-all placeholder or treat a saved key as proof of
+   ongoing native authorization or successful wake.
 3. After the exact existing Friday receiver/test-delivery activation is
    approved, create ONE fresh synthetic probe through the already authenticated
    Jarvis bridge_send operation, direction jarvis→friday, fixed testId/marker,
-   kind:probe, new UUID and sentAt generated at execution time. Use its known
-   durable message/job identity as the server-only probeMessageId configuration.
+   kind:probe, the unique reserved UUID and sentAt generated at execution time.
+   The reserved UUID must match the server-only probeMessageId configuration;
+   reserving it does not create an envelope, schedule a send or arm delivery.
    Use existing private managed-queue/worker plumbing; no local credential
    copy, direct assistant HTTP request, added service, public diagnostic route,
    polling or Mac relay.
@@ -107,8 +112,8 @@ can independently originate a probe at an unknown future time.
 ## Minimal later randomized two-direction verification
 
 Only after receiver/access/body acceptance and activation are verified, use
-supported hosted one-shot execution in each native environment. Generate each
-message UUID and sentAt when that job fires; the five-minute freshness rule
+supported hosted one-shot execution in each native environment. Use a unique
+reserved UUID per leg and generate sentAt when that job fires; the five-minute freshness rule
 forbids saving a current timestamp in a future scheduled payload. Each native
 job invokes exactly one direction-correct bridge_send. Receivers wake from
 webhook/MCP Events and use only read/receipt operations; no inbox/status polling.

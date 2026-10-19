@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { BridgeError } from '../src/policy.mjs';
+import { BridgeError, VERIFIED_AUTHORIZATION } from '../src/policy.mjs';
+import { Bridge } from '../src/bridge.mjs';
 import { createFridaySender } from '../src/friday-sender.mjs';
 import { DeliveryWorker } from '../src/worker.mjs';
 import { MemoryStore } from '../src/store.mjs';
@@ -10,17 +11,19 @@ import { digest } from '../src/events.mjs';
 const messageId = '00000000-0000-4000-8000-000000000001';
 const eventId = 'evt_' + digest(JSON.stringify([messageId, 'friday']));
 const jobId = 'job_' + eventId.slice(4);
+const policyId = 'c'.repeat(64);
 const config = { enabled: true, endpoint: 'https://receiver.example.test/hook',
   secret: 'FIXTURE_NOT_A_REAL_KEY', contractVerified: false, probeMessageId: messageId };
 function fixture(transport, options = {}, snapshot) {
   let time = 100000;
   const store = new MemoryStore(snapshot);
-  const seed = () => store.transaction(s => { s.jobs[jobId] = { id: jobId, messageId, eventId,
-    recipient: 'friday', subscriptionId: null,
-    body: JSON.stringify({ event: 'bridge.message.received', data: { messageId } }),
-    state: 'pending', attempts: 0, dueAt: time, leaseId: null, leaseUntil: null }; });
+  const sender = Object.defineProperty({ role: 'jarvis', principalKey: 'a'.repeat(64), scopes: ['bridge:send:friday'] },
+    VERIFIED_AUTHORIZATION, { value: { policyId, expiresAt: time + 3600000 } });
+  const seed = () => new Bridge({ store, clock: () => time }).send(sender, { id: messageId,
+    testId: 'RN-JARVIS-FRIDAY-SYNTHETIC', from: 'jarvis', to: 'friday', kind: 'probe',
+    sentAt: new Date(time).toISOString(), marker: 'RN-SYNTHETIC-NO-ACTIONS' });
   const makeWorker = (accessAllowed = async () => true) => new DeliveryWorker({ store, clock: () => time,
-    enabled: true, accessAllowed, fridaySender: createFridaySender({ ...config, ...options, transport }) });
+    enabled: true, policyId, accessAllowed, fridaySender: createFridaySender({ ...config, ...options, transport }) });
   // This fixture authorizer is in-process only; no production access binding is supplied.
   return { store, seed, makeWorker, advance: ms => { time += ms; } };
 }

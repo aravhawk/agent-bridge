@@ -10,27 +10,47 @@ import { DeliveryWorker } from './worker.mjs';
 import { createMcpHandler } from './mcp.mjs';
 import { createQueueAdapter } from './queue.mjs';
 import { ISSUER, JWKS, resourceFor, metadataFor } from './resource.mjs';
+import { messageAccessAllowed, subscriptionAccessAllowed } from './access.mjs';
+import { createFridaySender, fridaySenderConfigured } from './friday-sender.mjs';
 
 // No environment pull or local credential copy is needed. Vercel injects the
 // native Neon Production Secret only in this project's production runtime.
 export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
-  queueClient, accessAllowed, fridaySender, transportFactory = createPublicWebhookTransport } = {}) {
+  queueClient, accessAllowed, fridaySender, clock = Date.now, transportFactory = createPublicWebhookTransport } = {}) {
   const contractReady = env.BRIDGE_OAUTH_CONTRACT_VERIFIED === 'true' &&
     (!!env.BRIDGE_ALLOWED_SUBJECT || /^[a-f0-9]{64}$/.test(env.BRIDGE_ALLOWED_SUBJECT_SHA256 || ''));
   let pool, store, bridge, events, queue;
   const lastObservedTiming = new Map();
   const resolver = keyResolver || createRemoteJWKSet(new URL(JWKS), { timeoutDuration: 5000 });
   const client = queueClient || new QueueClient({ region: 'iad1', telemetry: { isEnabled: false } });
-  const policyId = contractReady ? authorizationPolicyId({ issuer: ISSUER, audience: resourceFor('jarvis'),
-    role: 'jarvis', subject: env.BRIDGE_ALLOWED_SUBJECT, subjectHash: env.BRIDGE_ALLOWED_SUBJECT_SHA256,
-    scopeClaim: env.BRIDGE_OAUTH_SCOPE_CLAIM || 'scope' }) : null;
+  const messagePolicyIds = Object.fromEntries(['jarvis', 'friday'].map(role => [role, contractReady
+    ? authorizationPolicyId({ issuer: ISSUER, audience: resourceFor(role), role,
+      subject: env.BRIDGE_ALLOWED_SUBJECT, subjectHash: env.BRIDGE_ALLOWED_SUBJECT_SHA256,
+      scopeClaim: env.BRIDGE_OAUTH_SCOPE_CLAIM || 'scope' }) : null]));
+  const policyId = messagePolicyIds.jarvis;
+  function fridayConfiguration() {
+    const until = Date.parse(env.FRIDAY_TEST_AUTHORIZED_UNTIL);
+    // Operator-approved finite test authority, never a request-supplied grant.
+    const authorized = env.FRIDAY_RECEIVER_ID === 'jarvis-friday-test-receiver' &&
+      Number.isSafeInteger(until) && until > clock() && until - clock() <= 6 * 3600000;
+    const senderConfigured = fridaySenderConfigured({ endpoint: env.FRIDAY_WEBHOOK_URL, secret: env.FRIDAY_WEBHOOK_KEY });
+    const contractVerified = env.FRIDAY_WEBHOOK_CONTRACT_VERIFIED === 'true';
+    const probeId = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(env.FRIDAY_CONTRACT_PROBE_MESSAGE_ID || '')
+      ? env.FRIDAY_CONTRACT_PROBE_MESSAGE_ID : undefined;
+    return { until, authorized, senderConfigured, contractVerified, probeId,
+      ready: authorized && senderConfigured && (contractVerified || !!probeId),
+      probeOnly: !contractVerified && !!probeId };
+  }
   function readiness() {
     const callbackProtectorConfigured = !!decodeStorageKey(env.BRIDGE_SUBSCRIPTION_STORAGE_KEY);
     const base = contractReady && callbackProtectorConfigured && !!policyId && !!env.DATABASE_URL;
+    const friday = fridayConfiguration();
     return { storageConfigured: !!env.DATABASE_URL, callbackProtectorConfigured,
       currentAccessCheckConfigured: !!policyId,
       subscriptionSetupEnabled: !!base && env.BRIDGE_SUBSCRIPTIONS_ENABLED === 'true',
-      deliveryEnabled: !!base && env.BRIDGE_DELIVERY_ENABLED === 'true' && typeof fridaySender === 'function' && typeof accessAllowed === 'function' };
+      fridaySenderConfigured: friday.senderConfigured, fridayTestAuthorizationConfigured: friday.authorized,
+      fridayContractVerified: friday.contractVerified, fridayProbeModeConfigured: friday.ready && friday.probeOnly,
+      deliveryEnabled: !!base && env.BRIDGE_DELIVERY_ENABLED === 'true' && friday.ready };
   }
   function configure() {
     if (store) return;
@@ -46,18 +66,36 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
     pool = new Pool({ connectionString: db.href, max: 2, connectionTimeoutMillis: 5000,
       idleTimeoutMillis: 10000, query_timeout: 10000 });
     pool.on('error', () => {}); // Never emit a credential-bearing connection error.
-    store = new PostgresStore(pool); bridge = new Bridge({ store });
+    store = new PostgresStore(pool);
+    const friday = fridayConfiguration();
+    bridge = new Bridge({ store, clock, messagePolicyIds, deliveryUntil: friday.authorized ? friday.until : 0,
+      probeMessageId: friday.probeOnly ? friday.probeId : undefined });
     const storageKey = decodeStorageKey(env.BRIDGE_SUBSCRIPTION_STORAGE_KEY);
     const protector = storageKey ? createProtector(storageKey) : undefined;
     const baseReady = contractReady && !!protector && !!policyId;
     const subscriptionSetup = baseReady && env.BRIDGE_SUBSCRIPTIONS_ENABLED === 'true';
-    const delivery = baseReady && env.BRIDGE_DELIVERY_ENABLED === 'true' && typeof fridaySender === 'function' && typeof accessAllowed === 'function';
+    const delivery = readiness().deliveryEnabled;
     const transport = subscriptionSetup || delivery ? transportFactory({ enabled: true }) : undefined;
     // A signed verification challenge is setup, not an application event. The
     // native subscription must be verifiable BEFORE event sends are enabled.
-    events = new NativeEvents({ store, protector, transport, policyId, enabled: subscriptionSetup });
-    const worker = new DeliveryWorker({ store, protector, transport, policyId, accessAllowed, fridaySender, enabled: delivery });
-    queue = createQueueAdapter({ client, store, worker, enabled: delivery });
+    events = new NativeEvents({ store, protector, transport, policyId, clock, enabled: subscriptionSetup });
+    const nativeSender = delivery ? fridaySender || createFridaySender({ enabled: true,
+      contractVerified: friday.contractVerified, probeMessageId: friday.probeId,
+      endpoint: env.FRIDAY_WEBHOOK_URL, secret: env.FRIDAY_WEBHOOK_KEY, transport }) : undefined;
+    const nativeAccess = async input => store.transaction(state => {
+      const message = state.messages[input.messageId];
+      if (clock() >= friday.until || !messageAccessAllowed(state, message, messagePolicyIds, clock()) ||
+          message.envelope.to !== input.recipient) return false;
+      if (input.recipient === 'jarvis') {
+        const sub = state.subscriptions[input.subscriptionId];
+        return sub?.owner === input.owner && subscriptionAccessAllowed(state, sub, policyId, clock());
+      }
+      return input.recipient === 'friday' && friday.ready && (!friday.probeOnly || input.messageId === friday.probeId);
+    });
+    const authorize = async input => (await nativeAccess(input)) && (!accessAllowed || await accessAllowed(input));
+    const worker = new DeliveryWorker({ store, protector, transport, policyId, messagePolicyIds,
+      clock, deliveryUntil: friday.until, accessAllowed: authorize, fridaySender: nativeSender, enabled: delivery });
+    queue = createQueueAdapter({ client, store, worker, clock, enabled: delivery });
   }
   return {
     handler(role) {
@@ -95,13 +133,19 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
       };
       return createMcpHandler({ enabled: true, verify, bridge: operations, events: lazyEvents,
         health: () => ({ status: 'ok', authenticated: true, serverVersion: '0.1.0', readiness: readiness() }),
-        scheduleJobs: async ids => { configure(); return queue.scheduleJobs(ids); }, resourceMetadataUrl: metadataFor(role),
+        scheduleJobs: async ids => {
+          if (!readiness().deliveryEnabled) throw new BridgeError('queue_not_enabled', 503);
+          configure(); return queue.scheduleJobs(ids);
+        }, resourceMetadataUrl: metadataFor(role),
         observeValidationFailure: role === 'friday' && env.BRIDGE_RPC_SHAPE_DIAGNOSTIC === 'true'
           ? facts => console.info('RN_BRIDGE_RPC_SHAPE ' + JSON.stringify(facts)) : undefined });
     },
     queueHandler() {
       configure();
-      return client.handleCallback(queue.consume, { visibilityTimeoutSeconds: 60, retry: queue.retry });
+      return client.handleCallback(async (...args) => {
+        if (!readiness().deliveryEnabled) throw new BridgeError('delivery_not_enabled', 503);
+        return queue.consume(...args);
+      }, { visibilityTimeoutSeconds: 60, retry: queue.retry });
     },
     async close() { await pool?.end(); },
   };
