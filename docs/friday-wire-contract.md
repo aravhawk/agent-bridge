@@ -118,6 +118,15 @@ forbids saving a current timestamp in a future scheduled payload. Each native
 job invokes exactly one direction-correct bridge_send. Receivers wake from
 webhook/MCP Events and use only read/receipt operations; no inbox/status polling.
 
+Preserve the user's sequence: arm only Friday's native outbound timer first.
+After Jarvis receives it and reports to the user, coordinate and arm the reverse
+Jarvis timer. Keep the runtime pinned to the current reserved UUID and sender
+through both delivery directions, even with verified transport. Missing native
+host IDs may be null; record the resulting evidence limit honestly rather than
+inventing a direct trace. A documented finite native cron with deadline and
+verified pause/cleanup is operationally bounded, but is not a platform one-shot
+guarantee. No Mac relay or receiving-agent polling may fill either gap.
+
 For Jarvis-originated probe: native Friday receives and completes it; native
 Jarvis receives/completes its ACK. For Friday-originated probe: native Jarvis
 receives/completes it; native Friday receives/completes its ACK. Capture actual

@@ -10,7 +10,7 @@ import { DeliveryWorker } from './worker.mjs';
 import { createMcpHandler } from './mcp.mjs';
 import { createQueueAdapter } from './queue.mjs';
 import { ISSUER, JWKS, resourceFor, metadataFor } from './resource.mjs';
-import { messageAccessAllowed, subscriptionAccessAllowed } from './access.mjs';
+import { messageAccessAllowed, subscriptionAccessAllowed, testEnvelopeAllowed } from './access.mjs';
 import { createFridaySender, fridaySenderConfigured } from './friday-sender.mjs';
 
 // No environment pull or local credential copy is needed. Vercel injects the
@@ -37,8 +37,10 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
     const contractVerified = env.FRIDAY_WEBHOOK_CONTRACT_VERIFIED === 'true';
     const probeId = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(env.FRIDAY_CONTRACT_PROBE_MESSAGE_ID || '')
       ? env.FRIDAY_CONTRACT_PROBE_MESSAGE_ID : undefined;
-    return { until, authorized, senderConfigured, contractVerified, probeId,
-      ready: authorized && senderConfigured && (contractVerified || !!probeId),
+    const probeSender = env.BRIDGE_TEST_PROBE_SENDER ?? 'jarvis';
+    return { until, authorized, senderConfigured, contractVerified, probeId, probeSender,
+      ready: authorized && senderConfigured && !!probeId && ['jarvis', 'friday'].includes(probeSender) &&
+        (contractVerified || probeSender === 'jarvis'),
       probeOnly: !contractVerified && !!probeId };
   }
   function readiness() {
@@ -50,6 +52,7 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
       subscriptionSetupEnabled: !!base && env.BRIDGE_SUBSCRIPTIONS_ENABLED === 'true',
       fridaySenderConfigured: friday.senderConfigured, fridayTestAuthorizationConfigured: friday.authorized,
       fridayContractVerified: friday.contractVerified, fridayProbeModeConfigured: friday.ready && friday.probeOnly,
+      testDeliveryPinned: friday.ready,
       deliveryEnabled: !!base && env.BRIDGE_DELIVERY_ENABLED === 'true' && friday.ready };
   }
   function configure() {
@@ -69,7 +72,7 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
     store = new PostgresStore(pool);
     const friday = fridayConfiguration();
     bridge = new Bridge({ store, clock, messagePolicyIds, deliveryUntil: friday.authorized ? friday.until : 0,
-      probeMessageId: friday.probeOnly ? friday.probeId : undefined });
+      probeMessageId: friday.probeId, probeSender: friday.probeSender });
     const storageKey = decodeStorageKey(env.BRIDGE_SUBSCRIPTION_STORAGE_KEY);
     const protector = storageKey ? createProtector(storageKey) : undefined;
     const baseReady = contractReady && !!protector && !!policyId;
@@ -86,13 +89,8 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
       const message = state.messages[input.messageId];
       if (clock() >= friday.until || !messageAccessAllowed(state, message, messagePolicyIds, clock()) ||
           message.envelope.to !== input.recipient) return false;
-      const e = message.envelope;
-      // Probe scope applies to BOTH delivery legs, including jobs persisted
-      // during an earlier valid window. A current lease alone is insufficient.
-      if (friday.probeOnly && !(
-        (e.id === friday.probeId && e.kind === 'probe' && e.from === 'jarvis' && e.to === 'friday') ||
-        (e.kind === 'ack' && e.from === 'friday' && e.to === 'jarvis' && e.correlationId === friday.probeId)
-      )) return false;
+      // Verification controls transport mode, never whether scope is enforced.
+      if (!testEnvelopeAllowed(message.envelope, friday.probeId, friday.probeSender)) return false;
       if (input.recipient === 'jarvis') {
         const sub = state.subscriptions[input.subscriptionId];
         return sub?.owner === input.owner && subscriptionAccessAllowed(state, sub, policyId, clock());
@@ -101,6 +99,7 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
     });
     const authorize = async input => (await nativeAccess(input)) && (!accessAllowed || await accessAllowed(input));
     const worker = new DeliveryWorker({ store, protector, transport, policyId, messagePolicyIds,
+      probeMessageId: friday.probeId, probeSender: friday.probeSender,
       clock, deliveryUntil: friday.until, accessAllowed: authorize, fridaySender: nativeSender, enabled: delivery });
     queue = createQueueAdapter({ client, store, worker, clock, enabled: delivery });
   }

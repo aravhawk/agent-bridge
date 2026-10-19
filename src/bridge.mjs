@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { BridgeError, validateEnvelope, SCOPES } from './policy.mjs';
 import { appendDeliveryJobs, authorizeRecipient, ownKeys } from './events.mjs';
-import { verifiedMessageAuthorization, messageAccessAllowed } from './access.mjs';
+import { verifiedMessageAuthorization, messageAccessAllowed, testEnvelopeAllowed } from './access.mjs';
 
 const fail = (code, status = 400) => { throw new BridgeError(code, status); };
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
@@ -16,12 +16,11 @@ function admitProbe(state, role, now) {
   if (recent.length >= 10) fail('probe_rate_limited', 429);
   admissions[role] = [...recent, now];
 }
-function incoming(state, principal, id, probeMessageId) {
+function incoming(state, principal, id, probeMessageId, probeSender) {
   authorizeRecipient(principal); messageId(id);
   const message = state.messages[id];
   if (!message || message.envelope.to !== principal.role) fail('message_not_found', 404);
-  if (probeMessageId && id !== probeMessageId &&
-      !(message.envelope.kind === 'ack' && message.envelope.correlationId === probeMessageId)) fail('contract_probe_only', 403);
+  if (probeMessageId && !testEnvelopeAllowed(message.envelope, probeMessageId, probeSender)) fail('contract_probe_only', 403);
   return message;
 }
 function insert(state, envelope, hash, now, authorization) {
@@ -39,8 +38,9 @@ function insert(state, envelope, hash, now, authorization) {
 }
 
 export class Bridge {
-  constructor({ store, clock = Date.now, probeMessageId, messagePolicyIds, deliveryUntil = Infinity }) {
+  constructor({ store, clock = Date.now, probeMessageId, probeSender = 'jarvis', messagePolicyIds, deliveryUntil = Infinity }) {
     this.store = store; this.clock = clock; this.probeMessageId = probeMessageId;
+    this.probeSender = probeSender;
     this.messagePolicyIds = messagePolicyIds; this.deliveryUntil = deliveryUntil;
   }
   async send(principal, input) {
@@ -52,7 +52,7 @@ export class Bridge {
       // still conflicts, and a new stale ID is rejected.
       const saved = typeof input.id === 'string' && state.messages[input.id.toLowerCase()];
       const { envelope, hash } = validateEnvelope(input, principal, saved ? Date.parse(input.sentAt) : this.clock());
-      if (this.probeMessageId && (envelope.id !== this.probeMessageId || envelope.from !== 'jarvis')) fail('contract_probe_only', 403);
+      if (this.probeMessageId && !testEnvelopeAllowed(envelope, this.probeMessageId, this.probeSender)) fail('contract_probe_only', 403);
       const authorization = saved ? undefined : verifiedMessageAuthorization(principal, envelope, this.clock(), this.deliveryUntil);
       // Exact retransmissions stay idempotent even at the limit or after the
       // freshness window; changed bodies still take insert's conflict path.
@@ -64,7 +64,7 @@ export class Bridge {
   async read(principal, params) {
     ownKeys(params, ['messageId']);
     return this.store.transaction(state => {
-      const message = incoming(state, principal, params.messageId, this.probeMessageId);
+      const message = incoming(state, principal, params.messageId, this.probeMessageId, this.probeSender);
       return { envelope: message.envelope, receivedAt: new Date(message.storedAt).toISOString() };
     });
   }
@@ -72,7 +72,7 @@ export class Bridge {
     ownKeys(params, ['messageId']);
     return this.store.transaction(state => {
       const now = this.clock();
-      const message = incoming(state, principal, params.messageId, this.probeMessageId);
+      const message = incoming(state, principal, params.messageId, this.probeMessageId, this.probeSender);
       const old = state.receipts[params.messageId];
       if (old?.state === 'complete') return { duplicate: true, completed: true, ackMessageId: old.ackMessageId };
       if (!messageAccessAllowed(state, message, this.messagePolicyIds, now)) fail('message_authorization_inactive', 403);
@@ -92,7 +92,7 @@ export class Bridge {
     }
     return this.store.transaction(state => {
       const now = this.clock();
-      const message = incoming(state, principal, params.messageId, this.probeMessageId), original = message.envelope;
+      const message = incoming(state, principal, params.messageId, this.probeMessageId, this.probeSender), original = message.envelope;
       const receipt = state.receipts[params.messageId];
       if (receipt?.owner !== principal.principalKey) fail('receipt_claim_required', 409);
       if (receipt.state === 'complete') return { completed: true, duplicate: true,

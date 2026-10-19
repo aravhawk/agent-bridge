@@ -86,6 +86,24 @@ test('source expiry or denial in flight rejects acceptance while preserving the 
   }
 });
 
+test('delivery pin is fenced before claim, after async access and after transport despite valid source JWT metadata', async () => {
+  for (const phase of ['claim', 'access', 'transport']) {
+    const f = fixture(), q = await f.bridge.send(f.sender, f.input);
+    const changePin = () => f.store.transaction(s => { s.messages[f.input.id].envelope.id = randomUUID(); });
+    if (phase === 'claim') await changePin();
+    const result = await f.worker({ probeMessageId: f.input.id, probeSender: 'jarvis',
+      accessAllowed: async () => { if (phase === 'access') await changePin(); return true; },
+      duringTransport: async () => { if (phase === 'transport') await changePin(); },
+    }).run(q.jobIds[0]);
+    const job = f.store.snapshot().jobs[q.jobIds[0]];
+    assert.notEqual(result.transportAccepted, true); assert.equal(job.state, 'dead');
+    assert.equal(job.lastError, 'message_authorization_inactive');
+    assert.equal(f.calls(), phase === 'transport' ? 1 : 0);
+    if (phase === 'transport') assert.equal(job.firstTransportOutcome.status, 202);
+    else assert.equal(job.firstTransportOutcome, undefined);
+  }
+});
+
 test('the original operator window caps source authority and duplicate fresh tokens cannot resurrect it', async () => {
   const f = fixture(), first = f.makeBridge({ deliveryUntil: f.clock() + 100 });
   const q = await first.send(f.sender, f.input), authorization = f.store.snapshot().messages[f.input.id].authorization;

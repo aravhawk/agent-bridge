@@ -117,6 +117,7 @@ FRIDAY_RECEIVER_ID=jarvis-friday-test-receiver
 FRIDAY_TEST_AUTHORIZED_UNTIL=<ISO timestamp at most six hours ahead>
 FRIDAY_WEBHOOK_CONTRACT_VERIFIED=false
 FRIDAY_CONTRACT_PROBE_MESSAGE_ID=<one reserved canonical UUID>
+BRIDGE_TEST_PROBE_SENDER=jarvis
 ```
 
 The exact existing receiver and finite operator window are required in both
@@ -124,8 +125,19 @@ probe and verified modes. The window expires without a scheduled cleanup.
 Before native body mapping and hosted wake are proven, keep the contract flag
 false: only the pinned Jarvis-originated probe and its correlated receipt/ACK
 are allowed. After independent native evidence, the operator may set the
-contract flag true for the bounded synthetic two-direction test. The global
-delivery flag still defaults false, and the subscription setup gate is separate.
+contract flag true for the bounded synthetic test. Verification never removes
+delivery pinning: the legacy-named FRIDAY_CONTRACT_PROBE_MESSAGE_ID is mandatory
+in both modes. BRIDGE_TEST_PROBE_SENDER selects jarvis or friday (omission keeps
+the original jarvis default; invalid/blank values fail closed). Both API/receipt
+scope and every worker authority fence allow only that exact sender's selected
+probe and the opposite sender's correlated ACK. An unrelated queued job from
+an earlier valid window is blocked in either direction. Friday-originated mode
+requires verified transport because its generated return ACK reaches Friday.
+The global delivery flag still defaults false; subscription setup is separate.
+
+Run the user's sequence one leg at a time: first pin the Friday-originated
+probe, wait for the native Jarvis receipt/user report, then coordinate and pin
+the Jarvis-originated reverse leg. Do not arm both source timers together.
 
 Every new probe and ACK stores only verified owner digest, role, exact resource,
 directional scope, policy fingerprint and token expiration. Message authority
@@ -138,7 +150,7 @@ before transport and at final commit. Receipt claim/completion also checks the
 original source authority before generating an ACK. No raw token is persisted.
 
 Health adds only `fridaySenderConfigured`, `fridayTestAuthorizationConfigured`,
-`fridayContractVerified` and `fridayProbeModeConfigured` booleans. These perform
+`fridayContractVerified`, `fridayProbeModeConfigured` and `testDeliveryPinned` booleans. These perform
 no receiver or database call and cannot establish live wake or token refresh.
 The status tool exposes sanitized transport counts, immutable first outcome and
 last numeric status/error to inspect the known message without raw runtime logs.

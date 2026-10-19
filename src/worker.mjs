@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { BridgeError, DELIVERY_TRANSPORT_OUTCOME } from './policy.mjs';
-import { subscriptionAccessAllowed, messageAccessAllowed } from './access.mjs';
+import { subscriptionAccessAllowed, messageAccessAllowed, testEnvelopeAllowed } from './access.mjs';
 import { signedHeaders } from './webhook.mjs';
 
 const transient = status => status === 408 || status === 429 || (status >= 500 && status <= 599);
@@ -8,12 +8,18 @@ const backoff = attempt => Math.min(60000, 1000 * (2 ** Math.min(attempt - 1, 6)
 
 export class DeliveryWorker {
   constructor({ store, protector, transport, fridaySender, accessAllowed, policyId, enabled = false, clock = Date.now,
-    maxAttempts = 5, leaseMs = 30000, messagePolicyIds = { jarvis: policyId, friday: policyId }, deliveryUntil = Infinity }) {
+    maxAttempts = 5, leaseMs = 30000, messagePolicyIds = { jarvis: policyId, friday: policyId }, deliveryUntil = Infinity,
+    probeMessageId, probeSender = 'jarvis' }) {
     this.store = store; this.protector = protector; this.transport = transport; this.fridaySender = fridaySender;
     this.accessAllowed = accessAllowed; this.enabled = enabled; this.clock = clock;
     this.policyId = policyId;
     this.messagePolicyIds = messagePolicyIds; this.deliveryUntil = deliveryUntil;
+    this.probeMessageId = probeMessageId; this.probeSender = probeSender;
     this.maxAttempts = maxAttempts; this.leaseMs = leaseMs;
+  }
+  messageAllowed(state, message, now) {
+    return messageAccessAllowed(state, message, this.messagePolicyIds, now) &&
+      (!this.probeMessageId || testEnvelopeAllowed(message.envelope, this.probeMessageId, this.probeSender));
   }
   // One queue job dispatches one attempt. There is no loop, interval, timer,
   // assistant listen/inbox check, or live queue registration in this module.
@@ -38,7 +44,7 @@ export class DeliveryWorker {
         job.state = 'dead'; job.lastError = 'subscription_inactive'; return null;
       }
       const message = state.messages[job.messageId];
-      if (this.clock() >= this.deliveryUntil || !messageAccessAllowed(state, message, this.messagePolicyIds, this.clock()) ||
+      if (this.clock() >= this.deliveryUntil || !this.messageAllowed(state, message, this.clock()) ||
           message.envelope.to !== job.recipient || !message.jobIds.includes(jobId)) {
         job.state = 'dead'; job.lastError = 'message_authorization_inactive'; return null;
       }
@@ -64,7 +70,7 @@ export class DeliveryWorker {
           const activeSub = subscription ? state.subscriptions[subscription.id] : null;
           const message = state.messages[job.messageId];
           if (activeJob?.leaseId !== job.leaseId || activeJob.state !== 'leased' || activeJob.leaseUntil <= this.clock() ||
-              this.clock() >= this.deliveryUntil || !messageAccessAllowed(state, message, this.messagePolicyIds, this.clock()) ||
+              this.clock() >= this.deliveryUntil || !this.messageAllowed(state, message, this.clock()) ||
               message.envelope.to !== activeJob.recipient || !message.jobIds.includes(jobId) ||
               (subscription && (activeJob.recipient !== activeSub?.recipient ||
                 !subscriptionAccessAllowed(state, activeSub, this.policyId, this.clock())))) return null;
@@ -72,7 +78,7 @@ export class DeliveryWorker {
         });
         if (!current) code = subscription ? 'subscription_inactive' : 'message_authorization_inactive';
         else {
-          if (this.clock() >= this.deliveryUntil || !messageAccessAllowed(current, current.message, this.messagePolicyIds, this.clock())) {
+          if (this.clock() >= this.deliveryUntil || !this.messageAllowed(current, current.message, this.clock())) {
             throw new BridgeError('message_authorization_inactive', 403);
           }
           let response;
@@ -112,7 +118,7 @@ export class DeliveryWorker {
       if (subscription && (activeJob.recipient !== sub?.recipient ||
           !subscriptionAccessAllowed(state, sub, this.policyId, this.clock()))) { accepted = false; retry = false; code = 'subscription_inactive'; }
       const message = state.messages[job.messageId];
-      if (this.clock() >= this.deliveryUntil || !messageAccessAllowed(state, message, this.messagePolicyIds, this.clock()) ||
+      if (this.clock() >= this.deliveryUntil || !this.messageAllowed(state, message, this.clock()) ||
           message.envelope.to !== activeJob.recipient || !message.jobIds.includes(jobId)) {
         accepted = false; retry = false; code = 'message_authorization_inactive';
       }

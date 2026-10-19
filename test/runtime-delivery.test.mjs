@@ -37,7 +37,10 @@ async function fixture(overrides = {}, initial = {}) {
       if (body.type === 'verification') return { status: 200, body: JSON.stringify({ challenge: body.challenge }) };
       if (url === env.FRIDAY_WEBHOOK_URL) {
         assert.equal(request.headers.authorization, 'Bearer ' + env.FRIDAY_WEBHOOK_KEY);
-        assert.deepEqual(body, { event: 'bridge.message.received', data: { messageId: probeId } });
+        const id = body.data?.messageId, envelope = document.messages[id]?.envelope;
+        assert.deepEqual(body, { event: 'bridge.message.received', data: { messageId: id } });
+        assert.equal(envelope?.to, 'friday');
+        assert.equal(envelope.kind === 'probe' ? id : envelope.correlationId, env.FRIDAY_CONTRACT_PROBE_MESSAGE_ID);
       } else new Webhook(key).verify(request.body, request.headers);
       calls.push({ recipient: url === env.FRIDAY_WEBHOOK_URL ? 'friday' : 'jarvis', body });
       return { status: 202, body: '' };
@@ -93,12 +96,17 @@ test('real runtime wiring admits one declared probe and its single correlated AC
 });
 
 test('restarting in probe mode blocks unrelated queued Jarvis probes and ACKs but delivers the pinned correlated ACK', async () => {
-  const previous = await fixture({ FRIDAY_WEBHOOK_CONTRACT_VERIFIED: 'true' });
+  const oldFridayId = '00000000-0000-4000-8000-000000000022';
+  let previous = await fixture({ FRIDAY_WEBHOOK_CONTRACT_VERIFIED: 'true',
+    BRIDGE_TEST_PROBE_SENDER: 'friday', FRIDAY_CONTRACT_PROBE_MESSAGE_ID: oldFridayId });
   await previous.subscribe();
   const oldFridayProbe = await previous.tool('friday', 'bridge_send', previous.probe({
-    id: '00000000-0000-4000-8000-000000000022', from: 'friday', to: 'jarvis' }));
+    id: oldFridayId, from: 'friday', to: 'jarvis' }));
   assert.equal(oldFridayProbe.status, 200);
   const unrelatedId = '00000000-0000-4000-8000-000000000023';
+  const firstWindow = previous; await firstWindow.rt.close();
+  previous = await fixture({ ...firstWindow.env, BRIDGE_TEST_PROBE_SENDER: 'jarvis',
+    FRIDAY_CONTRACT_PROBE_MESSAGE_ID: unrelatedId }, { document: firstWindow.state(), key: firstWindow.key });
   assert.equal((await previous.tool('jarvis', 'bridge_send', previous.probe({ id: unrelatedId }))).status, 200);
   const oldClaim = (await previous.tool('friday', 'bridge_receipt_claim', { messageId: unrelatedId })).result.structuredContent;
   const oldAck = (await previous.tool('friday', 'bridge_receipt_complete', { messageId: unrelatedId,
@@ -108,7 +116,8 @@ test('restarting in probe mode blocks unrelated queued Jarvis probes and ACKs bu
 
   // Existing valid message authority, callback protector and active native
   // lease survive deployment, but the new phase grants only the pinned pair.
-  const f = await fixture({ ...previous.env, FRIDAY_WEBHOOK_CONTRACT_VERIFIED: 'false' },
+  const f = await fixture({ ...previous.env, FRIDAY_WEBHOOK_CONTRACT_VERIFIED: 'false',
+    FRIDAY_CONTRACT_PROBE_MESSAGE_ID: probeId },
     { document: snapshot, key: previous.key });
   const blocked = [...snapshot.messages['00000000-0000-4000-8000-000000000022'].jobIds,
     ...snapshot.messages[oldAck.ackMessageId].jobIds];
@@ -116,7 +125,7 @@ test('restarting in probe mode blocks unrelated queued Jarvis probes and ACKs bu
     assert.equal(snapshot.jobs[id].recipient, 'jarvis');
     await f.consume(id);
     assert.equal(f.state().jobs[id].state, 'dead');
-    assert.equal(f.state().jobs[id].lastError, 'access_revoked');
+    assert.equal(f.state().jobs[id].lastError, 'message_authorization_inactive');
   }
   assert.equal(f.calls.length, 0);
 
@@ -128,6 +137,53 @@ test('restarting in probe mode blocks unrelated queued Jarvis probes and ACKs bu
   assert.ok(ack.ackMessageId); await f.consume(f.queue[1]);
   assert.equal(f.calls[1].recipient, 'jarvis'); assert.equal(f.calls[1].body.data.messageId, ack.ackMessageId);
   assert.equal(f.state().jobs[f.queue[1]].state, 'accepted');
+});
+
+test('verified transport remains pinned in either direction and admits only its correlated ACK through the real runtime', async () => {
+  for (const sender of ['friday', 'jarvis']) {
+    const recipient = sender === 'friday' ? 'jarvis' : 'friday';
+    const f = await fixture({ FRIDAY_WEBHOOK_CONTRACT_VERIFIED: 'true', BRIDGE_TEST_PROBE_SENDER: sender });
+    await f.subscribe();
+    const health = (await f.tool('jarvis', 'bridge_health')).result.structuredContent.readiness;
+    assert.equal(health.testDeliveryPinned, true); assert.equal(health.fridayContractVerified, true);
+    for (const [role, input] of [[recipient, f.probe({ from: recipient, to: sender })],
+      [sender, f.probe({ from: sender, to: recipient, id: '00000000-0000-4000-8000-000000000024' })]]) {
+      const denied = await f.tool(role, 'bridge_send', input);
+      assert.equal(denied.status, 403); assert.equal(denied.error.message, 'contract_probe_only');
+    }
+    assert.deepEqual(f.state().messages, {}); assert.equal(f.queue.length, 0);
+    const sent = await f.tool(sender, 'bridge_send', f.probe({ from: sender, to: recipient }));
+    assert.equal(sent.status, 200); await f.consume(f.queue[0]);
+    assert.equal(f.calls[0].recipient, recipient);
+    const read = (await f.tool(recipient, 'bridge_read', { messageId: probeId })).result.structuredContent;
+    assert.equal(read.envelope.from, sender);
+    const claim = (await f.tool(recipient, 'bridge_receipt_claim', { messageId: probeId })).result.structuredContent;
+    const complete = (await f.tool(recipient, 'bridge_receipt_complete', { messageId: probeId,
+      claimId: claim.claimId, hostedEventId: null, hostedTurnId: null })).result.structuredContent;
+    assert.ok(complete.ackMessageId); await f.consume(f.queue[1]);
+    assert.equal(f.calls[1].recipient, sender);
+    const ack = f.state().messages[complete.ackMessageId].envelope;
+    assert.equal(ack.kind, 'ack'); assert.equal(ack.correlationId, probeId); assert.equal(ack.to, sender);
+    const ackClaim = (await f.tool(sender, 'bridge_receipt_claim', { messageId: ack.id })).result.structuredContent;
+    const terminal = (await f.tool(sender, 'bridge_receipt_complete', { messageId: ack.id,
+      claimId: ackClaim.claimId, hostedEventId: null, hostedTurnId: null })).result.structuredContent;
+    assert.equal(terminal.ackMessageId, null); assert.equal(f.queue.length, 2);
+  }
+});
+
+test('verified transport without a pin, invalid sender or unverified Friday-origin scope stays disabled', async () => {
+  for (const extra of [
+    { FRIDAY_WEBHOOK_CONTRACT_VERIFIED: 'true', FRIDAY_CONTRACT_PROBE_MESSAGE_ID: '' },
+    { FRIDAY_WEBHOOK_CONTRACT_VERIFIED: 'true', BRIDGE_TEST_PROBE_SENDER: '' },
+    { FRIDAY_WEBHOOK_CONTRACT_VERIFIED: 'true', BRIDGE_TEST_PROBE_SENDER: 'other' },
+    { FRIDAY_WEBHOOK_CONTRACT_VERIFIED: 'false', BRIDGE_TEST_PROBE_SENDER: 'friday' },
+  ]) {
+    const f = await fixture(extra);
+    const health = (await f.tool('jarvis', 'bridge_health')).result.structuredContent.readiness;
+    assert.equal(health.deliveryEnabled, false); assert.equal(health.testDeliveryPinned, false);
+    assert.equal((await f.tool('jarvis', 'bridge_send', f.probe())).status, 503);
+    assert.equal(f.queue.length, 0); assert.equal(f.calls.length, 0);
+  }
 });
 
 test('probe phase rejects other new IDs and Friday-originated probes before any delivery', async () => {

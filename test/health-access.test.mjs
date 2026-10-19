@@ -37,7 +37,7 @@ test('authenticated health succeeds with no storage, network transport, queue or
   assert.deepEqual(JSON.parse(result.content[0].text), { status: 'ok', authenticated: true, serverVersion: '0.1.0',
     readiness: { storageConfigured: false, callbackProtectorConfigured: false, currentAccessCheckConfigured: true,
       fridaySenderConfigured: false, fridayTestAuthorizationConfigured: false,
-      fridayContractVerified: false, fridayProbeModeConfigured: false,
+      fridayContractVerified: false, fridayProbeModeConfigured: false, testDeliveryPinned: false,
       subscriptionSetupEnabled: false, deliveryEnabled: false } });
   const output = JSON.stringify(result);
   for (const value of [token, subject, owner, 'private-health@example.test', 'private-claim']) assert.equal(output.includes(value), false);
