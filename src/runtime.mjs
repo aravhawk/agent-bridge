@@ -13,6 +13,7 @@ import { resourceFor, metadataFor, providerConfiguration } from './resource.mjs'
 import { messageAccessAllowed, subscriptionAccessAllowed } from './access.mjs';
 import { dailyMessage } from './messages.mjs';
 import { createFridaySender, fridaySenderConfigured } from './friday-sender.mjs';
+import { createFridayDiagnostic, diagnosticWindowOpen } from './friday-diagnostic.mjs';
 import { VERSION, RECEIVER_ID } from './release.mjs';
 
 // Resource server only. The approved production provider owns consent,
@@ -23,7 +24,7 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
   const identityConfigured = !!provider &&
     (!!env.BRIDGE_ALLOWED_SUBJECT || /^[a-f0-9]{64}$/.test(env.BRIDGE_ALLOWED_SUBJECT_SHA256 || ''));
   const contractReady = identityConfigured && env.BRIDGE_OAUTH_CONTRACT_VERIFIED === 'true';
-  let pool, store, bridge, events, queue;
+  let pool, store, bridge, events, queue, diagnostic;
   const resolver = keyResolver || (provider ? createRemoteJWKSet(new URL(provider.jwks), { timeoutDuration: 5000 }) : undefined);
   const client = queueClient || new QueueClient({ region: 'iad1', telemetry: { isEnabled: false } });
   const policyIds = Object.fromEntries(['jarvis', 'friday'].map(role => [role, identityConfigured
@@ -36,10 +37,14 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
     const senderConfigured = fridaySenderConfigured({ endpoint: env.FRIDAY_WEBHOOK_URL, secret: env.FRIDAY_WEBHOOK_KEY });
     const receiverPolicyVerified = env.BRIDGE_RECEIVER_POLICY === 'inbox-v1' && env.FRIDAY_RECEIVER_ID === RECEIVER_ID;
     const fridayContractVerified = env.FRIDAY_WEBHOOK_CONTRACT_VERIFIED === 'true';
+    // Independent of delivery: one operator-armed transport check only.
+    const fridayWebhookDiagnosticArmed = contractReady && !!env.DATABASE_URL && senderConfigured &&
+      env.FRIDAY_RECEIVER_ID === RECEIVER_ID && diagnosticWindowOpen(
+        env.FRIDAY_WEBHOOK_DIAGNOSTIC_FROM, env.FRIDAY_WEBHOOK_DIAGNOSTIC_UNTIL, clock());
     return { storageConfigured: !!env.DATABASE_URL, callbackProtectorConfigured,
       currentAccessCheckConfigured: !!policyIds.jarvis,
       subscriptionSetupEnabled: !!base && env.BRIDGE_SUBSCRIPTIONS_ENABLED === 'true',
-      fridaySenderConfigured: senderConfigured, receiverPolicyVerified, fridayContractVerified,
+      fridaySenderConfigured: senderConfigured, receiverPolicyVerified, fridayContractVerified, fridayWebhookDiagnosticArmed,
       deliveryEnabled: !!base && env.BRIDGE_DELIVERY_ENABLED === 'true' &&
         senderConfigured && receiverPolicyVerified && fridayContractVerified };
   }
@@ -77,6 +82,9 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
     const worker = new DeliveryWorker({ store, protector, transport, policyId: policyIds.jarvis,
       messagePolicyIds: policyIds, clock, accessAllowed: authorize, fridaySender: nativeSender, enabled: delivery });
     queue = createQueueAdapter({ client, store, worker, clock, enabled: delivery, maintenanceEnabled: true });
+    diagnostic = createFridayDiagnostic({ store, endpoint: env.FRIDAY_WEBHOOK_URL, secret: env.FRIDAY_WEBHOOK_KEY,
+      transport: transport || transportFactory({ enabled: true }), from: env.FRIDAY_WEBHOOK_DIAGNOSTIC_FROM,
+      until: env.FRIDAY_WEBHOOK_DIAGNOSTIC_UNTIL, clock });
     bridge = new Bridge({ store, clock, messagePolicyIds: policyIds, dailyEnabled: true,
       prepareMessage: id => queue.prepareMessage(id), prepareReceipt: id => queue.prepareReceipt(id) });
   }
@@ -102,8 +110,13 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
         unsubscribe: async (...args) => { configure(); return events.unsubscribe(...args); },
         status: async (...args) => { configure(); return events.status(...args); },
       };
+      const fridayDiagnostic = { armed: () => readiness().fridayWebhookDiagnosticArmed,
+        run: async principal => {
+          if (!readiness().fridayWebhookDiagnosticArmed) throw new BridgeError('friday_diagnostic_not_armed', 503);
+          configure(); return diagnostic(principal);
+        } };
       return createMcpHandler({ enabled: true, verify, bridge: operations, events: nativeEvents,
-        dailyEnabled: true, healthOnly: !contractReady,
+        dailyEnabled: true, healthOnly: !contractReady, fridayDiagnostic,
         health: () => ({ status: 'ok', authenticated: true, serverVersion: VERSION, readiness: readiness() }),
         scheduleJobs: async ids => {
           if (!readiness().deliveryEnabled) throw new BridgeError('queue_not_enabled', 503);

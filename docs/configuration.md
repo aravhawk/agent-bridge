@@ -59,6 +59,13 @@ bridge_send. bridge_message_send handles bounded data; read/receipt/status tools
 are scoped; Jarvis additionally has safe bridge_subscription_status metadata.
 An authenticated health result proves neither DB connectivity nor native wake.
 
+Delivery flags never change the catalog. After attestation every token with a
+directional scope is offered bridge_status, so a host showing only bridge_health
+is displaying a cached or filtered list, not this server's output. Health
+reports `caller`: the role, whether the token carries the send and ACK scopes,
+and the exact tool names this server offers that caller. Compare it with the
+host's displayed list before changing grants or reconnecting.
+
 ## New project Secret/config bindings
 
 Only Production on project prj_rTBPrIoODxpC1A6sS2OQtlvc7cqE, Arav's Projects.
@@ -99,6 +106,40 @@ inbox-v1 policies on BOTH receivers, then global delivery true. New grants and
 these activations require the specifically reviewed action-time bundle. A flag
 is an operator attestation, not independent evidence. Do not reuse old test
 windows, IDs, grants, callbacks or activation approvals for the changed realm.
+
+## One-time Friday webhook diagnostic
+
+Transport-only check of the saved Friday receiver binding while delivery stays
+off. It is armed only when the OAuth contract is attested, storage and the
+Friday URL/key are configured, FRIDAY_RECEIVER_ID is `jarvis-friday-bridge-inbox`
+and FRIDAY_WEBHOOK_DIAGNOSTIC_FROM / FRIDAY_WEBHOOK_DIAGNOSTIC_UNTIL are fixed ISO
+start/end timestamps for an interval of at most two hours total. Both values
+are required: FROM must be at or before now, and UNTIL must be after now. Missing,
+invalid, reversed or overlong intervals stay closed, including after a restart;
+an overlong interval cannot become valid as time passes. This replaces the old
+deadline-only configuration. Prepare both timestamps together for the approved
+test window; no new credential or service is needed. Health reports
+`fridayWebhookDiagnosticArmed`. While armed, Jarvis (with
+its send scope) alone sees `bridge_friday_webhook_diagnostic`, which takes no
+arguments. Friday never sees it.
+
+The first call commits a durable spend marker with a fresh server UUID before
+any request starts, then makes ONE POST: the saved URL, `Authorization: Bearer`
+with the saved key, `Content-Type: application/json` and exactly
+`{"event":"bridge.message.received","data":{"messageId":"<uuid>"}}`. There are
+no retries. Concurrent calls, restarts, re-arming, timeouts and lost outcomes
+only return the recorded attempt (`duplicate: true`); a second send needs a
+code change. The window is checked again after the spend commits and before
+starting transport. If it has closed, no request starts, the spend remains
+permanent and the recorded result is `friday_diagnostic_expired`. Results carry
+the UUID, numeric status or sanitized error, never
+the URL, key or response body. No message is stored, so Friday's read of the
+UUID returns message_not_found by design.
+
+HTTP 2xx proves neither wake nor mapping. Evidence is the native Friday run
+showing this exact event and data.messageId. Only then may an operator consider
+FRIDAY_WEBHOOK_CONTRACT_VERIFIED; the diagnostic never sets it. Afterwards,
+clear both diagnostic timestamps (the window also lapses on its own).
 
 ## Public metadata/package checks
 

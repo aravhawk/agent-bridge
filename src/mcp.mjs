@@ -20,11 +20,16 @@ const dailySendTool = tool('bridge_message_send',
     to: { enum: ['jarvis', 'friday'] }, kind: { enum: ['message', 'status', 'handoff_request'] },
     sentAt: { type: 'string', format: 'date-time' }, expiresAt: { type: 'string', format: 'date-time' },
     threadId: idSchema, route: { const: 'inbox' }, text: { type: 'string', minLength: 1, maxLength: 4096 } }));
+const diagnosticTool = { ...tool('bridge_friday_webhook_diagnostic',
+  'Operator-armed, one-time transport check: POST one synthetic bridge.message.received event with a fresh UUID to the configured Friday receiver. No arguments or retries; later calls return the recorded attempt. HTTP status never proves wake.', object({})),
+  annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true } };
 const subscriptionStatusTool = tool('bridge_subscription_status', 'Inspect your Jarvis subscription activity and renewal timestamps. No callback URL or secret is returned.', object({}), true);
-function allowedTools(principal, health, dailyEnabled, healthOnly) {
-  return [...tools, ...(dailyEnabled ? [dailySendTool, ...(principal.role === 'jarvis' ? [subscriptionStatusTool] : [])] : [])].filter(t => !healthOnly || t.name === 'bridge_health').filter(t => t.name === 'bridge_health'
+function allowedTools(principal, health, dailyEnabled, healthOnly, diagnostic) {
+  return [...tools, ...(dailyEnabled ? [dailySendTool, ...(principal.role === 'jarvis' ? [subscriptionStatusTool] : [])] : []),
+    ...(principal.role === 'jarvis' && typeof diagnostic?.run === 'function' && diagnostic.armed?.() === true ? [diagnosticTool] : [])]
+    .filter(t => !healthOnly || t.name === 'bridge_health').filter(t => t.name === 'bridge_health'
     ? typeof health === 'function' && Object.values(SCOPES[principal.role]).some(s => principal.scopes.includes(s))
-    : t.name === 'bridge_message_send' ? principal.scopes.includes(SCOPES[principal.role].probe)
+    : [dailySendTool.name, diagnosticTool.name].includes(t.name) ? principal.scopes.includes(SCOPES[principal.role].probe)
     : t.name === 'bridge_status' || principal.scopes.includes(SCOPES[principal.role].ack));
 }
 const json = (body, status = 200) => new Response(JSON.stringify(body), { status,
@@ -63,7 +68,7 @@ async function boundedJson(request) {
 // Mount only at the canonical authenticated role paths. This resource server
 // never creates a provider, issues tokens or registers a native plugin.
 export function createMcpHandler({ enabled = false, verify, bridge, events, scheduleJobs, resourceMetadataUrl,
-  observeValidationFailure, health, dailyEnabled = true, healthOnly = false }) {
+  observeValidationFailure, health, dailyEnabled = true, healthOnly = false, fridayDiagnostic }) {
   return async request => {
     let id = null, input, stage = 'before_authenticated_body';
     try {
@@ -102,17 +107,28 @@ export function createMcpHandler({ enabled = false, verify, bridge, events, sche
             serverInfo: { name: 'jarvis-friday-bridge', version: VERSION } };
           break;
         case 'ping': ownKeys(params, [], []); result = {}; break;
-        case 'tools/list': ownKeys(params, [], []); result = { tools: allowedTools(principal, health, dailyEnabled, healthOnly) }; break;
+        case 'tools/list': ownKeys(params, [], []); result = { tools: allowedTools(principal, health, dailyEnabled, healthOnly, fridayDiagnostic) }; break;
         case 'events/list': if (healthOnly) throw new BridgeError('provider_contract_verification_required', 503); result = events.list(principal, params); break;
         case 'events/subscribe': if (healthOnly) throw new BridgeError('provider_contract_verification_required', 503); result = await events.subscribe(principal, params); break;
         case 'events/unsubscribe': result = await events.unsubscribe(principal, params); break;
         case 'tools/call': {
           ownKeys(params, ['name', 'arguments']);
-          if (!allowedTools(principal, health, dailyEnabled, healthOnly).some(t => t.name === params.name)) throw new BridgeError('tool_not_available', 403);
+          const available = allowedTools(principal, health, dailyEnabled, healthOnly, fridayDiagnostic);
+          if (!available.some(t => t.name === params.name)) throw new BridgeError('tool_not_available', 403);
           stage = 'tool_arguments';
           let output;
           switch (params.name) {
-            case 'bridge_health': ownKeys(params.arguments, [], []); output = await health(); break;
+            case 'bridge_health':
+              ownKeys(params.arguments, [], []);
+              // The caller's own grant and the catalog this server offers it, so a
+              // native host's displayed tool list can be compared with the source.
+              // Only the two fixed directional scope facts; no claims or identity.
+              output = { ...await health(), caller: { role: principal.role,
+                sendScope: principal.scopes.includes(SCOPES[principal.role].probe),
+                ackScope: principal.scopes.includes(SCOPES[principal.role].ack),
+                tools: available.map(t => t.name) } };
+              break;
+            case 'bridge_friday_webhook_diagnostic': ownKeys(params.arguments, [], []); output = await fridayDiagnostic.run(principal); break;
             case 'bridge_subscription_status': output = await events.status(principal, params.arguments); break;
             case 'bridge_message_send': output = await bridge.sendMessage(principal, params.arguments); break;
             case 'bridge_read': output = await bridge.read(principal, params.arguments); break;
