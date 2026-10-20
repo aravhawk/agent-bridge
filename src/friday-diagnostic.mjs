@@ -7,11 +7,13 @@ import { RECEIVER_ID } from './release.mjs';
 const fail = (code, status = 503) => { throw new BridgeError(code, status); };
 export const DIAGNOSTIC_MAX_WINDOW_MS = 2 * 3600000;
 
-// Operator arming is a finite env deadline no more than two hours ahead.
-// A missing, malformed, past or longer window keeps the diagnostic closed.
-export function diagnosticWindowOpen(until, now) {
+// Fixed operator interval, shared across instances/restarts. Validate its full
+// duration, not its remaining lifetime: an overlong arm must never open later.
+export function diagnosticWindowOpen(from, until, now) {
+  const start = typeof from === 'string' ? Date.parse(from) : NaN;
   const end = typeof until === 'string' ? Date.parse(until) : NaN;
-  return Number.isSafeInteger(end) && end > now && end - now <= DIAGNOSTIC_MAX_WINDOW_MS;
+  return Number.isSafeInteger(start) && Number.isSafeInteger(end) && Number.isSafeInteger(now) &&
+    end > start && end - start <= DIAGNOSTIC_MAX_WINDOW_MS && start <= now && now < end;
 }
 const view = (record, duplicate) => ({ messageId: record.messageId, receiverId: record.receiverId,
   attemptedAt: new Date(record.attemptedAt).toISOString(), duplicate,
@@ -25,7 +27,7 @@ const view = (record, duplicate) => ({ messageId: record.messageId, receiverId: 
 // BEFORE the request starts: concurrent calls, restarts, timeouts and lost
 // outcomes can only return the recorded attempt, never send another. Caller
 // input chooses nothing; destination, key and body are server configuration.
-export function createFridayDiagnostic({ store, endpoint, secret, transport, until, clock = Date.now }) {
+export function createFridayDiagnostic({ store, endpoint, secret, transport, from, until, clock = Date.now }) {
   return async principal => {
     if (principal?.role !== 'jarvis' || !principal.scopes?.includes(SCOPES.jarvis.probe)) fail('insufficient_scope', 403);
     // Repairable configuration must fail before the single attempt is spent.
@@ -33,9 +35,9 @@ export function createFridayDiagnostic({ store, endpoint, secret, transport, unt
     const claimed = await store.transaction(state => {
       const now = clock();
       if (state.fridayWebhookDiagnostic) return { record: state.fridayWebhookDiagnostic, duplicate: true };
-      if (!diagnosticWindowOpen(until, now)) fail('friday_diagnostic_not_armed');
+      if (!diagnosticWindowOpen(from, until, now)) fail('friday_diagnostic_not_armed');
       state.fridayWebhookDiagnostic = { messageId: randomUUID(), receiverId: RECEIVER_ID,
-        attemptedAt: now, armedUntil: Date.parse(until), outcome: null };
+        attemptedAt: now, armedFrom: Date.parse(from), armedUntil: Date.parse(until), outcome: null };
       return { record: state.fridayWebhookDiagnostic, duplicate: false };
     });
     if (claimed.duplicate) return view(claimed.record, true);
@@ -43,6 +45,9 @@ export function createFridayDiagnostic({ store, endpoint, secret, transport, unt
     const eventId = 'evt_' + digest(JSON.stringify([messageId, 'friday']));
     let outcome;
     try {
+      // The durable COMMIT can finish after the window closes. Keep that spend
+      // even when transport is suppressed; re-arming must not permit a resend.
+      if (!diagnosticWindowOpen(from, until, clock())) fail('friday_diagnostic_expired');
       const send = createFridaySender({ enabled: true, probeMessageId: messageId, endpoint, secret, transport });
       const response = await send({ id: 'job_' + eventId.slice(4), eventId, messageId, recipient: 'friday',
         attempts: 1, body: JSON.stringify({ event: EVENT_NAME, data: { messageId } }) });

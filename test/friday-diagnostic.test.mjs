@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { generateKeyPair, SignJWT } from 'jose';
 import { createRuntime } from '../src/runtime.mjs';
+import { diagnosticWindowOpen, DIAGNOSTIC_MAX_WINDOW_MS } from '../src/friday-diagnostic.mjs';
 import { emptyState } from '../src/store.mjs';
 import { resourceFor } from '../src/resource.mjs';
 import { SCOPES, BridgeError } from '../src/policy.mjs';
@@ -21,6 +22,7 @@ const deployedEnv = now => ({ BRIDGE_OAUTH_ISSUER: ISSUER, BRIDGE_OAUTH_CONTRACT
   BRIDGE_SUBSCRIPTION_STORAGE_KEY: randomBytes(32).toString('base64'),
   DATABASE_URL: 'postgresql://fixture.neon.tech/neondb?sslmode=require', FRIDAY_RECEIVER_ID: 'jarvis-friday-bridge-inbox',
   FRIDAY_WEBHOOK_URL: URL_SECRET, FRIDAY_WEBHOOK_KEY: KEY, FRIDAY_WEBHOOK_CONTRACT_VERIFIED: 'false',
+  FRIDAY_WEBHOOK_DIAGNOSTIC_FROM: new Date(now).toISOString(),
   FRIDAY_WEBHOOK_DIAGNOSTIC_UNTIL: new Date(now + 3600000).toISOString() });
 
 // Transactions serialize like the production row lock (SELECT ... FOR UPDATE)
@@ -38,7 +40,7 @@ function lockingDatabase(initial = emptyState()) {
           if (db.failUpdates > 0) { db.failUpdates--; throw Error('FIXTURE_DB_DOWN'); }
           pending = JSON.parse(params[0]); return {};
         }
-        if (sql === 'COMMIT') { if (pending) db.document = pending; release(); return {}; }
+        if (sql === 'COMMIT') { if (pending) db.document = pending; release(); db.afterCommit?.(); return {}; }
         if (sql === 'ROLLBACK') { release?.(); return {}; }
         return {};
       } };
@@ -47,8 +49,8 @@ function lockingDatabase(initial = emptyState()) {
   return db;
 }
 
-async function fixture({ env: changes = {}, db = lockingDatabase(), respond } = {}) {
-  let now = Date.now();
+async function fixture({ env: changes = {}, db = lockingDatabase(), respond, now: start = Date.now() } = {}) {
+  let now = start;
   const posts = [];
   const env = { ...deployedEnv(now), ...changes };
   const { publicKey, privateKey } = await generateKeyPair('RS256');
@@ -138,7 +140,9 @@ test('wrong caller, missing send scope or caller-supplied arguments cannot spend
 
 test('unarmed, expired, overlong, wrong receiver or unattested configuration keeps the diagnostic closed', async () => {
   const later = new Date(Date.now() + 3 * 3600000).toISOString();
-  for (const env of [{ FRIDAY_WEBHOOK_DIAGNOSTIC_UNTIL: '' }, { FRIDAY_WEBHOOK_DIAGNOSTIC_UNTIL: 'soon' },
+  for (const env of [{ FRIDAY_WEBHOOK_DIAGNOSTIC_FROM: undefined }, { FRIDAY_WEBHOOK_DIAGNOSTIC_FROM: '' },
+    { FRIDAY_WEBHOOK_DIAGNOSTIC_FROM: 'soon' }, { FRIDAY_WEBHOOK_DIAGNOSTIC_FROM: later },
+    { FRIDAY_WEBHOOK_DIAGNOSTIC_UNTIL: '' }, { FRIDAY_WEBHOOK_DIAGNOSTIC_UNTIL: 'soon' },
     { FRIDAY_WEBHOOK_DIAGNOSTIC_UNTIL: '2020-01-01T00:00:00Z' }, { FRIDAY_WEBHOOK_DIAGNOSTIC_UNTIL: later },
     { FRIDAY_RECEIVER_ID: 'jarvis-friday-test-receiver' }, { FRIDAY_RECEIVER_ID: '' },
     { FRIDAY_WEBHOOK_URL: 'http://receiver.example.test/hook' }, { FRIDAY_WEBHOOK_KEY: 'bad\nkey' },
@@ -152,6 +156,59 @@ test('unarmed, expired, overlong, wrong receiver or unattested configuration kee
   const f = await fixture(); f.advance(3600000);
   assert.equal((await f.names('jarvis')).includes(DIAGNOSTIC), false);
   assert.equal((await f.call()).status, 403); assert.equal(f.posts.length, 0);
+});
+
+test('fixed arm interval enforces start/end boundaries and a maximum total duration', () => {
+  const start = Date.now(), from = new Date(start).toISOString();
+  const until = new Date(start + DIAGNOSTIC_MAX_WINDOW_MS).toISOString();
+  assert.equal(diagnosticWindowOpen(from, until, start - 1), false);
+  assert.equal(diagnosticWindowOpen(from, until, start), true);
+  assert.equal(diagnosticWindowOpen(from, until, start + DIAGNOSTIC_MAX_WINDOW_MS - 1), true);
+  assert.equal(diagnosticWindowOpen(from, until, start + DIAGNOSTIC_MAX_WINDOW_MS), false);
+  assert.equal(diagnosticWindowOpen(from, from, start), false);
+  assert.equal(diagnosticWindowOpen(until, from, start), false);
+});
+
+test('overlong arm stays closed as time passes and after a new runtime starts', async () => {
+  const start = Date.now();
+  const env = { FRIDAY_WEBHOOK_DIAGNOSTIC_FROM: new Date(start).toISOString(),
+    FRIDAY_WEBHOOK_DIAGNOSTIC_UNTIL: new Date(start + 3 * 3600000).toISOString() };
+  const f = await fixture({ env, now: start });
+  for (let hour = 0; hour <= 3; hour++) {
+    assert.equal((await f.health('jarvis')).readiness.fridayWebhookDiagnosticArmed, false);
+    assert.equal((await f.names('jarvis')).includes(DIAGNOSTIC), false);
+    assert.equal((await f.call()).status, 403);
+    f.advance(3600000);
+  }
+  await f.rt.close();
+  const restarted = await fixture({ env, db: f.db, now: start + 3600000 });
+  assert.equal((await restarted.health('jarvis')).readiness.fridayWebhookDiagnosticArmed, false);
+  assert.equal((await restarted.call()).status, 403);
+  assert.equal(f.db.document.fridayWebhookDiagnostic, undefined);
+  assert.equal(f.posts.length + restarted.posts.length, 0);
+});
+
+test('expiry during spend COMMIT suppresses transport and keeps the attempt spent across restart/re-arming', async () => {
+  const f = await fixture();
+  // Publish the marker while still armed, but finish COMMIT at the exact end.
+  f.db.afterCommit = () => { delete f.db.afterCommit; f.advance(3600000); };
+  const response = await f.call();
+  assert.equal(response.status, 200);
+  const result = response.body.result.structuredContent;
+  assert.equal(result.duplicate, false); assert.equal(result.recorded, true);
+  assert.deepEqual(result.transport, { status: null, error: 'friday_diagnostic_expired' });
+  assert.match(result.messageId, uuid);
+  assert.equal(f.posts.length, 0);
+  assert.equal(f.db.document.fridayWebhookDiagnostic.messageId, result.messageId);
+  assert.deepEqual(f.db.document.fridayWebhookDiagnostic.outcome.error, 'friday_diagnostic_expired');
+  assert.equal((await f.health('jarvis')).readiness.deliveryEnabled, false);
+  assert.deepEqual([f.db.document.messages, f.db.document.jobs, f.db.document.receipts], [{}, {}, {}]);
+  await f.rt.close();
+  const restarted = await fixture({ db: f.db });
+  const duplicate = (await restarted.call()).body.result.structuredContent;
+  assert.equal(duplicate.duplicate, true); assert.equal(duplicate.messageId, result.messageId);
+  assert.deepEqual(duplicate.transport, result.transport);
+  assert.equal(restarted.posts.length, 0);
 });
 
 test('concurrent calls commit one spend marker and one POST; the rest return that attempt', async () => {

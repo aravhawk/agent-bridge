@@ -39,7 +39,8 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
     const fridayContractVerified = env.FRIDAY_WEBHOOK_CONTRACT_VERIFIED === 'true';
     // Independent of delivery: one operator-armed transport check only.
     const fridayWebhookDiagnosticArmed = contractReady && !!env.DATABASE_URL && senderConfigured &&
-      env.FRIDAY_RECEIVER_ID === RECEIVER_ID && diagnosticWindowOpen(env.FRIDAY_WEBHOOK_DIAGNOSTIC_UNTIL, clock());
+      env.FRIDAY_RECEIVER_ID === RECEIVER_ID && diagnosticWindowOpen(
+        env.FRIDAY_WEBHOOK_DIAGNOSTIC_FROM, env.FRIDAY_WEBHOOK_DIAGNOSTIC_UNTIL, clock());
     return { storageConfigured: !!env.DATABASE_URL, callbackProtectorConfigured,
       currentAccessCheckConfigured: !!policyIds.jarvis,
       subscriptionSetupEnabled: !!base && env.BRIDGE_SUBSCRIPTIONS_ENABLED === 'true',
@@ -82,7 +83,8 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
       messagePolicyIds: policyIds, clock, accessAllowed: authorize, fridaySender: nativeSender, enabled: delivery });
     queue = createQueueAdapter({ client, store, worker, clock, enabled: delivery, maintenanceEnabled: true });
     diagnostic = createFridayDiagnostic({ store, endpoint: env.FRIDAY_WEBHOOK_URL, secret: env.FRIDAY_WEBHOOK_KEY,
-      transport: transport || transportFactory({ enabled: true }), until: env.FRIDAY_WEBHOOK_DIAGNOSTIC_UNTIL, clock });
+      transport: transport || transportFactory({ enabled: true }), from: env.FRIDAY_WEBHOOK_DIAGNOSTIC_FROM,
+      until: env.FRIDAY_WEBHOOK_DIAGNOSTIC_UNTIL, clock });
     bridge = new Bridge({ store, clock, messagePolicyIds: policyIds, dailyEnabled: true,
       prepareMessage: id => queue.prepareMessage(id), prepareReceipt: id => queue.prepareReceipt(id) });
   }
