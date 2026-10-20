@@ -57,6 +57,8 @@ unavailable in the supported native flow, keep the OAuth contract unattested.
 Normal v1 catalog: seven Jarvis tools, six Friday tools. There is no synthetic
 bridge_send. bridge_message_send handles bounded data; read/receipt/status tools
 are scoped; Jarvis additionally has safe bridge_subscription_status metadata.
+After OAuth attestation, Jarvis callers with the send scope also discover the
+one-time diagnostic schema regardless of arming (eight tools with both scopes).
 An authenticated health result proves neither DB connectivity nor native wake.
 
 Delivery flags never change the catalog. After attestation every token with a
@@ -119,9 +121,14 @@ invalid, reversed or overlong intervals stay closed, including after a restart;
 an overlong interval cannot become valid as time passes. This replaces the old
 deadline-only configuration. Prepare both timestamps together for the approved
 test window; no new credential or service is needed. Health reports
-`fridayWebhookDiagnosticArmed`. While armed, Jarvis (with
-its send scope) alone sees `bridge_friday_webhook_diagnostic`, which takes no
-arguments. Friday never sees it.
+`fridayWebhookDiagnosticArmed`. After OAuth attestation, Jarvis with its send
+scope alone sees `bridge_friday_webhook_diagnostic`, which takes no arguments,
+even while unarmed. Friday never sees it; pre-attestation bootstrap stays health
+only. Discovery grants no execution: every invocation checks readiness before
+storage or transport setup, and an unarmed/expired call fails with
+`friday_diagnostic_not_armed` without spending an attempt. This stable schema
+allows the native catalog to refresh while delivery and the diagnostic are off.
+Native caching or host filtering can still require a supported refresh.
 
 The first call commits a durable spend marker with a fresh server UUID before
 any request starts, then makes ONE POST: the saved URL, `Authorization: Bearer`
