@@ -110,11 +110,10 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
         unsubscribe: async (...args) => { configure(); return events.unsubscribe(...args); },
         status: async (...args) => { configure(); return events.status(...args); },
       };
-      const fridayDiagnostic = { armed: () => readiness().fridayWebhookDiagnosticArmed,
-        run: async principal => {
-          if (!readiness().fridayWebhookDiagnosticArmed) throw new BridgeError('friday_diagnostic_not_armed', 503);
-          configure(); return diagnostic(principal);
-        } };
+      const fridayDiagnostic = { run: async principal => {
+        if (!readiness().fridayWebhookDiagnosticArmed) throw new BridgeError('friday_diagnostic_not_armed', 503);
+        configure(); return diagnostic(principal);
+      } };
       return createMcpHandler({ enabled: true, verify, bridge: operations, events: nativeEvents,
         dailyEnabled: true, healthOnly: !contractReady, fridayDiagnostic,
         health: () => ({ status: 'ok', authenticated: true, serverVersion: VERSION, readiness: readiness() }),

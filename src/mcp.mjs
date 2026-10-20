@@ -21,12 +21,14 @@ const dailySendTool = tool('bridge_message_send',
     sentAt: { type: 'string', format: 'date-time' }, expiresAt: { type: 'string', format: 'date-time' },
     threadId: idSchema, route: { const: 'inbox' }, text: { type: 'string', minLength: 1, maxLength: 4096 } }));
 const diagnosticTool = { ...tool('bridge_friday_webhook_diagnostic',
-  'Operator-armed, one-time transport check: POST one synthetic bridge.message.received event with a fresh UUID to the configured Friday receiver. No arguments or retries; later calls return the recorded attempt. HTTP status never proves wake.', object({})),
+  'Operator-armed, one-time transport check: POST one synthetic bridge.message.received event with a fresh UUID to the configured Friday receiver. Visible while unarmed, but invocation requires an active operator window. No arguments or retries; later armed calls return the recorded attempt. HTTP status never proves wake.', object({})),
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true } };
 const subscriptionStatusTool = tool('bridge_subscription_status', 'Inspect your Jarvis subscription activity and renewal timestamps. No callback URL or secret is returned.', object({}), true);
 function allowedTools(principal, health, dailyEnabled, healthOnly, diagnostic) {
   return [...tools, ...(dailyEnabled ? [dailySendTool, ...(principal.role === 'jarvis' ? [subscriptionStatusTool] : [])] : []),
-    ...(principal.role === 'jarvis' && typeof diagnostic?.run === 'function' && diagnostic.armed?.() === true ? [diagnosticTool] : [])]
+    // Discovery must not race the finite operator window. The runtime checks
+    // readiness on every invocation before configuring storage or transport.
+    ...(principal.role === 'jarvis' && typeof diagnostic?.run === 'function' ? [diagnosticTool] : [])]
     .filter(t => !healthOnly || t.name === 'bridge_health').filter(t => t.name === 'bridge_health'
     ? typeof health === 'function' && Object.values(SCOPES[principal.role]).some(s => principal.scopes.includes(s))
     : [dailySendTool.name, diagnosticTool.name].includes(t.name) ? principal.scopes.includes(SCOPES[principal.role].probe)
