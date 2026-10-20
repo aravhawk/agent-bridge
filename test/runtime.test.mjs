@@ -6,14 +6,16 @@ import { createContractObserver, createAccessVerifier } from '../src/policy.mjs'
 import { generateKeyPair, SignJWT } from 'jose';
 import { handle } from '../api/index.mjs';
 import { createRuntime } from '../src/runtime.mjs';
-import { resourceFor, metadataFor, ISSUER } from '../src/resource.mjs';
+import { resourceFor, metadataFor } from '../src/resource.mjs';
+import { ISSUER } from './fixtures/provider.mjs';
 import { MemoryStore } from '../src/store.mjs';
 import { emptyState } from '../src/store.mjs';
 import { TOPIC, createQueueAdapter } from '../src/queue.mjs';
 import queueHandler from '../api/queue.mjs';
 
 const headers = { 'content-type': 'application/json', accept: 'application/json, text/event-stream' };
-const request = (path, extra = {}) => new Request('https://rn-jarvis-friday-discovery-20261018.vercel.app' + path,
+process.env.BRIDGE_OAUTH_ISSUER = ISSUER;
+const request = (path, extra = {}) => new Request('https://jarvis-friday-bridge.aravhawk.com' + path,
   { method: 'POST', headers, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }), ...extra });
 test('public discovery challenges both resources and describes only the real provider', async () => {
   for (const role of ['friday', 'jarvis']) {
@@ -102,17 +104,19 @@ test('catch-all routing excludes the actual queue function path', () => {
   assert.equal(config.functions['api/queue.mjs'].experimentalTriggers[0].topic, TOPIC);
   assert.equal(config.functions['api/queue.mjs'].experimentalTriggers[0].maxDeliveries, 20);
 });
-test('legacy health and health-only invocation still work through new router', async () => {
-  assert.equal((await (await handle(new Request(resourceFor('friday').split('/bridge/')[0] + '/health'))).json()).events, false);
-  const r = await handle(request('/mcp', { body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'probe_health', arguments: {} } }) }));
-  assert.equal(JSON.parse((await r.json()).result.content[0].text).messageDelivery, false);
-  assert.equal((await handle(new Request(metadataFor('friday').split('/.well-known/')[0] + '/.well-known/oauth-authorization-server'))).status, 503);
+test('v1 health is clean and all legacy probe/diagnostic/token routes are absent', async () => {
+  const base = new URL(resourceFor('jarvis')).origin;
+  const health = await (await handle(new Request(base + '/health'))).json();
+  assert.equal(health.service, 'Jarvis Friday Bridge'); assert.equal(health.version, '1.0.0');
+  assert.equal(health.authenticationRequired, true); assert.equal('messageDelivery' in health, false);
+  for (const path of ['/mcp', '/oauth-diag/public/mcp', '/oauth-diag/dcr/token', '/.well-known/oauth-authorization-server'])
+    assert.equal((await handle(request(path))).status, 404);
 });
 test('runtime requires real subject/claim contract, verifies audience, and blocks writes without readiness', async () => {
   const { publicKey, privateKey } = await generateKeyPair('RS256');
   let poolOptions;
   class FakePool { constructor(options) { poolOptions = options; } on() {} connect() { throw new Error('unexpected database access'); } }
-  const rt = createRuntime({ env: { BRIDGE_OAUTH_CONTRACT_VERIFIED: 'true', BRIDGE_ALLOWED_SUBJECT: 'fixture-subject',
+  const rt = createRuntime({ env: { BRIDGE_OAUTH_ISSUER: ISSUER, BRIDGE_OAUTH_CONTRACT_VERIFIED: 'true', BRIDGE_ALLOWED_SUBJECT: 'fixture-subject',
     DATABASE_URL: 'postgresql://fixture:fixture@fixture.neon.tech/neondb?sslmode=require' }, Pool: FakePool,
     keyResolver: publicKey, queueClient: {} });
   const token = await new SignJWT({ scope: 'bridge:send:jarvis bridge:ack:friday' }).setProtectedHeader({ alg: 'RS256' })
@@ -122,7 +126,7 @@ test('runtime requires real subject/claim contract, verifies audience, and block
   const call = (method, params) => handler(request('/bridge/friday/mcp', { headers: { ...headers, authorization: `Bearer ${token}` },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) }));
   assert.equal((await (await call('tools/list')).json()).result.tools.length, 6);
-  const response = await call('tools/call', { name: 'bridge_send', arguments: {} });
+  const response = await call('tools/call', { name: 'bridge_message_send', arguments: {} });
   assert.equal(response.status, 503); assert.equal((await response.json()).error.message, 'receiver_readiness_required');
   const lookup = await call('tools/call', { name: 'bridge_status', arguments: { messageId: '00000000-0000-4000-8000-000000000001' } });
   assert.equal(lookup.status, 503); assert.equal(new URL(poolOptions.connectionString).searchParams.get('sslmode'), 'verify-full');
@@ -136,11 +140,11 @@ test('runtime bounds Jarvis subscription by verified expiry and durable denial w
     on() {}
     async connect() { return { release() {}, async query(sql, params) {
       if (sql.startsWith('SELECT document')) return { rows: [{ document: structuredClone(document) }] };
-      if (sql.startsWith('UPDATE rn_bridge_runtime')) document = JSON.parse(params[0]);
+      if (sql.startsWith('UPDATE bridge_runtime_v1')) document = JSON.parse(params[0]);
       return { rows: [] };
     } }; }
   }
-  const rt = createRuntime({ env: { BRIDGE_OAUTH_CONTRACT_VERIFIED: 'true', BRIDGE_ALLOWED_SUBJECT: 'fixture-subject',
+  const rt = createRuntime({ env: { BRIDGE_OAUTH_ISSUER: ISSUER, BRIDGE_OAUTH_CONTRACT_VERIFIED: 'true', BRIDGE_ALLOWED_SUBJECT: 'fixture-subject',
     BRIDGE_SUBSCRIPTIONS_ENABLED: 'true', BRIDGE_DELIVERY_ENABLED: 'false',
     BRIDGE_SUBSCRIPTION_STORAGE_KEY: randomBytes(32).toString('base64'),
     DATABASE_URL: 'postgresql://fixture:fixture@fixture.neon.tech/neondb?sslmode=require' },
@@ -164,7 +168,7 @@ test('runtime bounds Jarvis subscription by verified expiry and durable denial w
     delivery: { mode: 'webhook', url: 'https://callback.example.test/events', secret: 'whsec_' + randomBytes(32).toString('base64') }, ttlMs: null });
   assert.equal(denied.status, 403); assert.equal((await denied.json()).error.message, 'access_revoked');
   assert.equal(challenges, 1); assert.equal(Object.keys(document.subscriptions).length, 1);
-  const sent = await rpc('tools/call', { name: 'bridge_send', arguments: {} });
+  const sent = await rpc('tools/call', { name: 'bridge_message_send', arguments: {} });
   assert.equal(sent.status, 503); assert.equal((await sent.json()).error.message, 'receiver_readiness_required');
   assert.deepEqual(document.messages, {}); assert.deepEqual(document.jobs, {}); assert.equal(queueSends, 0);
 });
@@ -202,7 +206,7 @@ test('private queue handler is disabled before any pool, SDK or transport work',
   delete process.env.BRIDGE_DELIVERY_ENABLED;
   try {
     const response = await queueHandler.fetch(new Request('https://fixture.example/api/queue', { method: 'POST', body: '{}' }));
-    assert.equal(response.status, 503); assert.deepEqual(await response.json(), { error: 'delivery_not_enabled' });
+    assert.equal(response.status, 503); assert.deepEqual(await response.json(), { error: 'storage_configuration_required' });
   } finally {
     if (previous === undefined) delete process.env.BRIDGE_DELIVERY_ENABLED;
     else process.env.BRIDGE_DELIVERY_ENABLED = previous;

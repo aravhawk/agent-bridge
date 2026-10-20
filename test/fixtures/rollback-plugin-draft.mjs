@@ -1,4 +1,4 @@
-import { BridgeError, SCOPES } from './policy.mjs';
+import { BridgeError, SCOPES } from '../../src/policy.mjs';
 
 // Only creates local file contents after ACTUAL authenticated discovery is
 // supplied. It never contacts a service, zips/uploads or installs a plugin.

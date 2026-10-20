@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { generateKeyPair, SignJWT } from 'jose';
 import { Webhook } from 'standardwebhooks';
-import { createRuntime } from '../src/runtime.mjs';
+import { createRuntime } from './fixtures/rollback-runtime.mjs';
 import { emptyState } from '../src/store.mjs';
-import { ISSUER, resourceFor } from '../src/resource.mjs';
+import { resourceFor } from '../src/resource.mjs';
+import { ISSUER } from './fixtures/provider.mjs';
 import { SCOPES } from '../src/policy.mjs';
 import { TOPIC } from '../src/queue.mjs';
 
@@ -25,7 +26,7 @@ async function fixture(overrides = {}, initial = {}) {
     on() {} async end() {}
     async connect() { return { release() {}, async query(sql, params) {
       if (sql.startsWith('SELECT document')) return { rows: [{ document: structuredClone(document) }] };
-      if (sql.startsWith('UPDATE rn_bridge_runtime')) document = JSON.parse(params[0]);
+      if (sql.startsWith('UPDATE bridge_runtime_v1')) document = JSON.parse(params[0]);
       return { rows: [] };
     } }; }
   }

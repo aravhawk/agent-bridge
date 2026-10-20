@@ -11,7 +11,8 @@ import { NativeEvents } from '../src/events.mjs';
 import { DeliveryWorker } from '../src/worker.mjs';
 import { createFridaySender } from '../src/friday-sender.mjs';
 import { createRuntime } from '../src/runtime.mjs';
-import { ISSUER, resourceFor } from '../src/resource.mjs';
+import { resourceFor } from '../src/resource.mjs';
+import { ISSUER } from './fixtures/provider.mjs';
 import { TOPIC } from '../src/queue.mjs';
 
 const start = Date.UTC(2026, 9, 19), policy = 'c'.repeat(64);
@@ -156,14 +157,14 @@ async function runtimeFixture(changes = {}) {
   const { publicKey, privateKey } = await generateKeyPair('RS256');
   class Pool { on() {} async connect() { return { release() {}, async query(sql, params) {
     if (sql.startsWith('SELECT document')) return { rows: [{ document: structuredClone(document) }] };
-    if (sql.startsWith('UPDATE rn_bridge_runtime')) document = JSON.parse(params[0]);
+    if (sql.startsWith('UPDATE bridge_runtime_v1')) document = JSON.parse(params[0]);
     return { rows: [] };
   } }; } }
-  const env = { BRIDGE_OAUTH_CONTRACT_VERIFIED: 'true', BRIDGE_ALLOWED_SUBJECT: 'fixture', BRIDGE_DELIVERY_ENABLED: 'true',
+  const env = { BRIDGE_OAUTH_ISSUER: ISSUER, BRIDGE_OAUTH_CONTRACT_VERIFIED: 'true', BRIDGE_ALLOWED_SUBJECT: 'fixture', BRIDGE_DELIVERY_ENABLED: 'true',
     BRIDGE_SUBSCRIPTIONS_ENABLED: 'true', BRIDGE_SUBSCRIPTION_STORAGE_KEY: randomBytes(32).toString('base64'),
     DATABASE_URL: 'postgresql://fixture.neon.tech/neondb?sslmode=require',
-    BRIDGE_DAILY_ENABLED: 'true', BRIDGE_DAILY_RECEIVER_POLICY: 'inbox-v1', FRIDAY_WEBHOOK_CONTRACT_VERIFIED: 'true',
-    FRIDAY_RECEIVER_ID: 'jarvis-friday-test-receiver', FRIDAY_WEBHOOK_URL: 'https://receiver.example.test/event', FRIDAY_WEBHOOK_KEY: 'FIXTURE_ONLY', ...changes };
+    BRIDGE_RECEIVER_POLICY: 'inbox-v1', FRIDAY_WEBHOOK_CONTRACT_VERIFIED: 'true',
+    FRIDAY_RECEIVER_ID: 'jarvis-friday-bridge-inbox', FRIDAY_WEBHOOK_URL: 'https://receiver.example.test/event', FRIDAY_WEBHOOK_KEY: 'FIXTURE_ONLY', ...changes };
   const rt = createRuntime({ env, Pool, keyResolver: publicKey, clock: () => now,
     queueClient: { async send(...args) { if (failQueue) throw Error('FIXTURE_PRIVATE'); sends.push(args); },
       handleCallback(fn) { consumer = fn; return fn; } },
@@ -184,7 +185,7 @@ async function runtimeFixture(changes = {}) {
 }
 
 test('real runtime daily gates require reviewed policy and contract independently of expired synthetic configuration', async () => {
-  for (const env of [{ BRIDGE_DELIVERY_ENABLED: 'false' }, { BRIDGE_DAILY_RECEIVER_POLICY: '' }, { FRIDAY_WEBHOOK_CONTRACT_VERIFIED: 'false' }]) {
+  for (const env of [{ BRIDGE_DELIVERY_ENABLED: 'false' }, { BRIDGE_RECEIVER_POLICY: '' }, { FRIDAY_WEBHOOK_CONTRACT_VERIFIED: 'false' }]) {
     const f = await runtimeFixture(env), m = f.message();
     const denied = await f.rpc('jarvis', 'tools/call', { name: 'bridge_message_send', arguments: m });
     assert.equal(denied.status, 503); assert.equal(Object.keys(f.document().messages).length, 0); assert.equal(f.sends.length, 0);
@@ -277,7 +278,7 @@ test('daily admission bounds prearmed queue work before publication, including f
   const bridge = new Bridge({ store: f.store, clock: f.clock, dailyEnabled: true,
     messagePolicyIds: { jarvis: policy, friday: policy }, prepareMessage: async () => { publishes++; throw Error('fixture publish failure'); } });
   for (let i = 0; i < 10; i++) await assert.rejects(bridge.sendMessage(jarvis, f.message()), /fixture publish failure/);
-  await assert.rejects(bridge.sendMessage(jarvis, f.message()), /probe_rate_limited/);
+  await assert.rejects(bridge.sendMessage(jarvis, f.message()), /message_rate_limited/);
   assert.equal(publishes, 10); assert.equal(Object.keys(f.store.snapshot().messages).length, 0);
   assert.equal(Object.keys(f.store.snapshot().messagePreparations).length, 10);
 });

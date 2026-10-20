@@ -6,7 +6,7 @@ import { MemoryStore } from '../src/store.mjs';
 import { BridgeError, SCOPES, VERIFIED_AUTHORIZATION } from '../src/policy.mjs';
 import { NativeEvents } from '../src/events.mjs';
 import { createProtector } from '../src/webhook.mjs';
-import { createMcpHandler } from '../src/mcp.mjs';
+import { createMcpHandler } from './fixtures/rollback-mcp.mjs';
 
 const start = Date.UTC(2026, 9, 19);
 const policyId = 'c'.repeat(64);
@@ -43,13 +43,13 @@ test('concurrent fresh IDs share one durable budget across bridge instances and 
   const outcomes = await Promise.allSettled(Array.from({ length: 40 }, (_, i) =>
     (i % 2 ? other : f.bridge).send(jarvis, f.probe())));
   assert.equal(outcomes.filter(x => x.status === 'fulfilled').length, 10);
-  for (const x of outcomes.filter(x => x.status === 'rejected')) assert.ok(code('probe_rate_limited', 429)(x.reason));
+  for (const x of outcomes.filter(x => x.status === 'rejected')) assert.ok(code('message_rate_limited', 429)(x.reason));
   const snapshot = f.store.snapshot();
   assert.equal(Object.keys(snapshot.messages).length, 10);
   assert.equal(Object.keys(snapshot.jobs).length, 10);
   assert.equal(snapshot.probeAdmissions.jarvis.length, 10);
   const restarted = fixture(snapshot);
-  await assert.rejects(restarted.bridge.send(jarvis, restarted.probe()), code('probe_rate_limited', 429));
+  await assert.rejects(restarted.bridge.send(jarvis, restarted.probe()), code('message_rate_limited', 429));
 });
 
 test('rolling admission expires each entry at 60 seconds without a fixed-window double burst', async () => {
@@ -58,10 +58,10 @@ test('rolling admission expires each entry at 60 seconds without a fixed-window 
   f.advance(30000);
   for (let i = 0; i < 5; i++) await f.bridge.send(jarvis, f.probe());
   f.advance(29999);
-  await assert.rejects(f.bridge.send(jarvis, f.probe()), code('probe_rate_limited', 429));
+  await assert.rejects(f.bridge.send(jarvis, f.probe()), code('message_rate_limited', 429));
   f.advance(1);
   for (let i = 0; i < 5; i++) await f.bridge.send(jarvis, f.probe());
-  await assert.rejects(f.bridge.send(jarvis, f.probe()), code('probe_rate_limited', 429));
+  await assert.rejects(f.bridge.send(jarvis, f.probe()), code('message_rate_limited', 429));
   assert.equal(f.store.snapshot().probeAdmissions.jarvis.length, 10);
 });
 
@@ -96,7 +96,7 @@ test('sender roles have independent bounded budgets and receipt ACKs do not cons
   const probes = await fill(f);
   await fill(f, friday);
   for (const who of [jarvis, friday]) {
-    await assert.rejects(f.bridge.send(who, f.probe(who.role)), code('probe_rate_limited', 429));
+    await assert.rejects(f.bridge.send(who, f.probe(who.role)), code('message_rate_limited', 429));
   }
   const budgets = f.store.snapshot().probeAdmissions;
   const claim = await f.bridge.claim(friday, { messageId: probes[0].id });
@@ -121,7 +121,7 @@ test('authenticated MCP surfaces 429 without scheduling another job, and duplica
       method: 'tools/call', params: { name: 'bridge_send', arguments: input } }) }));
   const limited = await call(f.probe());
   assert.equal(limited.status, 429);
-  assert.equal((await limited.json()).error.message, 'probe_rate_limited');
+  assert.equal((await limited.json()).error.message, 'message_rate_limited');
   assert.equal(schedules, 0);
   const duplicate = await call(probes[0]);
   assert.equal(duplicate.status, 200);

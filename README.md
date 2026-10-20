@@ -1,24 +1,24 @@
-# Jarvis Friday Bridge
+# Jarvis Friday Bridge · v1.0.0
 
-Private messaging bridge between Jarvis and Friday, using an
-isolated Vercel MCP backend, Clerk public OAuth clients, Neon storage and native
-MCP Events. This repository includes the backend, the registered private plugin,
-tests, schema and Vercel configuration.
+Private, event-driven inbox messaging between Arav's Jarvis and Friday. Messages,
+status updates and handoff requests are data; they never grant permission to run
+code, perform production actions or change access. The receiver evaluates them
+under Arav's independently authorized workflow. No Mac relay or recipient polling.
 
-The deployed baseline accepts only the fixed synthetic envelope. This 0.2.0
-source candidate adds a separately gated bounded daily-use inbox transport; see
-[the contract, receiver policy and activation review](docs/daily-use.md). It is
-not activated. Native receivers,
-subscription readiness and delivery bindings must be verified before sends.
-Delivery is disabled. Jarvis subscription setup is enabled and its signed
-callback/persisted subscription was verified on October 19. No random wake test
-is armed. OAuth credentials remain in the native clients/provider; database and
-runtime secrets remain in the isolated Vercel project's Production environment.
+Canonical service: **https://jarvis-friday-bridge.aravhawk.com**
 
-## Develop and check
+- Jarvis MCP: `/bridge/jarvis/mcp`
+- Friday MCP: `/bridge/friday/mcp`
+- Public version/liveness: `/health` (no private readiness or delivery operations)
 
-Use Node24 and Python3. No environment file or real credential is needed for
-the local tests.
+This v1 source is pending independent review and new auth/Secret approvals. It
+has not been activated. The old disabled deployment remains a separate rollback
+snapshot; its source is commit `fac3baf1ab0be6d70609b3520c97801fc734361b`.
+Historical setup records and fixtures are explicitly separate from active v1.
+
+## Verify source
+
+Node24 and Python3; no real credentials needed:
 
 ```sh
 npm ci --ignore-scripts
@@ -26,79 +26,32 @@ npm test
 python3 scripts/audit_repo.py
 ```
 
-Tests use in-memory transports, fixture identities and locally generated test
-keys. They do not send real messages or call native assistants. The legacy
-health/negative OAuth routes are also covered.
+The suite covers signature/issuer/audience/scope isolation, canonical routing,
+health-only bootstrap, native subscription leases, atomic receipt/ACK handling,
+durable dispatch, bounded retries and retention. Rollback-model fixtures exercise
+old guard behavior without deploying old routes or configuration.
 
-For explicitly requested credential-free checks against the existing isolated
-public deployment, run `npm run check:remote`. Reports go to ignored `.reports/`.
-These checks do not send real credentials, create grants or deliver events.
+`npm run check:remote` makes credential-free requests only to the canonical v1
+service, with no messages, subscriptions, grants or real bearer tokens. Before
+an actual issuer is configured it expects metadata503 and closed bearer access.
+See [configuration](docs/configuration.md) before using its optional flags.
 
-## Contents
+## Deployment identity
 
-| Path | Purpose |
-|---|---|
-| `api/`, `src/` | Authenticated MCP bridge, durable state, Events and queue worker |
-| `legacy/` | Preserved health-only and rejecting diagnostic routes |
-| `plugin/` | Actual registered portable plugin plus compatibility manifests |
-| `test/` | Backend, protocol, storage, legacy and repository contract checks |
-| `schema.sql` | Existing isolated database schema; no automatic migrations |
-| `vercel.json` | Existing iad1/Node runtime and private queue configuration |
-| `.env.example` | Blank secret slots and nonsecret public connection settings |
-| `docs/source-provenance.json` | Initial production source reconciliation and portable plugin identity |
-| `docs/configuration.md` | Runtime boundaries and current connection requirements |
-| `scripts/package_plugin.py` | Package the existing plugin without creating a duplicate |
+Only Arav's Projects, team `team_rCVvKJ5rUgNP0LOPEwzfyl0z`.
+New project **jarvis-friday-bridge**, `prj_rTBPrIoODxpC1A6sS2OQtlvc7cqE`.
+Reuse the private repository `aravhawk/jarvis-friday-bridge`.
+Do not modify the portfolio, other projects or the old deployment during cutover.
 
-`plugin/` is the canonical registered plugin source. The backend's gated
-`src/plugin-draft.mjs` preparation helper is retained from the deployed snapshot;
-it is not used by the packaging script to regenerate the registered plugin.
+The v1 queue is `jarvis-friday-bridge-v1`; state table is `bridge_runtime_v1` in a
+new isolated database. No old user/subscription/message state is silently copied.
+The issuer and public client IDs come from the approved production provider;
+there is no development-provider fallback or guessed live configuration.
 
-## Existing deployment
+[Message/receiver contract](docs/inbox-policy.md) ·
+[Setup and configuration](docs/configuration.md) ·
+[Cutover and confirmation bundle](docs/cutover.md)
 
-Production: https://rn-jarvis-friday-discovery-20261018.vercel.app
-
-- Friday MCP: `/bridge/friday/mcp`
-- Jarvis MCP: `/bridge/jarvis/mcp`
-- Original health-only MCP: `/mcp`
-
-The product/repository name is **Jarvis Friday Bridge**. Existing RN deployment,
-OAuth, event and test identifiers are preserved because they are protocol and
-integration identities. Do not rename the Vercel project, aliases or clients
-merely to match this repository.
-
-Only **Arav's Projects**, team `team_rCVvKJ5rUgNP0LOPEwzfyl0z`, project
-`prj_U4y7PBcoZN3cI2bE3NLE2GZGBFIG`, is in scope. This repository is linked to
-that existing project; do not import it as a second project. Its Git settings
-now show `aravhawk/jarvis-friday-bridge` connected using the existing GitHub
-installation, with no new grant. Production tracks `main`. The root directory
-is this repository root, Framework is Other, Node.js is 24.x, and build, output
-and install commands use their defaults. Preserve Production secrets and all
-disabled delivery gates. Do not change another project's Git connection.
-
-The initial source commit passed all 59 local/CI tests and the staged/history
-secret scans. After linkage, all 34 credential-free endpoint checks passed;
-linking itself did not trigger a build. The first subsequent push to `main`
-must verify a Git deployment's exact commit, Ready status, canonical URL and
-the same endpoint checks. See `docs/configuration.md` for the verification
-limits and disabled runtime gates.
-
-## Synthetic baseline acceptance history
-
-The following describes earlier setup checkpoints. The completed native
-two-direction test is recorded separately; it did not enable daily use. Current
-release acceptance, retention and renewal requirements are in [daily-use.md](docs/daily-use.md).
-
-Jarvis native OAuth and discovery are verified through the managed custom MCP
-app. Its authenticated no-argument `bridge_health` tool checks nonsecret
-configuration readiness without storage, message or event operations. It uses
-the existing resource policy and directional scopes; no new OAuth scope is
-needed. A healthy response does not imply that delivery or subscriptions are
-ready. Refresh the managed app's tool list after a backend tool change.
-
-Jarvis's signed native Events subscription and callback protection are verified.
-Friday's actual Bearer authentication and direct human Secret handoff are
-verified. Its finite source-JWT/operator-window delivery binding is wired behind
-disabled gates; native webhook body mapping, hosted wake and the native
-post-expiry refresh test remain separate acceptance requirements. A discovered
-tool, HTTP acceptance or caller-reported turn ID does not prove a hosted wake.
-See `docs/configuration.md` before enabling either setup or delivery.
+Content reads expire after24h. Physical cleanup is best effort and can exhaust;
+there is no finite physical-deletion guarantee. Strict count/size capacity and
+seven-day replay tombstones bound live state. See the contract for exact limits.
