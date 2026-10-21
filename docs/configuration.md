@@ -173,6 +173,46 @@ showing this exact event and data.messageId. Only then may an operator consider
 FRIDAY_WEBHOOK_CONTRACT_VERIFIED; the diagnostic never sets it. Afterwards,
 clear both diagnostic timestamps (the window also lapses on its own).
 
+## Bounded operation evidence
+
+The existing store retains at most eight renewal-result observations per saved
+subscription and eight read-result observations for the single diagnostic UUID.
+Only records less than 24 hours old are visible. Retention is lazy: relevant
+successful transactions prune stale records; idle storage does not have a timed
+deletion guarantee. No new table, binding, schedule, service or credential is
+needed. Each qualifying operation adds one best-effort store transaction and
+its associated database latency. Recording failures are ignored without retry,
+preserving the original result or error.
+
+The existing subscription-status tool returns `inactiveReason` and
+`renewalObservations` only for the caller's own subscriptions. Records contain
+time, success/error, an allowlisted result code, an optional sanitized callback
+failure reason, the granted refresh deadline, and whether the presented
+authority expiry was new, same, later, earlier or unknown. They never retain
+tokens, callback URLs, callback secrets, error messages or message content.
+Failed initial setup without a saved identity, pre-authentication rejection,
+runtime preflight failure and unavailable storage can leave no observation.
+These records are not a complete request log. Recording never extends a lease,
+reopens denied/unsubscribed access or changes subscription identity.
+
+After the diagnostic spend, an authorized Friday `bridge_read` of its exact
+UUID can record its original success/error without storing the source payload.
+Capture closes at the earlier of the original arm deadline and 30 minutes after
+the spend, even if settings are subsequently changed. `bridge_status` exposes
+these sanitized results when no source message exists: the original Jarvis
+operator with ACK scope may inspect all records; Friday with ACK scope may see
+only its own records. New first-spend markers save the operator's existing
+hashed principal identity solely for this isolation. Legacy ownerless markers
+are never backfilled and grant no new Jarvis status access. The permanent spend
+marker is never cleared by evidence expiry. Existing stored-message status
+responses stay unchanged.
+
+`evidenceStatus: server_read_result_only_not_native_wake` and `wakeVerified:
+false` are deliberate: a recorded read result proves a server call by that
+authenticated principal, not the original native event context, routine wake,
+claim, completion or ACK. No observation retries a request or enables delivery.
+Deploying this change cannot recover the earlier diagnostic's missing trace.
+
 ## Public metadata/package checks
 
 `npm run check:remote` expects an unconfigured, closed v1 deployment. After

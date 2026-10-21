@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypt
 import { BridgeError, SCOPES } from './policy.mjs';
 import { callbackUrl, validSecret, signedHeaders } from './webhook.mjs';
 import { verifiedLease, resourceDenied, validLeaseMetadata, subscriptionAccessAllowed } from './access.mjs';
+import { observeRenewal, renewalObservations } from './observability.mjs';
 
 const fail = (code, status = 400) => { throw new BridgeError(code, status); };
 export const EVENT_NAME = 'bridge.message.received';
@@ -46,6 +47,17 @@ export class NativeEvents {
   }
   async subscribe(principal, params) {
     const { id, url } = identity(principal, params, true);
+    const facts = {};
+    let response;
+    try { response = await this.#subscribe(principal, params, id, url, facts); }
+    catch (error) {
+      await observeRenewal({ store: this.store, principal, id, facts, error, failed: true, clock: this.clock });
+      throw error;
+    }
+    await observeRenewal({ store: this.store, principal, id, facts, response, clock: this.clock });
+    return response;
+  }
+  async #subscribe(principal, params, id, url, facts) {
     if (!this.enabled || !this.store || !this.protector || !this.transport) fail('events_not_enabled', 503);
     const secret = validSecret(params.delivery.secret);
     const now = this.clock();
@@ -54,6 +66,8 @@ export class NativeEvents {
     if (!Number.isSafeInteger(ttl) || ttl <= 0) fail('invalid_params');
     const requestedUntil = Math.min(now + Math.min(ttl, 7 * 86400000), authorization.tokenExpiresAt);
     const deadline = (state, existing, at) => {
+      Object.assign(facts, { checked: true, existing: !!existing,
+        previousExpiry: existing?.authorization?.tokenExpiresAt, expiry: authorization.tokenExpiresAt });
       verifiedLease(principal, this.policyId, at);
       if (resourceDenied(state, principal.principalKey)) fail('access_revoked', 403);
       if (existing && (!validLeaseMetadata(existing, this.policyId) || existing.owner !== principal.principalKey))
@@ -105,6 +119,7 @@ export class NativeEvents {
       deadline(s, old, this.clock());
       s.subscriptions[id] = { id, owner: principal.principalKey, recipient: 'jarvis', name: EVENT_NAME,
         arguments: { recipient: 'jarvis' }, active: true, status: 'active', expiresAt: until, authorization, sealed, fingerprint,
+        ...(old?.renewalObservations ? { renewalObservations: old.renewalObservations } : {}),
         verifiedUntil: savedAt + 300000, firstSubscribedAt: old?.firstSubscribedAt || savedAt,
         lastSubscribedAt: savedAt, renewalCount: (old?.renewalCount || 0) + (old ? 1 : 0) };
       return until;
@@ -114,12 +129,18 @@ export class NativeEvents {
   async status(principal, params = {}) {
     authorizeRecipient(principal, 'jarvis'); ownKeys(params, [], []);
     if (!this.store) fail('storage_configuration_required', 503);
-    return this.store.transaction(state => ({ subscriptions: Object.values(state.subscriptions)
+    return this.store.transaction(state => { const now = this.clock(); return { subscriptions: Object.values(state.subscriptions)
       .filter(sub => sub.owner === principal.principalKey && sub.recipient === 'jarvis').slice(0, 20)
-      .map(sub => ({ id: sub.id, active: subscriptionAccessAllowed(state, sub, this.policyId, this.clock()),
+      .map(sub => ({ id: sub.id, active: subscriptionAccessAllowed(state, sub, this.policyId, now),
         refreshBefore: Number.isSafeInteger(sub.expiresAt) ? new Date(sub.expiresAt).toISOString() : null,
         lastSubscribedAt: Number.isSafeInteger(sub.lastSubscribedAt) ? new Date(sub.lastSubscribedAt).toISOString() : null,
-        renewalCount: sub.renewalCount || 0 })) }));
+        renewalCount: sub.renewalCount || 0,
+        inactiveReason: subscriptionAccessAllowed(state, sub, this.policyId, now) ? null
+          : resourceDenied(state, sub.owner) || sub.status === 'denied' ? 'denied'
+            : sub.status === 'unsubscribed' ? 'unsubscribed'
+              : !validLeaseMetadata(sub, this.policyId) ? 'authorization_invalid'
+                : sub.status !== 'active' || !sub.active ? 'inactive' : 'expired',
+        renewalObservations: renewalObservations(sub, now) })) }; });
   }
   async unsubscribe(principal, params) {
     const { id } = identity(principal, params, false);
