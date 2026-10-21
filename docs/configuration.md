@@ -175,6 +175,14 @@ clear both diagnostic timestamps (the window also lapses on its own).
 
 ## Bounded operation evidence
 
+Subscription requests accept an optional non-negative safe-integer `maxAgeMs`
+as in the [MCP Events draft's cursor lifecycle](https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md#cursor-lifecycle).
+It has no effect on this event: replay is
+unsupported and the cursor remains null. It never alters subscription identity,
+lease expiry, callback verification or delivery admission. Non-null cursors and
+unknown fields remain rejected. This compatibility allowance is not evidence
+that the native host has sent this field or that it caused a renewal failure.
+
 The existing store retains at most eight renewal-result observations per saved
 subscription and eight read-result observations for the single diagnostic UUID.
 Only records less than 24 hours old are visible. Retention is lazy: relevant

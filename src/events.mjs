@@ -24,12 +24,15 @@ export function authorizeRecipient(principal, role = principal?.role) {
 }
 function identity(principal, params, subscribing) {
   authorizeRecipient(principal, 'jarvis');
-  ownKeys(params, subscribing ? ['name', 'arguments', 'delivery', 'cursor', 'ttlMs'] : ['name', 'arguments', 'delivery'],
+  ownKeys(params, subscribing ? ['name', 'arguments', 'delivery', 'cursor', 'ttlMs', 'maxAgeMs'] : ['name', 'arguments', 'delivery'],
     ['name', 'arguments', 'delivery']);
   ownKeys(params.arguments, ['recipient']);
   ownKeys(params.delivery, subscribing ? ['mode', 'url', 'secret'] : ['mode', 'url']);
   if (params.name !== EVENT_NAME || params.arguments.recipient !== 'jarvis' || params.delivery.mode !== 'webhook' ||
       (params.cursor !== undefined && params.cursor !== null)) fail('invalid_params');
+  // Draft replay age is irrelevant for this non-replay event. Accept its valid
+  // request shape without changing the lease, identity or null-cursor contract.
+  if (Object.hasOwn(params, 'maxAgeMs') && (!Number.isSafeInteger(params.maxAgeMs) || params.maxAgeMs < 0)) fail('invalid_params');
   const url = callbackUrl(params.delivery.url);
   // Arguments have only one allowed key, so their canonical order is fixed.
   const id = 'sub_' + digest(JSON.stringify([principal.principalKey, url, EVENT_NAME, { recipient: 'jarvis' }]));
