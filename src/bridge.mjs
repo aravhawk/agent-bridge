@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { BridgeError, validateEnvelope, SCOPES } from './policy.mjs';
 import { appendDeliveryJobs, authorizeRecipient, ownKeys } from './events.mjs';
 import { verifiedMessageAuthorization, messageAccessAllowed, subscriptionAccessAllowed, testEnvelopeAllowed } from './access.mjs';
+import { diagnosticReadCandidate, diagnosticReadStatus, observeDiagnosticRead } from './observability.mjs';
 
 const fail = (code, status = 400) => { throw new BridgeError(code, status); };
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
@@ -120,12 +121,20 @@ export class Bridge {
   }
   async read(principal, params) {
     ownKeys(params, ['messageId']);
-    return this.store.transaction(state => {
-      retainMessages(state, this.clock());
+    let candidate = false, output;
+    try { output = await this.store.transaction(state => {
+      const now = this.clock();
+      retainMessages(state, now);
+      candidate = diagnosticReadCandidate(state, principal, params.messageId, now);
       const message = incoming(state, principal, params.messageId, this.probeMessageId, this.probeSender);
       return { envelope: message.envelope, ...(dailyMessage(message.envelope) ? { authority: 'peer_data_requires_user_workflow',
         expired: Date.parse(message.envelope.expiresAt) <= this.clock() } : {}), receivedAt: new Date(message.storedAt).toISOString() };
-    });
+    }); } catch (error) {
+      if (candidate) await observeDiagnosticRead({ store: this.store, principal, messageId: params.messageId, error, failed: true, clock: this.clock });
+      throw error;
+    }
+    if (candidate) await observeDiagnosticRead({ store: this.store, principal, messageId: params.messageId, clock: this.clock });
+    return output;
   }
   async claim(principal, params) {
     ownKeys(params, ['messageId']);
@@ -198,6 +207,10 @@ export class Bridge {
     return this.store.transaction(state => {
       retainMessages(state, this.clock());
       const message = state.messages[params.messageId];
+      if (!message) {
+        const diagnostic = diagnosticReadStatus(state, principal, params.messageId, this.clock());
+        if (diagnostic) return diagnostic;
+      }
       if (!message || ![message.envelope.from, message.envelope.to].includes(principal.role)) fail('message_not_found', 404);
       const receipt = state.receipts[params.messageId];
       return { messageId: params.messageId,

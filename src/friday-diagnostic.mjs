@@ -37,6 +37,7 @@ export function createFridayDiagnostic({ store, endpoint, secret, transport, fro
       if (state.fridayWebhookDiagnostic) return { record: state.fridayWebhookDiagnostic, duplicate: true };
       if (!diagnosticWindowOpen(from, until, now)) fail('friday_diagnostic_not_armed');
       state.fridayWebhookDiagnostic = { messageId: randomUUID(), receiverId: RECEIVER_ID,
+        owner: principal.principalKey,
         attemptedAt: now, armedFrom: Date.parse(from), armedUntil: Date.parse(until), outcome: null };
       return { record: state.fridayWebhookDiagnostic, duplicate: false };
     });
