@@ -37,6 +37,9 @@ function fixture(snapshot) {
 }
 const complete = (bridge, recipient, messageId, claimId) => bridge.complete(recipient,
   { messageId, claimId, hostedEventId: null, hostedTurnId: null });
+async function readyFixture() {
+  const f = fixture(); await f.events.subscribe(jarvis, f.subscription); return f;
+}
 
 test('daily messages accept only a scoped opposite-role inbox with bounded text and lifetime', () => {
   const f = fixture(), good = f.message();
@@ -51,7 +54,7 @@ test('daily messages accept only a scoped opposite-role inbox with bounded text 
 });
 
 test('concurrent duplicate daily sends commit once and conflicting text never changes the saved body', async () => {
-  const f = fixture(), m = f.message(); m.from = 'jarvis'; m.to = 'friday';
+  const f = await readyFixture(), m = f.message(); m.from = 'jarvis'; m.to = 'friday';
   const results = await Promise.all(Array.from({ length: 20 }, () => f.bridge.sendMessage(jarvis, m)));
   assert.equal(results.filter(r => !r.duplicate).length, 1);
   assert.equal(Object.keys(f.store.snapshot().jobs).length, 1);
@@ -62,7 +65,7 @@ test('concurrent duplicate daily sends commit once and conflicting text never ch
 });
 
 test('recipient isolation, source expiry and durable denial apply to daily reads/receipts/jobs', async () => {
-  const f = fixture(), m = f.message();
+  const f = await readyFixture(), m = f.message();
   const sent = await f.bridge.sendMessage(who('jarvis', start + 1000), m);
   assert.equal(f.store.snapshot().messages[m.id].authorization.expiresAt, start + 1000);
   await assert.rejects(f.bridge.read(jarvis, { messageId: m.id }), /message_not_found/);
@@ -99,7 +102,7 @@ test('daily receipt commits exactly one correlated ACK, and ACK completion is te
 });
 
 test('retention deletes daily content/jobs/receipts but keeps replay tombstones and legacy/subscription/denial state', async () => {
-  const f = fixture(), m = f.message(); await f.bridge.sendMessage(jarvis, m);
+  const f = await readyFixture(), m = f.message(); await f.bridge.sendMessage(jarvis, m);
   await f.store.transaction(s => { s.messages.legacy = { envelope: { kind: 'probe' } }; s.subscriptions.keep = { sealed: 'ciphertext' }; s.resourceDenials = { keep: { status: 'denied' } }; });
   f.advance(CONTENT_RETENTION_MS);
   assert.deepEqual(await f.bridge.sendMessage(jarvis, m), { messageId: m.id, queued: false, duplicate: true, expired: true, jobIds: [] });
@@ -124,7 +127,7 @@ test('daily live-capacity backpressure preserves pending messages and reserves r
 });
 
 test('daily transport retries transient failures at most five times with one stable event/body', async () => {
-  const f = fixture(), m = f.message(); const sent = await f.bridge.sendMessage(jarvis, m), bodies = [];
+  const f = await readyFixture(), m = f.message(); const sent = await f.bridge.sendMessage(jarvis, m), bodies = [];
   const fridaySender = createFridaySender({ enabled: true, contractVerified: true, endpoint: 'https://receiver.example.test/event',
     secret: 'FIXTURE_ONLY', transport: async (_url, req) => { bodies.push(req.body); return { status: 503 }; } });
   const worker = new DeliveryWorker({ store: f.store, clock: f.clock, enabled: true, fridaySender,
@@ -183,6 +186,12 @@ async function runtimeFixture(changes = {}) {
     message: () => ({ protocol: MESSAGE_PROTOCOL, id: randomUUID(), from: 'jarvis', to: 'friday', kind: 'message', sentAt: new Date(now).toISOString(),
       expiresAt: new Date(now + 3600000).toISOString(), threadId: randomUUID(), route: 'inbox', text: 'Fixture request data' }) };
 }
+async function readyRuntimeFixture(changes = {}) {
+  const f = await runtimeFixture(changes);
+  const sub = await f.rpc('jarvis', 'events/subscribe', { name: 'bridge.message.received', arguments: { recipient: 'jarvis' }, ttlMs: null,
+    delivery: { mode: 'webhook', url: 'https://callback.example.test/events', secret: 'whsec_' + randomBytes(32).toString('base64') } });
+  assert.ok(sub.body.result.id); return f;
+}
 
 test('real runtime daily gates require reviewed policy and contract independently of expired synthetic configuration', async () => {
   for (const env of [{ BRIDGE_DELIVERY_ENABLED: 'false' }, { BRIDGE_RECEIVER_POLICY: '' }, { FRIDAY_WEBHOOK_CONTRACT_VERIFIED: 'false' }]) {
@@ -190,7 +199,7 @@ test('real runtime daily gates require reviewed policy and contract independentl
     const denied = await f.rpc('jarvis', 'tools/call', { name: 'bridge_message_send', arguments: m });
     assert.equal(denied.status, 503); assert.equal(Object.keys(f.document().messages).length, 0); assert.equal(f.sends.length, 0);
   }
-  const f = await runtimeFixture({ FRIDAY_TEST_AUTHORIZED_UNTIL: '2020-01-01T00:00:00Z', FRIDAY_CONTRACT_PROBE_MESSAGE_ID: 'invalid' });
+  const f = await readyRuntimeFixture({ FRIDAY_TEST_AUTHORIZED_UNTIL: '2020-01-01T00:00:00Z', FRIDAY_CONTRACT_PROBE_MESSAGE_ID: 'invalid' });
   const list = await f.rpc('jarvis', 'tools/list');
   assert.ok(list.body.result.tools.some(t => t.name === 'bridge_message_send'));
   assert.ok(list.body.result.tools.some(t => t.name === 'bridge_subscription_status'));
@@ -207,8 +216,21 @@ test('real runtime daily gates require reviewed policy and contract independentl
   assert.equal((await f.rpc('jarvis', 'tools/call', { name: 'bridge_send', arguments: {} })).status, 403);
 });
 
+test('real runtime refuses a missing return lease before queue publication and rechecks it before Friday claims', async () => {
+  const f = await runtimeFixture(), m = f.message();
+  const missing = await f.rpc('jarvis', 'tools/call', { name: 'bridge_message_send', arguments: m });
+  assert.equal(missing.status, 503); assert.equal(missing.body.error.message, 'return_subscription_required');
+  assert.equal(f.sends.length, 0); assert.deepEqual(f.document().messages, {});
+  const ready = await readyRuntimeFixture(), accepted = ready.message();
+  assert.equal((await ready.rpc('jarvis', 'tools/call', { name: 'bridge_message_send', arguments: accepted })).status, 200);
+  Object.values(ready.document().subscriptions)[0].expiresAt = Date.now() - 1;
+  const claim = await ready.rpc('friday', 'tools/call', { name: 'bridge_receipt_claim', arguments: { messageId: accepted.id } });
+  assert.equal(claim.status, 503); assert.equal(claim.body.error.message, 'return_subscription_required');
+  assert.deepEqual(ready.document().receipts, {});
+});
+
 test('daily prearmed queue failure stores no content; retry creates one identity and dispatch survives later scheduling failure', async () => {
-  const f = await runtimeFixture(), m = f.message(); f.setQueueFailure(true);
+  const f = await readyRuntimeFixture(), m = f.message(); f.setQueueFailure(true);
   const response = await f.rpc('jarvis', 'tools/call', { name: 'bridge_message_send', arguments: m });
   assert.equal(response.status, 503);
   assert.equal(Object.keys(f.document().messages).length, 0); assert.equal(f.sends.length, 0);
@@ -221,7 +243,7 @@ test('daily prearmed queue failure stores no content; retry creates one identity
 
 test('prearmed native dispatcher survives an early callback/restart and queued cleanup removes idle content with delivery off', async () => {
   const { createQueueAdapter } = await import('../src/queue.mjs');
-  const f = fixture(), published = [], m = f.message();
+  const f = await readyFixture(), published = [], m = f.message();
   const metadata = { topicName: TOPIC, region: 'iad1', deliveryCount: 1 };
   const adapter = createQueueAdapter({ store: f.store, clock: f.clock, enabled: true, maintenanceEnabled: true,
     client: { async send(...args) { published.push(args); } }, worker: { async run(id) { await f.store.transaction(s => { s.jobs[id].state = 'accepted'; }); } } });
@@ -274,7 +296,7 @@ test('prearmed ACK dispatcher waits for atomic completion and ACK content shares
 });
 
 test('daily admission bounds prearmed queue work before publication, including failed publication retries', async () => {
-  const f = fixture(); let publishes = 0;
+  const f = await readyFixture(); let publishes = 0;
   const bridge = new Bridge({ store: f.store, clock: f.clock, dailyEnabled: true,
     messagePolicyIds: { jarvis: policy, friday: policy }, prepareMessage: async () => { publishes++; throw Error('fixture publish failure'); } });
   for (let i = 0; i < 10; i++) await assert.rejects(bridge.sendMessage(jarvis, f.message()), /fixture publish failure/);
