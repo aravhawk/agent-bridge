@@ -128,7 +128,7 @@ test('callback error has the OpenAI integration code/reason; MCP metadata does n
   assert.equal((await f.events.status(next)).subscriptions[0].id, original.id);
 });
 
-test('expired JWT tolerance boundary can return 403 without challenge, while later expiry rejection returns 401 with challenge', async () => {
+test('expired JWT returns401 with challenge across the former tolerance boundary before subscription work', async () => {
   const { publicKey, privateKey } = await generateKeyPair('RS256');
   const expiry = 2000000000;
   const token = await new SignJWT({ scope: SCOPES.jarvis.ack }).setProtectedHeader({ alg: 'RS256' })
@@ -143,17 +143,13 @@ test('expired JWT tolerance boundary can return 403 without challenge, while lat
       enabled: true, protector: createProtector(Buffer.alloc(32, 5)), transport: async () => assert.fail('no callback') });
     const handler = createMcpHandler({ enabled: true, verify, bridge: {}, events, scheduleJobs: async () => {},
       health: () => ({}), resourceMetadataUrl: metadataFor('jarvis') });
-    // Match the actual verified policy rather than inject a caller-selected one.
-    if (delta < 5000) {
-      const who = await verify(new Request(resourceFor('jarvis'), { headers: { authorization: 'Bearer ' + token } }));
-      events.policyId = who[VERIFIED_AUTHORIZATION].policyId;
-    }
     const response = await handler(new Request(resourceFor('jarvis'), { method: 'POST', headers: {
       'content-type': 'application/json', authorization: 'Bearer ' + token },
       body: JSON.stringify({ jsonrpc: '2.0', id: 42, method: 'events/subscribe', params: f.params }) }));
     const rpc = await response.json();
-    assert.equal(response.status, delta < 5000 ? 403 : 401);
-    assert.equal(rpc.error.message, delta < 5000 ? 'authorization_lease_required' : 'unauthorized');
-    assert.equal(response.headers.has('www-authenticate'), delta >= 5000);
+    assert.equal(response.status, 401);
+    assert.equal(rpc.error.message, 'unauthorized');
+    assert.equal(response.headers.get('www-authenticate'), `Bearer resource_metadata="${metadataFor('jarvis')}"`);
+    assert.deepEqual(events.store.snapshot().subscriptions, {});
   }
 });

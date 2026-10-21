@@ -144,14 +144,16 @@ test('final worker fence rejects acceptance after in-flight expiry or revocation
     assert.notEqual(f.store.snapshot().jobs[q.jobIds[0]].state, 'accepted');
   }
 });
-test('JWT verification tolerance does not extend the hard subscription expiry or leak tokens into principal JSON', async () => {
+test('JWT expiry is rejected before principal creation and hard subscription expiry remains enforced without token leaks', async () => {
   const { publicKey, privateKey } = await generateKeyPair('RS256');
   const token = await new SignJWT({ scope: 'bridge:ack:jarvis' }).setProtectedHeader({ alg: 'RS256' })
     .setIssuer(ISSUER).setAudience(resourceFor('jarvis')).setSubject('fixture-lease-subject')
     .setIssuedAt(990).setExpirationTime(999).sign(privateKey);
-  const who = await createAccessVerifier({ issuer: ISSUER, audience: resourceFor('jarvis'), subject: 'fixture-lease-subject',
-    role: 'jarvis', keyResolver: publicKey, currentDate: new Date(1000000) })(new Request(resourceFor('jarvis'),
-    { headers: { authorization: 'Bearer ' + token } }));
+  const verify = currentDate => createAccessVerifier({ issuer: ISSUER, audience: resourceFor('jarvis'), subject: 'fixture-lease-subject',
+    role: 'jarvis', keyResolver: publicKey, currentDate: new Date(currentDate) });
+  const request = () => new Request(resourceFor('jarvis'), { headers: { authorization: 'Bearer ' + token } });
+  await assert.rejects(verify(1000000)(request()), e => e.code === 'unauthorized' && e.status === 401);
+  const who = await verify(998000)(request());
   assert.equal(who[VERIFIED_AUTHORIZATION].expiresAt, 999000);
   assert.equal(JSON.stringify(who).includes(token), false); assert.equal(JSON.stringify(who).includes('expiresAt'), false);
   const f = fixture(); f.events.policyId = who[VERIFIED_AUTHORIZATION].policyId;
