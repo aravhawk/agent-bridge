@@ -8,6 +8,7 @@ const hash = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const uuid = value => typeof value === 'string' && /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value);
 const time = value => Number.isSafeInteger(value) && value >= 0 && value <= 8640000000000000;
 const relations = new Set(['new', 'same', 'later', 'earlier', 'unknown']);
+const skipObservation = Symbol('no matching observation');
 const codes = new Set(['ok', 'invalid_params', 'events_not_enabled', 'authorization_lease_required',
   'access_revoked', 'subscription_inactive', 'stale_authorization', 'subscription_expired',
   'callback_endpoint_error', 'storage_configuration_required', 'storage_unavailable',
@@ -42,7 +43,9 @@ export async function observeRenewal({ store, principal, id, facts, response, er
   try {
     await store.transaction(state => {
       const sub = state.subscriptions[id], now = clock();
-      if (!time(now) || !sub || !hash(principal?.principalKey) || sub.owner !== principal.principalKey) return;
+      // Abort rather than commit an unchanged document: PostgresStore would
+      // otherwise UPDATE its row even when no caller-owned binding matched.
+      if (!time(now) || !sub || !hash(principal?.principalKey) || sub.owner !== principal.principalKey) throw skipObservation;
       const authorityExpiry = !facts.checked ? 'unknown' : !facts.existing ? 'new'
         : !time(facts.previousExpiry) || !time(facts.expiry) ? 'unknown'
           : facts.expiry === facts.previousExpiry ? 'same' : facts.expiry > facts.previousExpiry ? 'later' : 'earlier';
