@@ -22,6 +22,7 @@ export function authorizeRecipient(principal, role = principal?.role) {
     fail('insufficient_scope', 403);
   }
 }
+const subscriptionId = (principal, url) => 'sub_' + digest(JSON.stringify([principal.principalKey, url, EVENT_NAME, { recipient: 'jarvis' }]));
 function identity(principal, params, subscribing) {
   authorizeRecipient(principal, 'jarvis');
   ownKeys(params, subscribing ? ['name', 'arguments', 'delivery', 'cursor', 'ttlMs', 'maxAgeMs'] : ['name', 'arguments', 'delivery'],
@@ -35,8 +36,23 @@ function identity(principal, params, subscribing) {
   if (Object.hasOwn(params, 'maxAgeMs') && (!Number.isSafeInteger(params.maxAgeMs) || params.maxAgeMs < 0)) fail('invalid_params');
   const url = callbackUrl(params.delivery.url);
   // Arguments have only one allowed key, so their canonical order is fixed.
-  const id = 'sub_' + digest(JSON.stringify([principal.principalKey, url, EVENT_NAME, { recipient: 'jarvis' }]));
+  const id = subscriptionId(principal, url);
   return { id, url };
+}
+// Used only after full validation rejects. Recognize an exact binding, never
+// guess one from a response ID, malformed callback or different filter.
+function rejectedSubscriptionId(principal, params, policyId, clock) {
+  try {
+    verifiedLease(principal, policyId, clock());
+    if (!params || typeof params !== 'object' || Array.isArray(params) ||
+        ['name', 'arguments', 'delivery'].some(k => !Object.hasOwn(params, k))) return;
+    ownKeys(params.arguments, ['recipient']);
+    const delivery = params.delivery;
+    if (!delivery || typeof delivery !== 'object' || Array.isArray(delivery) ||
+        ['mode', 'url'].some(k => !Object.hasOwn(delivery, k)) ||
+        params.name !== EVENT_NAME || params.arguments.recipient !== 'jarvis' || delivery.mode !== 'webhook') return;
+    return subscriptionId(principal, callbackUrl(delivery.url));
+  } catch { /* Authentication and unrecognizable bindings create no evidence. */ }
 }
 export class NativeEvents {
   constructor({ store, protector, transport, policyId, enabled = false, clock = Date.now }) {
@@ -49,7 +65,16 @@ export class NativeEvents {
     return { events: [eventDefinition] };
   }
   async subscribe(principal, params) {
-    const { id, url } = identity(principal, params, true);
+    let binding;
+    try { binding = identity(principal, params, true); }
+    catch (error) {
+      if (error instanceof BridgeError && error.code === 'invalid_params') {
+        const id = rejectedSubscriptionId(principal, params, this.policyId, this.clock);
+        if (id) await observeRenewal({ store: this.store, principal, id, facts: {}, error, failed: true, clock: this.clock });
+      }
+      throw error;
+    }
+    const { id, url } = binding;
     const facts = {};
     let response;
     try { response = await this.#subscribe(principal, params, id, url, facts); }

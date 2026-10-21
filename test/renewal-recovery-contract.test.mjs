@@ -95,14 +95,20 @@ test('secret rotation preserves identity; changed callback or owner is a differe
   assert.equal(Object.keys(f.store.snapshot().subscriptions).length, 3);
 });
 
-test('client-supplied subscription IDs, unknown delivery metadata and changed filters are rejected before observations', async () => {
+test('invalid ID/delivery/filter inputs stay rejected; only recognizable owned bindings record validation failures', async () => {
   const f = fixture(), principal = f.who(f.clock() + 60000);
   const a = await f.events.subscribe(principal, f.params), before = f.store.snapshot();
   for (const params of [{ ...f.params, id: a.id },
     { ...f.params, delivery: { ...f.params.delivery, subscriptionId: a.id } },
     { ...f.params, arguments: { recipient: 'friday' } }])
     await assert.rejects(f.events.subscribe(principal, params), code('invalid_params'));
-  assert.deepEqual(f.store.snapshot(), before);
+  const after = f.store.snapshot(), records = after.subscriptions[a.id].renewalObservations;
+  assert.equal(records.length, 3);
+  assert.deepEqual(records.slice(1).map(r => r.code), ['invalid_params', 'invalid_params']);
+  delete after.subscriptions[a.id].renewalObservations;
+  delete before.subscriptions[a.id].renewalObservations;
+  assert.deepEqual(after, before);
+  assert.equal(f.calls.length, 1);
 });
 
 test('callback error has the OpenAI integration code/reason; MCP metadata does not alter subscription identity', async () => {

@@ -203,6 +203,17 @@ runtime preflight failure and unavailable storage can leave no observation.
 These records are not a complete request log. Recording never extends a lease,
 reopens denied/unsubscribed access or changes subscription identity.
 
+Rejected subscription parameter shapes can also record `invalid_params` when
+the caller has current verified Jarvis/ACK authority and the known event,
+exact filter and validated callback identify an existing caller-owned binding.
+Only the usual fixed result metadata is saved, never parameter names/values or
+callback URLs. Validation still rejects the request with its original error.
+Unknown or malformed bindings are not invented from a supplied ID. A recognizable
+binding requires one store lookup transaction; an unmatched owner/ID rolls it
+back without a durable UPDATE. Unauthenticated, wrong-scope, expired-authority
+or unrecognizable requests make no observation-store call. Recording is best
+effort and cannot turn a malformed request into a subscription or retry.
+
 After the diagnostic spend, an authorized Friday `bridge_read` of its exact
 UUID can record its original success/error without storing the source payload.
 Capture closes at the earlier of the original arm deadline and 30 minutes after
