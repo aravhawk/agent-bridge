@@ -109,6 +109,31 @@ these activations require the specifically reviewed action-time bundle. A flag
 is an operator attestation, not independent evidence. Do not reuse old test
 windows, IDs, grants, callbacks or activation approvals for the changed realm.
 
+## Bounded queue failure recovery
+
+An eligible private queue callback that still fails on delivery 18 or later
+attempts to publish one successor on the existing topic before acknowledging
+the old item. This happens in the asynchronous consumer, not the SDK's
+synchronous retry hook. The successor preserves its work identifier, uses a
+stable idempotency key for ambiguous publication/ACK outcomes, waits 60 seconds,
+and carries an absolute recovery deadline. Descendants cannot extend that
+deadline beyond the original queue item's expiry or one hour from its creation.
+Workers retain all original source/recipient expiry, authorization and attempt
+limits. Known-absent source/ACK commits do not spawn continuations.
+
+This requires no new environment variable, grant, endpoint, schedule or service.
+Healthy work adds no recovery publication. Prolonged handler/database failures
+add queue publishes and callbacks within the fixed window; the five-attempt
+transport cap stays unchanged. If the consumer cannot start, or every successor
+publish also fails through the remaining SDK attempts, work can still exhaust
+the platform budget. Cleanup remains best effort. This is bounded recovery of
+known backend work, not assistant inbox polling or a guarantee of delivery.
+
+HTTP acceptance does not schedule another hosted turn after a receiver fails.
+These continuations do not retry accepted transports or the one-shot diagnostic,
+and receipt leases alone do not recover hosted processing. Exactly-once durable
+receipt/ACK creation does not guarantee exactly-once external agent actions.
+
 ## One-time Friday webhook diagnostic
 
 Transport-only check of the saved Friday receiver binding while delivery stays

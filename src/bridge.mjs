@@ -2,7 +2,7 @@ import { dailyMessage, validateMessage, retainMessages, reserveMessage, checkMes
 import { randomUUID } from 'node:crypto';
 import { BridgeError, validateEnvelope, SCOPES } from './policy.mjs';
 import { appendDeliveryJobs, authorizeRecipient, ownKeys } from './events.mjs';
-import { verifiedMessageAuthorization, messageAccessAllowed, testEnvelopeAllowed } from './access.mjs';
+import { verifiedMessageAuthorization, messageAccessAllowed, subscriptionAccessAllowed, testEnvelopeAllowed } from './access.mjs';
 
 const fail = (code, status = 400) => { throw new BridgeError(code, status); };
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
@@ -23,6 +23,15 @@ function incoming(state, principal, id, probeMessageId, probeSender) {
   if (!message || message.envelope.to !== principal.role) fail('message_not_found', 404);
   if (probeMessageId && !testEnvelopeAllowed(message.envelope, probeMessageId, probeSender)) fail('contract_probe_only', 403);
   return message;
+}
+function requireAckPath(state, envelope, authorization, policyIds, now) {
+  if (!dailyMessage(envelope) || envelope.kind === 'ack' || envelope.from !== 'jarvis') return;
+  // Friday must not handle a source whose required ACK has no usable return
+  // path. Cover its entire immutable authority lifetime, not just this instant.
+  // Revocation/shortening during handling still fails closed at completion.
+  if (!Object.values(state.subscriptions).some(sub => sub.owner === authorization?.owner &&
+      subscriptionAccessAllowed(state, sub, policyIds?.jarvis, now) &&
+      sub.expiresAt >= authorization.expiresAt)) fail('return_subscription_required', 503);
 }
 function insert(state, envelope, hash, now, authorization) {
   const saved = state.messages[envelope.id];
@@ -77,7 +86,8 @@ export class Bridge {
       const validated = validateMessage(input, principal, prior ? Date.parse(input.sentAt) : this.clock());
       if (prior?.hash !== undefined && prior.hash !== validated.hash) fail('message_id_conflict', 409);
       if (!prior) {
-        verifiedMessageAuthorization(principal, validated.envelope, this.clock(), this.deliveryUntil);
+        const authorization = verifiedMessageAuthorization(principal, validated.envelope, this.clock(), this.deliveryUntil);
+        requireAckPath(state, validated.envelope, authorization, this.messagePolicyIds, this.clock());
         checkMessageCapacity(state);
         const now = this.clock();
         state.messagePreparations ||= {};
@@ -103,6 +113,7 @@ export class Bridge {
         : { messageId: id, queued: false, duplicate: true, expired: true, jobIds: [] };
       if (Date.parse(envelope.expiresAt) <= now) fail('message_expired', 403);
       const authorization = verifiedMessageAuthorization(principal, envelope, now, this.deliveryUntil);
+      requireAckPath(state, envelope, authorization, this.messagePolicyIds, now);
       delete state.messagePreparations?.[envelope.id];
       return insert(state, envelope, hash, now, authorization);
     });
@@ -125,6 +136,7 @@ export class Bridge {
       const old = state.receipts[params.messageId];
       if (old?.state === 'complete') return { duplicate: true, completed: true, ackMessageId: old.ackMessageId };
       if (!messageAccessAllowed(state, message, this.messagePolicyIds, now)) fail('message_authorization_inactive', 403);
+      requireAckPath(state, message.envelope, message.authorization, this.messagePolicyIds, now);
       if (old?.leaseUntil > now) fail('receipt_busy', 409);
       const claimId = randomUUID();
       state.receipts[params.messageId] = { state: 'claimed', owner: principal.principalKey,
@@ -159,6 +171,7 @@ export class Bridge {
         ackMessageId: receipt.ackMessageId, evidenceStatus: 'reported_requires_independent_host_confirmation' };
       if (!messageAccessAllowed(state, message, this.messagePolicyIds, now)) fail('message_authorization_inactive', 403);
       if (receipt.claimId !== params.claimId || receipt.leaseUntil <= now) fail('stale_receipt_claim', 409);
+      requireAckPath(state, original, message.authorization, this.messagePolicyIds, now);
       let ackMessageId = null; let jobIds = [];
       if (original.kind !== 'ack') {
         // All ACK creation, receipt completion, and outbound jobs commit together.

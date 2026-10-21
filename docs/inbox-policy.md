@@ -26,8 +26,15 @@ processing is quiet and never creates an ACK-of-ACK or agent reply loop.
 Claim before handling a source message. Only its authorized recipient may read,
 claim or complete it. The source authorization policy is immutable; later
 requests cannot replace the admitting identity or revive withdrawn access.
-Replayed/conflicting IDs do not create fresh messages. Queue payloads contain
-identifiers only; dispatch rechecks current policy, expiry and native access.
+Replayed/conflicting IDs do not create fresh messages. New Jarvis-to-Friday
+sources additionally need a verified Jarvis return subscription for the same
+owner and current policy, covering the source's immutable authority lifetime.
+Admission, new claims and completion recheck this path; expiry, revocation or
+shortening during processing still fails closed. Exact committed replays and
+terminal ACKs do not create new source work. This does not reserve future host
+availability or promise ACK delivery; its worker still checks current access.
+Queue payloads contain an identifier and, for bounded recovery, an optional
+absolute deadline; dispatch rechecks current policy, expiry and native access.
 Transport acceptance proves delivery to a native endpoint, not that an agent
 read or acted on it. Only the durable recipient receipt proves handling.
 
