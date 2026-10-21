@@ -45,6 +45,12 @@ export function createAccessVerifier({ issuer, audience, subject, subjectHash, r
         clockTolerance: 5, ...(currentDate ? { currentDate } : {}),
       }));
     } catch { reject('unauthorized', 401); }
+    // Retain the verifier's other skew checks, but never admit an expired
+    // access token as a principal. Hard expiry must produce the existing 401
+    // resource-metadata challenge, not a later 403 from a domain lease fence.
+    const expiresAt = payload.exp * 1000;
+    const checkedAt = currentDate ? currentDate.getTime() : Date.now();
+    if (!Number.isSafeInteger(expiresAt) || !Number.isSafeInteger(checkedAt) || expiresAt <= checkedAt) reject('unauthorized', 401);
     if (typeof payload.sub !== 'string' || (subject ? payload.sub !== subject
       : createHash('sha256').update(payload.sub).digest('hex') !== subjectHash)) reject('forbidden_subject', 403);
     const granted = payload[scopeClaim];
@@ -62,7 +68,7 @@ export function createAccessVerifier({ issuer, audience, subject, subjectHash, r
     const principalKey = createHash('sha256').update(JSON.stringify([issuer, audience, payload.sub, role])).digest('hex');
     const principal = { role, scopes: Object.freeze([...new Set(scopes)]), principalKey };
     // Internal expiry only. Hard subscription deadlines never inherit tolerance.
-    Object.defineProperty(principal, VERIFIED_AUTHORIZATION, { value: Object.freeze({ expiresAt: payload.exp * 1000,
+    Object.defineProperty(principal, VERIFIED_AUTHORIZATION, { value: Object.freeze({ expiresAt,
       policyId: authorizationPolicyId({ issuer, audience, subject, subjectHash, role, scopeClaim, algorithms }) }) });
     return Object.freeze(principal);
   };
