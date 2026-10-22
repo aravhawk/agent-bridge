@@ -55,7 +55,7 @@ test('contract: a busy receipt is a tool execution error, not a failed MCP conne
   await f.bridge.sendMessage(f.friday, { protocol: 'jarvis-friday/1', id, threadId: randomUUID(),
     from: 'friday', to: 'jarvis', kind: 'message', route: 'inbox', text: 'Offline fixture only.',
     sentAt: new Date(f.clock()).toISOString(), expiresAt: new Date(f.clock() + 60000).toISOString() });
-  await f.bridge.claim(f.jarvis, { messageId: id });
+  const firstClaim = await f.bridge.claim(f.jarvis, { messageId: id });
   const handler = createMcpHandler({ enabled: true, verify: async () => f.jarvis,
     bridge: f.bridge, events: f.events, scheduleJobs: async () => {}, health: () => ({}) });
   const response = await handler(new Request(resourceFor('jarvis'), { method: 'POST',
@@ -65,6 +65,10 @@ test('contract: a busy receipt is a tool execution error, not a failed MCP conne
   assert.equal(response.status, 200);
   assert.equal(rpc.result.isError, true);
   assert.deepEqual(rpc.result.structuredContent, { error: 'receipt_busy' });
+  assert.deepEqual(f.store.snapshot().receipts[id], {
+    state: 'claimed', owner: f.jarvis.principalKey,
+    claimId: firstClaim.claimId, leaseUntil: Date.parse(firstClaim.leaseUntil),
+  });
 });
 
 for (const phase of ['access_check', 'state_recheck']) {
@@ -90,6 +94,9 @@ for (const phase of ['access_check', 'state_recheck']) {
     assert.equal(posts, 0); assert.equal(first.transportAccepted, false);
     assert.equal(f.store.snapshot().jobs[sent.jobIds[0]].state, 'pending');
     assert.equal(f.store.snapshot().jobs[sent.jobIds[0]].lastError, 'storage_unavailable');
+    const early = await new DeliveryWorker({ ...options, store: f.store, accessAllowed: async () => true }).run(sent.jobIds[0]);
+    assert.equal(early.attempted, false); assert.equal(posts, 0);
+    assert.equal(f.store.snapshot().jobs[sent.jobIds[0]].attempts, 1);
     f.advance(1001);
     const restarted = new MemoryStore(f.store.snapshot());
     const next = await new DeliveryWorker({ ...options, store: restarted, accessAllowed: async () => true }).run(sent.jobIds[0]);
@@ -167,11 +174,12 @@ test('storage retries remain bounded and never bypass source expiry, denial or t
     const id = randomUUID(), sent = await f.bridge.sendMessage(f.friday, { protocol: 'jarvis-friday/1', id,
       threadId: randomUUID(), from: 'friday', to: 'jarvis', kind: 'message', route: 'inbox', text: 'Offline budget fixture.',
       sentAt: new Date(f.clock()).toISOString(), expiresAt: new Date(f.clock() + 600000).toISOString() });
-    let posts = 0;
+    let posts = 0, failures = mode === 'budget' ? Infinity : 1;
     const worker = new DeliveryWorker({ store: f.store, clock: f.clock, enabled: true, policyId,
       messagePolicyIds: { jarvis: policyId, friday: policyId }, protector: f.events.protector,
       transport: async () => { posts++; return { status: 202 }; }, accessAllowed: async () => {
-        throw new BridgeError(mode === 'configuration' ? 'storage_configuration_required' : 'storage_unavailable', 503);
+        if (failures-- > 0) throw new BridgeError(mode === 'configuration' ? 'storage_configuration_required' : 'storage_unavailable', 503);
+        return true;
       } });
     await worker.run(sent.jobIds[0]);
     if (mode === 'expiry') f.advance(600000);
@@ -179,8 +187,28 @@ test('storage retries remain bounded and never bypass source expiry, denial or t
     for (let n = 0; n < 6; n++) { f.advance(16000); await worker.run(sent.jobIds[0]); }
     const job = f.store.snapshot().jobs[sent.jobIds[0]];
     assert.equal(job.state, 'dead'); assert.ok(job.attempts <= 5); assert.equal(posts, 0);
-    if (mode === 'budget') assert.equal(job.attempts, 5);
+    if (mode === 'budget') { assert.equal(job.attempts, 5); assert.equal(job.lastError, 'storage_unavailable'); }
+    else {
+      assert.equal(job.attempts, 1);
+      assert.equal(job.lastError, { expiry: 'subscription_inactive', denial: 'message_authorization_inactive',
+        configuration: 'delivery_configuration_required' }[mode]);
+    }
   }
+});
+
+test('an adapter storage error after transport starts is terminal, not a pre-send recovery opportunity', async () => {
+  const f = fixture(); await f.events.subscribe(f.jarvis, { ...f.params, ttlMs: null });
+  const id = randomUUID(), sent = await f.bridge.sendMessage(f.friday, { protocol: 'jarvis-friday/1', id,
+    threadId: randomUUID(), from: 'friday', to: 'jarvis', kind: 'message', route: 'inbox', text: 'Offline ambiguous adapter fixture.',
+    sentAt: new Date(f.clock()).toISOString(), expiresAt: new Date(f.clock() + 600000).toISOString() });
+  let posts = 0;
+  const worker = new DeliveryWorker({ store: f.store, clock: f.clock, enabled: true, policyId,
+    messagePolicyIds: { jarvis: policyId, friday: policyId }, protector: f.events.protector,
+    accessAllowed: async () => true, transport: async () => { posts++; throw new BridgeError('storage_unavailable', 503); } });
+  await worker.run(sent.jobIds[0]); f.advance(30000); await worker.run(sent.jobIds[0]);
+  const job = f.store.snapshot().jobs[sent.jobIds[0]];
+  assert.equal(posts, 1); assert.equal(job.state, 'dead'); assert.equal(job.attempts, 1);
+  assert.equal(job.lastError, 'delivery_configuration_required');
 });
 
 test('a failed immediate schedule reports uncertainty without promising an unwired reconciler', async () => {

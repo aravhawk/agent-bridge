@@ -146,8 +146,9 @@ reconciliation daemon. Work can still exhaust after a long shutdown/outage;
 re-enabling a flag alone does not guarantee recovery of exhausted queue items.
 
 Known permitted tool execution failures use HTTP200 with `result.isError:true`
-and a sanitized structured error, including closed readiness gates. Authentication
-and permission failures retain HTTP401/403 and the401 metadata challenge.
+and a sanitized structured error, including closed readiness gates. Existing
+HTTP401/403 errors retain their status and the401 metadata challenge; some local
+domain-expiry controls currently also return403.
 Malformed RPC envelopes and unavailable tools remain protocol errors. Callers
 must inspect the tool result, not interpret HTTP200 as successful execution.
 

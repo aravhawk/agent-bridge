@@ -60,7 +60,7 @@ test('renewal re-grants TTL within verified expiry; older authority and actual e
   const restored = await restarted.subscribe(later, { ...f.params, ttlMs: 10000 });
   assert.equal(Date.parse(restored.refreshBefore), f.clock() + 10000);
   f.advance(10001);
-  assert.ok(Date.parse((await restarted.subscribe(later, f.params)).refreshBefore) <= f.tokenExpiry + 1000);
+  assert.equal(Date.parse((await restarted.subscribe(later, f.params)).refreshBefore), f.tokenExpiry + 1000);
   f.advance(f.tokenExpiry + 1000 - f.clock());
   await assert.rejects(restarted.subscribe(later, f.params), error('authorization_lease_required'));
 });

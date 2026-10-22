@@ -54,7 +54,7 @@ export class DeliveryWorker {
     if (!claimed) return { attempted: false };
     const { job, subscription } = claimed;
     let accepted = false; let retry = false; let code = 'delivery_configuration_required'; let status = null;
-    let transportOutcome = null;
+    let transportOutcome = null, transportStarted = false;
     try {
       // Jarvis uses a finite verified-token lease plus durable resource denial.
       // Friday additionally requires its separately verified native authorizer.
@@ -89,10 +89,12 @@ export class DeliveryWorker {
             if (!subscriptionAccessAllowed(current, current.subscription, this.policyId, when))
               throw new BridgeError('authorization_lease_expired', 403);
             const secrets = [config.secret, ...(config.previous || []).filter(x => x.until > when).map(x => x.secret)];
+            transportStarted = true;
             response = await this.transport(config.url, { body: job.body,
               headers: signedHeaders({ id: job.eventId, body: job.body, secrets, subscriptionId: subscription.id, now: when }) });
           } else {
             if (!this.fridaySender) throw new BridgeError('friday_native_contract_unverified', 503);
+            transportStarted = true;
             response = await this.fridaySender(job);
           }
           status = response.status;
@@ -108,7 +110,7 @@ export class DeliveryWorker {
       // attempt/backoff budget; every retry must pass all authorization fences.
       // Configuration, encryption and public-address rejection remain terminal.
       transportOutcome = error?.[DELIVERY_TRANSPORT_OUTCOME] || null;
-      const storageUnavailable = error instanceof BridgeError && error.code === 'storage_unavailable';
+      const storageUnavailable = !transportStarted && error instanceof BridgeError && error.code === 'storage_unavailable';
       const transientError = ['callback_timeout', 'callback_transport_failed', 'callback_dns_failed'].includes(error?.code);
       retry = (storageUnavailable || transientError) && transportOutcome?.terminal !== true;
       code = storageUnavailable ? 'storage_unavailable' : transientError ? 'transport_transient' : 'delivery_configuration_required';

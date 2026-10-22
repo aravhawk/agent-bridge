@@ -77,7 +77,8 @@ policy and actual current claim.
 The [MCP tool error contract](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#error-handling)
 distinguishes protocol failures from tool execution failures. Known permitted
 tools return sanitized validation/conflict/backend failures as isError results;
-401/403 authentication/permission fences keep their HTTP status. The adapter
+Existing401/403 errors keep their HTTP status, including current domain-expiry
+errors; changing that classification is outside this repair. The adapter
 does not turn an execution error into success or perform a retry. The prior
 message_not_found-only exception is replaced by one execution boundary.
 
