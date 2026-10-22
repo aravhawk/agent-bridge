@@ -36,6 +36,8 @@ function allowedTools(principal, health, dailyEnabled, healthOnly, diagnostic) {
 }
 const json = (body, status = 200) => new Response(JSON.stringify(body), { status,
   headers: { 'content-type': 'application/json', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' } });
+const toolResult = (output, isError = false) => ({ content: [{ type: 'text', text: JSON.stringify(output) }],
+  structuredContent: output, isError });
 function methodParams(raw) {
   if (raw === undefined) return {};
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new BridgeError('invalid_params', 400);
@@ -141,9 +143,9 @@ export function createMcpHandler({ enabled = false, verify, bridge, events, sche
           const { jobIds = [], ...safe } = output;
           if (jobIds.length) {
             try { await scheduleJobs(jobIds); safe.scheduling = 'requested'; }
-            catch { safe.scheduling = 'pending_backend_reconciliation'; safe.deliveryScheduled = false; }
+            catch { safe.scheduling = 'not_confirmed'; safe.deliveryScheduled = false; }
           }
-          result = { content: [{ type: 'text', text: JSON.stringify(safe) }], structuredContent: safe, isError: false };
+          result = toolResult(safe);
           break;
         }
         default: { const error = new BridgeError('method_not_found', 400); error.rpcCode = -32601; throw error; }
@@ -151,13 +153,6 @@ export function createMcpHandler({ enabled = false, verify, bridge, events, sche
       return json({ jsonrpc: '2.0', id, result });
     } catch (error) {
       const safe = error instanceof BridgeError;
-      if (safe && stage === 'tool_arguments' && error.code === 'message_not_found') {
-        // An absent message is a tool execution failure, not a broken
-        // HTTP connection. Preserve the explicit error and never invent a hit.
-        const failure = { error: 'message_not_found' };
-        return json({ jsonrpc: '2.0', id, result: { isError: true, structuredContent: failure,
-          content: [{ type: 'text', text: JSON.stringify(failure) }] } });
-      }
       if (safe && error.code === 'invalid_params' && typeof observeValidationFailure === 'function' && input) {
         // Allowlisted key SHAPES only: no arbitrary key names, parameter values,
         // identity, authorization headers or other request contents can escape.
@@ -170,6 +165,13 @@ export function createMcpHandler({ enabled = false, verify, bridge, events, sche
           paramsKeys: shape(params), argumentsKeys: shape(params?.arguments), metaKeys: shape(params?._meta),
           tool: tools.some(t => t.name === params?.name) ? params.name : '[other]',
           messageIdType: typeof params?.arguments?.messageId })); } catch {}
+      }
+      // Once a known permitted tool starts, validation, state conflicts and
+      // backend failures belong in the MCP tool result. Authentication and
+      // permission failures keep their HTTP status and existing challenge.
+      // Never expose an arbitrary backend exception or change its side effects.
+      if (stage === 'tool_arguments' && !(safe && [401, 403].includes(error.status))) {
+        return json({ jsonrpc: '2.0', id, result: toolResult({ error: safe ? error.code : 'bridge_unavailable' }, true) });
       }
       const status = safe ? error.status : 503;
       const response = json({ jsonrpc: '2.0', id, error: { code: safe && error.rpcCode || (status === 401 ? -32001 : -32000),

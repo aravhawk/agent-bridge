@@ -97,8 +97,10 @@ FRIDAY_WEBHOOK_CONTRACT_VERIFIED=false
 
 After native health/contract proof, subscription setup can be enabled separately
 from delivery. Native ChatGPT creates exactly one new v1 subscription with its
-own callback/secret. Its lease is capped by verified JWT expiry. Same-token
-renewal cannot extend expiry; later verified token expiry can. Denial and
+own callback/secret. Its lease is capped by verified JWT expiry. Each valid
+subscribe re-grants the requested TTL within that ceiling, including after a
+shorter TTL lapses. Reusing a token can renew a shorter grant but cannot extend
+past that token's expiry. Later verified expiry can raise the ceiling. Denial and
 unsubscribe tombstones survive renewal/restart. No provider introspection or
 immortal lease is claimed. Verify actual native renewal and exact subscription
 identity before transport activation; metadata count alone does not prove it.
@@ -133,6 +135,22 @@ HTTP acceptance does not schedule another hosted turn after a receiver fails.
 These continuations do not retry accepted transports or the one-shot diagnostic,
 and receipt leases alone do not recover hosted processing. Exactly-once durable
 receipt/ACK creation does not guarantee exactly-once external agent actions.
+
+A transient `storage_unavailable` during the worker's pre-send access or state
+check leaves the job pending under its existing five-attempt/backoff budget;
+every retry rechecks expiry, revocation and delivery gates. Configuration and
+decryption failures stay terminal. No send occurs on a failed access check.
+The pre-commit dispatcher provides bounded recovery when immediate scheduling
+fails. The tool reports `scheduling: not_confirmed`, never promises a running
+reconciliation daemon. Work can still exhaust after a long shutdown/outage;
+re-enabling a flag alone does not guarantee recovery of exhausted queue items.
+
+Known permitted tool execution failures use HTTP200 with `result.isError:true`
+and a sanitized structured error, including closed readiness gates. Existing
+HTTP401/403 errors retain their status and the401 metadata challenge; some local
+domain-expiry controls currently also return403.
+Malformed RPC envelopes and unavailable tools remain protocol errors. Callers
+must inspect the tool result, not interpret HTTP200 as successful execution.
 
 ## One-time Friday webhook diagnostic
 

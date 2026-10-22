@@ -197,7 +197,9 @@ test('real runtime daily gates require reviewed policy and contract independentl
   for (const env of [{ BRIDGE_DELIVERY_ENABLED: 'false' }, { BRIDGE_RECEIVER_POLICY: '' }, { FRIDAY_WEBHOOK_CONTRACT_VERIFIED: 'false' }]) {
     const f = await runtimeFixture(env), m = f.message();
     const denied = await f.rpc('jarvis', 'tools/call', { name: 'bridge_message_send', arguments: m });
-    assert.equal(denied.status, 503); assert.equal(Object.keys(f.document().messages).length, 0); assert.equal(f.sends.length, 0);
+    assert.equal(denied.status, 200); assert.equal(denied.body.result.isError, true);
+    assert.deepEqual(denied.body.result.structuredContent, { error: 'receiver_readiness_required' });
+    assert.equal(Object.keys(f.document().messages).length, 0); assert.equal(f.sends.length, 0);
   }
   const f = await readyRuntimeFixture({ FRIDAY_TEST_AUTHORIZED_UNTIL: '2020-01-01T00:00:00Z', FRIDAY_CONTRACT_PROBE_MESSAGE_ID: 'invalid' });
   const list = await f.rpc('jarvis', 'tools/list');
@@ -219,20 +221,23 @@ test('real runtime daily gates require reviewed policy and contract independentl
 test('real runtime refuses a missing return lease before queue publication and rechecks it before Friday claims', async () => {
   const f = await runtimeFixture(), m = f.message();
   const missing = await f.rpc('jarvis', 'tools/call', { name: 'bridge_message_send', arguments: m });
-  assert.equal(missing.status, 503); assert.equal(missing.body.error.message, 'return_subscription_required');
+  assert.equal(missing.status, 200); assert.equal(missing.body.result.isError, true);
+  assert.deepEqual(missing.body.result.structuredContent, { error: 'return_subscription_required' });
   assert.equal(f.sends.length, 0); assert.deepEqual(f.document().messages, {});
   const ready = await readyRuntimeFixture(), accepted = ready.message();
   assert.equal((await ready.rpc('jarvis', 'tools/call', { name: 'bridge_message_send', arguments: accepted })).status, 200);
   Object.values(ready.document().subscriptions)[0].expiresAt = Date.now() - 1;
   const claim = await ready.rpc('friday', 'tools/call', { name: 'bridge_receipt_claim', arguments: { messageId: accepted.id } });
-  assert.equal(claim.status, 503); assert.equal(claim.body.error.message, 'return_subscription_required');
+  assert.equal(claim.status, 200); assert.equal(claim.body.result.isError, true);
+  assert.deepEqual(claim.body.result.structuredContent, { error: 'return_subscription_required' });
   assert.deepEqual(ready.document().receipts, {});
 });
 
 test('daily prearmed queue failure stores no content; retry creates one identity and dispatch survives later scheduling failure', async () => {
   const f = await readyRuntimeFixture(), m = f.message(); f.setQueueFailure(true);
   const response = await f.rpc('jarvis', 'tools/call', { name: 'bridge_message_send', arguments: m });
-  assert.equal(response.status, 503);
+  assert.equal(response.status, 200); assert.equal(response.body.result.isError, true);
+  assert.deepEqual(response.body.result.structuredContent, { error: 'bridge_unavailable' });
   assert.equal(Object.keys(f.document().messages).length, 0); assert.equal(f.sends.length, 0);
   assert.equal(JSON.stringify(response).includes('FIXTURE_PRIVATE'), false);
   f.setQueueFailure(false);

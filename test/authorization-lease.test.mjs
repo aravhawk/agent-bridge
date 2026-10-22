@@ -47,17 +47,22 @@ test('requested/default/maximum lifetimes and token expiry cap every finite leas
   assert.equal(Date.parse(result.refreshBefore), f.clock() + 5);
   for (const ttlMs of [0, -1, 1.5, Infinity]) await assert.rejects(f.subscribe(f.who, { ttlMs }), error('invalid_params'));
 });
-test('same-expiry token cannot extend a lease; only later verified expiry permits extension across restarts', async () => {
+test('renewal re-grants TTL within verified expiry; older authority and actual expiry remain fenced across restarts', async () => {
   const f = fixture(), first = await f.subscribe(f.who, { ttlMs: 500 });
   f.advance(100);
-  assert.equal((await f.subscribe(f.who, { ttlMs: 1000 })).refreshBefore, first.refreshBefore);
+  const renewed = await f.subscribe(f.who, { ttlMs: 1000 });
+  assert.ok(Date.parse(renewed.refreshBefore) > Date.parse(first.refreshBefore));
+  assert.equal(Date.parse(renewed.refreshBefore), f.clock() + 1000);
   const later = f.principal(f.tokenExpiry + 1000), next = await f.subscribe(later, { ttlMs: 1000 });
   assert.equal(Date.parse(next.refreshBefore), f.clock() + 1000);
   await assert.rejects(f.subscribe(f.who), error('stale_authorization'));
   const restarted = new NativeEvents({ ...f, store: new MemoryStore(f.store.snapshot()), enabled: true });
-  assert.equal((await restarted.subscribe(later, { ...f.params, ttlMs: 10000 })).refreshBefore, next.refreshBefore);
-  f.advance(1001);
-  await assert.rejects(restarted.subscribe(later, f.params), error('subscription_expired'));
+  const restored = await restarted.subscribe(later, { ...f.params, ttlMs: 10000 });
+  assert.equal(Date.parse(restored.refreshBefore), f.clock() + 10000);
+  f.advance(10001);
+  assert.equal(Date.parse((await restarted.subscribe(later, f.params)).refreshBefore), f.tokenExpiry + 1000);
+  f.advance(f.tokenExpiry + 1000 - f.clock());
+  await assert.rejects(restarted.subscribe(later, f.params), error('authorization_lease_required'));
 });
 test('durable owner/resource denial survives restart, new tokens, new callbacks and renewal attempts', async () => {
   const f = fixture(); await f.subscribe(); await denyResourceAccess(f.store, f.owner, f.clock());

@@ -1,5 +1,12 @@
 # Jarvis Friday Bridge v1.0.0 cutover and action bundle
 
+> Historical migration plan. The v1 project and bindings now exist, and main
+> deploys to jarvis-friday-bridge in Arav's Projects. The pending-creation and
+> branch-routing statements below describe the original cutover, not current
+> instructions to create credentials, databases, projects or subscriptions.
+> Reuse the existing production resources. Delivery remains off; deployment is
+> not evidence of a completed native integration. See architecture.md.
+
 This document records proposed targets and staged work, not completed grants.
 The immutable review commit and independent review must precede deployment and
 activation. Publish the v1 review branch only: the legacy project tracks main,

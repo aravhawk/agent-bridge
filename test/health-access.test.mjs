@@ -57,7 +57,10 @@ test('health rejects wrong issuer, audience, subject, expired token, unrelated s
     assert.ok((await handler(rpc(await sign({}, overrides)))).status >= 400);
   }
   assert.equal((await handler(rpc(await sign({ scope: 'profile' })))).status, 403);
-  assert.equal((await handler(rpc(await sign(), 'bridge_health', { messageId: 'ignored' }))).status, 400);
+  const badArguments = await handler(rpc(await sign(), 'bridge_health', { messageId: 'ignored' }));
+  assert.equal(badArguments.status, 200);
+  const rejected = (await badArguments.json()).result;
+  assert.equal(rejected.isError, true); assert.deepEqual(rejected.structuredContent, { error: 'invalid_params' });
   assert.equal((await handler(rpc('FIXTURE_INVALID_NOT_A_TOKEN'))).status, 401);
 });
 test('gate flags alone cannot report subscription or delivery ready', async () => {
