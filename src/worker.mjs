@@ -103,12 +103,15 @@ export class DeliveryWorker {
         }
       }
     } catch (error) {
-      // Transport failures are retryable. Configuration, encryption and public
-      // address rejection require repair and must not consume repeat requests.
+      // A temporary DB failure during the access/state recheck has not granted
+      // permission or sent anything. Keep this work pending within the existing
+      // attempt/backoff budget; every retry must pass all authorization fences.
+      // Configuration, encryption and public-address rejection remain terminal.
       transportOutcome = error?.[DELIVERY_TRANSPORT_OUTCOME] || null;
+      const storageUnavailable = error instanceof BridgeError && error.code === 'storage_unavailable';
       const transientError = ['callback_timeout', 'callback_transport_failed', 'callback_dns_failed'].includes(error?.code);
-      retry = transientError && transportOutcome?.terminal !== true;
-      code = transientError ? 'transport_transient' : 'delivery_configuration_required';
+      retry = (storageUnavailable || transientError) && transportOutcome?.terminal !== true;
+      code = storageUnavailable ? 'storage_unavailable' : transientError ? 'transport_transient' : 'delivery_configuration_required';
     }
     const completedAt = this.clock();
     const saved = await this.store.transaction(state => {

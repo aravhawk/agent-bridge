@@ -11,10 +11,15 @@ Canonical service: **https://jarvis-friday-bridge.aravhawk.com**
 - Friday MCP: `/bridge/friday/mcp`
 - Public version/liveness: `/health` (no private readiness or delivery operations)
 
-This v1 source is pending independent review and new auth/Secret approvals. It
-has not been activated. The old disabled deployment remains a separate rollback
-snapshot; its source is commit `fac3baf1ab0be6d70609b3520c97801fc734361b`.
-Historical setup records and fixtures are explicitly separate from active v1.
+This is the deployed v1 source. Normal delivery remains disabled pending native
+integration evidence; deployment does not attest readiness. Existing production
+bindings are reused, and setup documents do not authorize recreating them. The
+old disabled deployment remains a separate rollback snapshot at commit
+`fac3baf1ab0be6d70609b3520c97801fc734361b`.
+
+See [architecture and invariants](docs/architecture.md) for the active lifecycle,
+failure semantics and remaining integration limits. Historical setup records
+and fixtures are separate from active v1.
 
 ## Verify source
 

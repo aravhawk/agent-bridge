@@ -102,10 +102,11 @@ export class NativeEvents {
         fail('authorization_lease_required', 403);
       if (existing && (existing.status !== 'active' || !existing.active)) fail('subscription_inactive', 403);
       if (existing && authorization.tokenExpiresAt < existing.authorization.tokenExpiresAt) fail('stale_authorization', 403);
-      const until = existing && authorization.tokenExpiresAt === existing.authorization.tokenExpiresAt
-        ? Math.min(requestedUntil, existing.expiresAt) : requestedUntil;
-      if (until <= at) fail('subscription_expired', 409);
-      return until;
+      // Each authenticated subscribe re-grants its requested TTL. The old
+      // grant is not an authority ceiling: requestedUntil is already capped by
+      // this request's verified token expiry, rechecked at every commit fence.
+      if (requestedUntil <= at) fail('subscription_expired', 409);
+      return requestedUntil;
     };
     const fingerprint = digest(secret);
     const cached = await this.store.transaction(s => {

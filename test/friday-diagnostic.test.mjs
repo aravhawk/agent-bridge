@@ -13,6 +13,11 @@ import { ISSUER } from './fixtures/provider.mjs';
 const URL_SECRET = 'https://receiver.example.test/hook/FIXTURE_URL_TOKEN';
 const KEY = 'FIXTURE_NOT_A_REAL_KEY';
 const DIAGNOSTIC = 'bridge_friday_webhook_diagnostic';
+function executionError(response, code) {
+  assert.equal(response.status, 200);
+  assert.equal(response.body.result.isError, true);
+  assert.deepEqual(response.body.result.structuredContent, { error: code });
+}
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 
 // Mirrors the deployed state at the time of the diagnostic: OAuth contract and
@@ -113,8 +118,7 @@ test('unarmed discovery and health expose the same schema without backend setup 
   assert.equal(health.readiness.fridayWebhookDiagnosticArmed, false);
   assert.equal(health.readiness.deliveryEnabled, false);
   const rejected = await closed.call();
-  assert.equal(rejected.status, 503);
-  assert.equal(rejected.body.error.message, 'friday_diagnostic_not_armed');
+  executionError(rejected, 'friday_diagnostic_not_armed');
   assert.equal(closed.posts.length, 0);
   assert.equal(db.document.fridayWebhookDiagnostic, undefined);
 });
@@ -126,8 +130,7 @@ test('expired window keeps the schema stable but rejects invocation before spend
   assert.deepEqual(await f.names('jarvis'), names);
   assert.deepEqual((await f.health('jarvis')).caller.tools, names);
   const rejected = await f.call();
-  assert.equal(rejected.status, 503);
-  assert.equal(rejected.body.error.message, 'friday_diagnostic_not_armed');
+  executionError(rejected, 'friday_diagnostic_not_armed');
   assert.equal(f.posts.length, 0);
   assert.equal(f.db.document.fridayWebhookDiagnostic, undefined);
 });
@@ -184,7 +187,7 @@ test('wrong caller, missing send scope or caller-supplied arguments cannot spend
     assert.equal((await f.names('jarvis', ackOnly)).includes(DIAGNOSTIC), false);
     assert.equal((await f.call('jarvis', {}, ackOnly)).status, 403);
     for (const args of [{ url: 'https://attacker.example.test' }, { messageId: '00000000-0000-4000-8000-000000000001' }, { body: {} }]) {
-      assert.equal((await f.call('jarvis', args)).status, 400);
+      executionError(await f.call('jarvis', args), 'invalid_params');
     }
     assert.equal(f.posts.length, 0); assert.equal(f.db.document.fridayWebhookDiagnostic, undefined);
   }
@@ -204,13 +207,13 @@ test('unarmed, expired, overlong, wrong receiver or unattested configuration kee
     const attested = env.BRIDGE_OAUTH_CONTRACT_VERIFIED !== 'false';
     assert.equal((await f.names('jarvis')).includes(DIAGNOSTIC), attested);
     const rejected = await f.call();
-    assert.equal(rejected.status, attested ? 503 : 403);
-    assert.equal(rejected.body.error.message, attested ? 'friday_diagnostic_not_armed' : 'tool_not_available');
+    if (attested) executionError(rejected, 'friday_diagnostic_not_armed');
+    else { assert.equal(rejected.status, 403); assert.equal(rejected.body.error.message, 'tool_not_available'); }
     assert.equal(f.posts.length, 0); assert.equal(f.db.document.fridayWebhookDiagnostic, undefined);
   }
   const f = await fixture(); f.advance(3600000);
   assert.equal((await f.names('jarvis')).includes(DIAGNOSTIC), true);
-  assert.equal((await f.call()).status, 503); assert.equal(f.posts.length, 0);
+  executionError(await f.call(), 'friday_diagnostic_not_armed'); assert.equal(f.posts.length, 0);
 });
 
 test('fixed arm interval enforces start/end boundaries and a maximum total duration', () => {
@@ -232,13 +235,13 @@ test('overlong arm stays closed as time passes and after a new runtime starts', 
   for (let hour = 0; hour <= 3; hour++) {
     assert.equal((await f.health('jarvis')).readiness.fridayWebhookDiagnosticArmed, false);
     assert.equal((await f.names('jarvis')).includes(DIAGNOSTIC), true);
-    assert.equal((await f.call()).status, 503);
+    executionError(await f.call(), 'friday_diagnostic_not_armed');
     f.advance(3600000);
   }
   await f.rt.close();
   const restarted = await fixture({ env, db: f.db, now: start + 3600000 });
   assert.equal((await restarted.health('jarvis')).readiness.fridayWebhookDiagnosticArmed, false);
-  assert.equal((await restarted.call()).status, 503);
+  executionError(await restarted.call(), 'friday_diagnostic_not_armed');
   assert.equal(f.db.document.fridayWebhookDiagnostic, undefined);
   assert.equal(f.posts.length + restarted.posts.length, 0);
 });
@@ -301,7 +304,7 @@ test('restart, re-arming or a lost outcome never re-sends; ambiguous results are
   // A failed spend commit sends nothing and leaves the diagnostic unspent.
   const closedDb = lockingDatabase(); closedDb.failUpdates = 1;
   const closed = await fixture({ db: closedDb });
-  assert.equal((await closed.call()).status, 503);
+  executionError(await closed.call(), 'storage_unavailable');
   assert.equal(closed.posts.length, 0); assert.equal(closedDb.document.fridayWebhookDiagnostic, undefined);
 });
 

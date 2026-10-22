@@ -127,9 +127,11 @@ test('runtime requires real subject/claim contract, verifies audience, and block
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) }));
   assert.equal((await (await call('tools/list')).json()).result.tools.length, 6);
   const response = await call('tools/call', { name: 'bridge_message_send', arguments: {} });
-  assert.equal(response.status, 503); assert.equal((await response.json()).error.message, 'receiver_readiness_required');
+  assert.equal(response.status, 200);
+  assert.deepEqual((await response.json()).result.structuredContent, { error: 'receiver_readiness_required' });
   const lookup = await call('tools/call', { name: 'bridge_status', arguments: { messageId: '00000000-0000-4000-8000-000000000001' } });
-  assert.equal(lookup.status, 503); assert.equal(new URL(poolOptions.connectionString).searchParams.get('sslmode'), 'verify-full');
+  assert.equal(lookup.status, 200); assert.equal((await lookup.json()).result.isError, true);
+  assert.equal(new URL(poolOptions.connectionString).searchParams.get('sslmode'), 'verify-full');
   const wrong = await rt.handler('jarvis')(request('/bridge/jarvis/mcp', { headers: { ...headers, authorization: `Bearer ${token}` } }));
   assert.equal(wrong.status, 401);
 });
@@ -169,7 +171,9 @@ test('runtime bounds Jarvis subscription by verified expiry and durable denial w
   assert.equal(denied.status, 403); assert.equal((await denied.json()).error.message, 'access_revoked');
   assert.equal(challenges, 1); assert.equal(Object.keys(document.subscriptions).length, 1);
   const sent = await rpc('tools/call', { name: 'bridge_message_send', arguments: {} });
-  assert.equal(sent.status, 503); assert.equal((await sent.json()).error.message, 'receiver_readiness_required');
+  assert.equal(sent.status, 200);
+  const failure = (await sent.json()).result;
+  assert.equal(failure.isError, true); assert.deepEqual(failure.structuredContent, { error: 'receiver_readiness_required' });
   assert.deepEqual(document.messages, {}); assert.deepEqual(document.jobs, {}); assert.equal(queueSends, 0);
 });
 const id = 'job_' + 'a'.repeat(64);

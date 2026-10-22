@@ -46,11 +46,13 @@ test('expired token-bound lease recovers with later valid authority, same ID and
   assert.deepEqual(restarted.store.snapshot().jobs, {});
 });
 
-test('same-expiry policy does not revive an expired shorter grant even while token is still valid', async () => {
+test('a shorter expired grant can be renewed by the same still-valid authority without exceeding its expiry', async () => {
   const f = fixture(), principal = f.who(f.clock() + 60000);
   const original = await f.events.subscribe(principal, { ...f.params, ttlMs: 1000 });
   f.advance(1001);
-  await assert.rejects(f.events.subscribe(principal, { ...f.params, ttlMs: 60000 }), code('subscription_expired'));
+  const renewed = await f.events.subscribe(principal, { ...f.params, ttlMs: 60000 });
+  assert.equal(renewed.id, original.id);
+  assert.equal(Date.parse(renewed.refreshBefore), f.clock() + 58999);
   const recovered = await f.events.subscribe(f.who(f.clock() + 120000), f.params);
   assert.equal(recovered.id, original.id);
 });
