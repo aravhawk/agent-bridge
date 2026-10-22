@@ -9,11 +9,11 @@ export const DIAGNOSTIC_MAX_WINDOW_MS = 2 * 3600000;
 
 // Fixed operator interval, shared across instances/restarts. Validate its full
 // duration, not its remaining lifetime: an overlong arm must never open later.
-export function diagnosticWindowOpen(from, until, now) {
+export function diagnosticWindowOpen(from, until, now, maxWindowMs = DIAGNOSTIC_MAX_WINDOW_MS) {
   const start = typeof from === 'string' ? Date.parse(from) : NaN;
   const end = typeof until === 'string' ? Date.parse(until) : NaN;
   return Number.isSafeInteger(start) && Number.isSafeInteger(end) && Number.isSafeInteger(now) &&
-    end > start && end - start <= DIAGNOSTIC_MAX_WINDOW_MS && start <= now && now < end;
+    end > start && end - start <= maxWindowMs && start <= now && now < end;
 }
 const view = (record, duplicate) => ({ messageId: record.messageId, receiverId: record.receiverId,
   attemptedAt: new Date(record.attemptedAt).toISOString(), duplicate,

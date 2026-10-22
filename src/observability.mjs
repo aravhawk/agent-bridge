@@ -92,3 +92,34 @@ export function diagnosticReadStatus(state, principal, messageId, now) {
   return { messageId, messageStored: false, readObservations: own.map(({ owner, ...r }) => view(r)),
     evidenceStatus: 'server_read_result_only_not_native_wake', wakeVerified: false };
 }
+// Stored-message canary reads live in its own durable reservation, never the
+// spent diagnostic marker: Friday reading the source, the reserving Jarvis
+// owner reading the server-created ACK. Capture ends 30 minutes after UNTIL.
+function canaryReadField(state, principal, messageId, now) {
+  const r = state.fridayCanary;
+  if (!r || !uuid(messageId) || !hash(principal?.principalKey) || !time(now) || !time(r.reservedAt) ||
+      !time(r.until) || now < r.reservedAt || now >= r.until + DIAGNOSTIC_READ_WINDOW_MS) return;
+  const role = messageId === r.messageId ? 'friday' : r.ackMessageId && messageId === r.ackMessageId ? 'jarvis' : null;
+  if (!role || principal.role !== role || !principal.scopes?.includes(SCOPES[role].ack) ||
+      (role === 'jarvis' && principal.principalKey !== r.owner)) return;
+  return role === 'friday' ? 'sourceReads' : 'ackReads';
+}
+export const canaryReadCandidate = (state, principal, messageId, now) => !!canaryReadField(state, principal, messageId, now);
+export async function observeCanaryRead({ store, principal, messageId, error, failed = false, clock }) {
+  try {
+    await store.transaction(state => {
+      const now = clock(), field = canaryReadField(state, principal, messageId, now);
+      if (!field) throw skipObservation;
+      state.fridayCanary[field] = [...records(state.fridayCanary[field], now, 'read'),
+        { at: now, ...result(error, failed), owner: principal.principalKey }].slice(-OBSERVATION_LIMIT);
+    });
+  } catch { /* A failed observation never repeats or changes the read. */ }
+}
+export function canaryReadStatus(state, messageId, now) {
+  const r = state.fridayCanary;
+  const field = !r || !uuid(messageId) ? null : messageId === r.messageId ? 'sourceReads'
+    : r.ackMessageId && messageId === r.ackMessageId ? 'ackReads' : null;
+  if (!field) return;
+  return { readObservations: records(r[field], now, 'read').map(({ owner, ...x }) => view(x)),
+    evidenceStatus: 'server_operation_results_only_not_native_wake' };
+}
