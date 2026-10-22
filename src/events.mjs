@@ -184,9 +184,12 @@ export class NativeEvents {
 }
 
 // Called only inside a message transaction, after its durable identity exists.
-export function appendDeliveryJobs(state, envelope, now) {
+// A pinned subscriptionId restricts Jarvis fan-out to that one return path;
+// maxAttempts persists a stricter per-job transport limit.
+export function appendDeliveryJobs(state, envelope, now, { subscriptionId, maxAttempts } = {}) {
   const destinations = envelope.to === 'jarvis'
-    ? Object.values(state.subscriptions).filter(sub => subscriptionAccessAllowed(state, sub, sub.authorization?.policyId, now))
+    ? Object.values(state.subscriptions).filter(sub => (!subscriptionId || sub.id === subscriptionId) &&
+      subscriptionAccessAllowed(state, sub, sub.authorization?.policyId, now))
     : [{ id: 'friday', recipient: 'friday' }];
   const jobIds = [];
   for (const sub of destinations) {
@@ -197,7 +200,8 @@ export function appendDeliveryJobs(state, envelope, now) {
         data: { messageId: envelope.id }, cursor: null } : { event: EVENT_NAME, data: { messageId: envelope.id } };
       state.jobs[id] = { id, messageId: envelope.id, recipient: envelope.to,
         subscriptionId: envelope.to === 'jarvis' ? sub.id : null, eventId,
-        body: JSON.stringify(event), state: 'pending', attempts: 0, dueAt: now, leaseId: null, leaseUntil: null };
+        body: JSON.stringify(event), state: 'pending', attempts: 0, dueAt: now, leaseId: null, leaseUntil: null,
+        ...(maxAttempts ? { maxAttempts } : {}) };
     }
     jobIds.push(id);
   }

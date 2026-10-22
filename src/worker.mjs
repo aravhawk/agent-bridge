@@ -9,18 +9,25 @@ const backoff = attempt => Math.min(60000, 1000 * (2 ** Math.min(attempt - 1, 6)
 export class DeliveryWorker {
   constructor({ store, protector, transport, fridaySender, accessAllowed, policyId, enabled = false, clock = Date.now,
     maxAttempts = 5, leaseMs = 30000, messagePolicyIds = { jarvis: policyId, friday: policyId }, deliveryUntil = Infinity,
-    probeMessageId, probeSender = 'jarvis' }) {
+    probeMessageId, probeSender = 'jarvis', jobAllowed }) {
     this.store = store; this.protector = protector; this.transport = transport; this.fridaySender = fridaySender;
     this.accessAllowed = accessAllowed; this.enabled = enabled; this.clock = clock;
     this.policyId = policyId;
     this.messagePolicyIds = messagePolicyIds; this.deliveryUntil = deliveryUntil;
     this.probeMessageId = probeMessageId; this.probeSender = probeSender;
-    this.maxAttempts = maxAttempts; this.leaseMs = leaseMs;
+    this.maxAttempts = maxAttempts; this.leaseMs = leaseMs; this.jobAllowed = jobAllowed;
   }
   messageAllowed(state, message, now) {
     return messageAccessAllowed(state, message, this.messagePolicyIds, now) &&
       (!this.probeMessageId || testEnvelopeAllowed(message.envelope, this.probeMessageId, this.probeSender));
   }
+  // A job may persist a stricter limit (one-shot work); it never raises ours.
+  attemptLimit(job) {
+    return Number.isSafeInteger(job?.maxAttempts) && job.maxAttempts >= 1 ? Math.min(this.maxAttempts, job.maxAttempts) : this.maxAttempts;
+  }
+  // Restricted workers leave jobs outside their scope untouched: not leased,
+  // counted or marked dead, so other work keeps its own lifecycle.
+  outOfScope(state, job) { return !!this.jobAllowed && !this.jobAllowed(state, job); }
   // One queue job dispatches one attempt. There is no loop, interval, timer,
   // assistant listen/inbox check, or live queue registration in this module.
   async run(jobId) {
@@ -29,13 +36,13 @@ export class DeliveryWorker {
     const claimed = await this.store.transaction(state => {
       const job = state.jobs[jobId];
       if (!job || ['accepted', 'dead'].includes(job.state) || job.dueAt > now ||
-          (job.state === 'leased' && job.leaseUntil > now)) return null;
+          (job.state === 'leased' && job.leaseUntil > now) || this.outOfScope(state, job)) return null;
       if (job.firstTransportOutcome?.terminal === true) {
         const status = job.firstTransportOutcome.status;
         job.state = status >= 200 && status < 300 ? 'accepted' : 'dead';
         return null; // Restore a committed one-shot result without another send.
       }
-      if (job.attempts >= this.maxAttempts) {
+      if (job.attempts >= this.attemptLimit(job)) {
         job.state = 'dead'; job.lastError = 'attempt_limit'; return null;
       }
       const sub = job.subscriptionId ? state.subscriptions[job.subscriptionId] : null;
@@ -70,6 +77,7 @@ export class DeliveryWorker {
           const activeSub = subscription ? state.subscriptions[subscription.id] : null;
           const message = state.messages[job.messageId];
           if (activeJob?.leaseId !== job.leaseId || activeJob.state !== 'leased' || activeJob.leaseUntil <= this.clock() ||
+              this.outOfScope(state, activeJob) ||
               this.clock() >= this.deliveryUntil || !this.messageAllowed(state, message, this.clock()) ||
               message.envelope.to !== activeJob.recipient || !message.jobIds.includes(jobId) ||
               (subscription && (activeJob.recipient !== activeSub?.recipient ||
@@ -124,7 +132,7 @@ export class DeliveryWorker {
           !subscriptionAccessAllowed(state, sub, this.policyId, this.clock()))) { accepted = false; retry = false; code = 'subscription_inactive'; }
       const message = state.messages[job.messageId];
       if (this.clock() >= this.deliveryUntil || !this.messageAllowed(state, message, this.clock()) ||
-          message.envelope.to !== activeJob.recipient || !message.jobIds.includes(jobId)) {
+          message.envelope.to !== activeJob.recipient || !message.jobIds.includes(jobId) || this.outOfScope(state, activeJob)) {
         accepted = false; retry = false; code = 'message_authorization_inactive';
       }
       if (transportOutcome) {
@@ -136,7 +144,7 @@ export class DeliveryWorker {
           status, error: transportOutcome.error || (status === null ? code : status >= 200 && status < 300 ? null
             : transient(status) ? 'transient_http' : 'permanent_http'), terminal: transportOutcome.terminal === true };
       }
-      activeJob.state = accepted ? 'accepted' : retry && activeJob.attempts < this.maxAttempts ? 'pending' : 'dead';
+      activeJob.state = accepted ? 'accepted' : retry && activeJob.attempts < this.attemptLimit(activeJob) ? 'pending' : 'dead';
       activeJob.lastError = code; activeJob.lastStatus = status;
       activeJob.dueAt = completedAt + backoff(activeJob.attempts);
       activeJob.leaseId = null; activeJob.leaseUntil = null;
@@ -144,7 +152,7 @@ export class DeliveryWorker {
       return true;
     });
     return { attempted: true, committed: saved, transportAccepted: saved && accepted, status,
-      retryAt: saved && retry && job.attempts < this.maxAttempts ? new Date(completedAt + backoff(job.attempts)).toISOString() : null };
+      retryAt: saved && retry && job.attempts < this.attemptLimit(job) ? new Date(completedAt + backoff(job.attempts)).toISOString() : null };
   }
 }
 

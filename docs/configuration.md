@@ -93,6 +93,10 @@ BRIDGE_DELIVERY_ENABLED=false
 BRIDGE_RECEIVER_POLICY=
 FRIDAY_RECEIVER_ID=jarvis-friday-bridge-inbox
 FRIDAY_WEBHOOK_CONTRACT_VERIFIED=false
+FRIDAY_CANARY_MESSAGE_ID=
+FRIDAY_CANARY_FROM=
+FRIDAY_CANARY_UNTIL=
+FRIDAY_CANARY_RETURN_SUBSCRIPTION_ID=
 ```
 
 After native health/contract proof, subscription setup can be enabled separately
@@ -190,6 +194,80 @@ HTTP 2xx proves neither wake nor mapping. Evidence is the native Friday run
 showing this exact event and data.messageId. Only then may an operator consider
 FRIDAY_WEBHOOK_CONTRACT_VERIFIED; the diagnostic never sets it. Afterwards,
 clear both diagnostic timestamps (the window also lapses on its own).
+
+## One stored-message canary
+
+A server-armed exception that lets ONE fixed Jarvis -> Friday source and its
+server-created ACK use the existing tools, queue and Friday sender while
+`BRIDGE_DELIVERY_ENABLED`, `BRIDGE_RECEIVER_POLICY` and
+`FRIDAY_WEBHOOK_CONTRACT_VERIFIED` stay off. It is a diagnostic, not readiness
+evidence: it never sets a flag, `deliveryEnabled` stays false and no tool,
+endpoint, grant or credential is added. Health reports only `canaryArmed`.
+
+Armed only when the OAuth contract is attested, storage, callback protector and
+Friday URL/key are configured, FRIDAY_RECEIVER_ID is exactly
+`jarvis-friday-bridge-inbox`, normal delivery is off, and all four values are
+valid: FRIDAY_CANARY_MESSAGE_ID (a fresh lowercase UUID), FRIDAY_CANARY_FROM /
+FRIDAY_CANARY_UNTIL (fixed ISO interval of at most 30 minutes total, FROM at or
+before now, UNTIL after now) and FRIDAY_CANARY_RETURN_SUBSCRIPTION_ID (the
+existing active `sub_...` Jarvis return subscription). Missing, malformed,
+reversed, overlong, future or expired settings stay closed; an overlong interval
+never opens as time passes. Callers choose no ID, target, window or setting.
+
+The only admissible source is Jarvis `bridge_message_send` with protocol
+`jarvis-friday/1`, `id` and `threadId` both the configured UUID, from `jarvis`,
+to `friday`, kind `status`, route `inbox`, `expiresAt` exactly UNTIL (same
+instant), `sentAt` within the normal 5-minute validation and text exactly
+`CANARY_TEXT` from `src/friday-canary.mjs`:
+
+```text
+Jarvis Friday Bridge canary: one-time status data only. No action is requested.
+```
+
+Any other source, body, thread, direction, kind or expiry is refused with
+`friday_canary_only`; manual ACK sends still return
+`use_receipt_complete_for_ack`. All existing JWT, pinned role/scope, hard-expiry,
+denial and message validation checks still run first. The return-path check is
+pinned to the configured subscription, which must be active, owned by the
+sending Jarvis identity and outlive the source. In canary mode, claim/complete
+admit only that source (Friday) and its ACK (the reserving Jarvis owner); every
+other stored message returns `friday_canary_only`. Read/status authorization is
+unchanged. Without an armed canary every gated path returns
+`receiver_readiness_required` as before.
+
+The first admitted send commits a durable lifetime reservation
+(`fridayCanary`: UUID, hashed owner, FROM/UNTIL, return subscription, source
+hash, reservation time, later the ACK ID and bounded read results) before any
+queue publication. It is separate from the spent webhook diagnostic marker,
+which it never modifies; that marker's UUID is refused as a canary ID.
+Nothing clears it. A new UUID, moved/extended window, other subscription or
+changed body returns `friday_canary_spent` (or `message_id_conflict` once the
+source is stored); an exact replay is idempotent. Retry a failed send only
+with identical arguments. A spend whose window closes during commit stays spent.
+
+Source and ACK jobs persist a one-attempt limit; the Friday POST uses the sender's
+unverified one-job probe mode and the Jarvis callback records every invocation as
+terminal. Timeouts, 5xx results, crashes, lease expiry and restarts are never
+retried: conservative loss is accepted for this one-shot diagnostic. The worker
+rechecks UNTIL after the access check and state recheck commits, immediately
+before transport. The ACK has exactly one job, for the pinned subscription; other
+active subscriptions receive nothing. In canary mode the private queue callback
+accepts only `{dispatchMessageId|dispatchReceiptOf: <canary UUID>}` while armed;
+direct job IDs and all other work stay closed and untouched (not leased, counted or
+marked dead). Canary tool results report `scheduling: not_confirmed` because
+direct job scheduling stays closed; dispatch comes from the pre-commit
+preparation item, so this alone does not indicate a failure.
+
+Procedure: set the four values (FROM now, UNTIL at most 30 minutes later), then
+Jarvis sends the fixed source once. Friday `bridge_read`, `bridge_receipt_claim`
+and `bridge_receipt_complete` (null host IDs unless independently known), then
+Jarvis reads, claims and completes the ACK (terminal, no further ACK). Inspect
+`bridge_status` for the source and ACK: deliveries (attempts, transport attempts,
+first outcome), `receiptCompleted`, `ackMessageId` and `canary.readObservations`.
+Clear the four values afterwards. Results are server operation evidence only
+(`server_operation_results_only_not_native_wake`, `wakeVerified: false`); they
+prove neither native event context nor host IDs, nor ordinary bidirectional
+delivery or lease renewal.
 
 ## Bounded operation evidence
 

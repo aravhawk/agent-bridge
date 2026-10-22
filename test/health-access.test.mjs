@@ -38,7 +38,7 @@ test('authenticated health succeeds with no storage, network transport, queue or
   assert.deepEqual(JSON.parse(result.content[0].text), { status: 'ok', authenticated: true, serverVersion: '1.0.0',
     readiness: { storageConfigured: false, callbackProtectorConfigured: false, currentAccessCheckConfigured: true,
       fridaySenderConfigured: false, receiverPolicyVerified: false, fridayContractVerified: false,
-      fridayWebhookDiagnosticArmed: false, subscriptionSetupEnabled: false, deliveryEnabled: false },
+      fridayWebhookDiagnosticArmed: false, canaryArmed: false, subscriptionSetupEnabled: false, deliveryEnabled: false },
     caller: { role: 'jarvis', sendScope: false, ackScope: true, tools: ['bridge_health', 'bridge_read',
       'bridge_receipt_claim', 'bridge_receipt_complete', 'bridge_status', 'bridge_subscription_status'] } });
   const output = JSON.stringify(result);

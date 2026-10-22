@@ -3,7 +3,9 @@ import { randomUUID } from 'node:crypto';
 import { BridgeError, validateEnvelope, SCOPES } from './policy.mjs';
 import { appendDeliveryJobs, authorizeRecipient, ownKeys } from './events.mjs';
 import { verifiedMessageAuthorization, messageAccessAllowed, subscriptionAccessAllowed, testEnvelopeAllowed } from './access.mjs';
-import { diagnosticReadCandidate, diagnosticReadStatus, observeDiagnosticRead } from './observability.mjs';
+import { diagnosticReadCandidate, diagnosticReadStatus, observeDiagnosticRead,
+  canaryReadCandidate, canaryReadStatus, observeCanaryRead } from './observability.mjs';
+import { canaryEnvelope, reserveCanary, canaryReceipt } from './friday-canary.mjs';
 
 const fail = (code, status = 400) => { throw new BridgeError(code, status); };
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
@@ -25,16 +27,18 @@ function incoming(state, principal, id, probeMessageId, probeSender) {
   if (probeMessageId && !testEnvelopeAllowed(message.envelope, probeMessageId, probeSender)) fail('contract_probe_only', 403);
   return message;
 }
-function requireAckPath(state, envelope, authorization, policyIds, now) {
+function requireAckPath(state, envelope, authorization, policyIds, now, subscriptionId) {
   if (!dailyMessage(envelope) || envelope.kind === 'ack' || envelope.from !== 'jarvis') return;
   // Friday must not handle a source whose required ACK has no usable return
   // path. Cover its entire immutable authority lifetime, not just this instant.
   // Revocation/shortening during handling still fails closed at completion.
+  // A pinned subscriptionId (canary) admits only that exact return path.
   if (!Object.values(state.subscriptions).some(sub => sub.owner === authorization?.owner &&
+      (!subscriptionId || sub.id === subscriptionId) &&
       subscriptionAccessAllowed(state, sub, policyIds?.jarvis, now) &&
       sub.expiresAt >= authorization.expiresAt)) fail('return_subscription_required', 503);
 }
-function insert(state, envelope, hash, now, authorization) {
+function insert(state, envelope, hash, now, authorization, jobOptions) {
   const saved = state.messages[envelope.id];
   if (saved && saved.hash !== hash) fail('message_id_conflict', 409);
   if (saved) return { messageId: envelope.id, queued: true, duplicate: true, jobIds: saved.jobIds };
@@ -44,15 +48,17 @@ function insert(state, envelope, hash, now, authorization) {
         (dailyMessage(envelope) && (probe.threadId !== envelope.threadId || probe.route !== envelope.route)) || probe.from !== envelope.to || probe.to !== envelope.from) fail('invalid_correlation', 409);
   }
   const retainUntil = dailyMessage(envelope) ? reserveMessage(state, envelope, hash, now) : undefined;
-  const jobIds = appendDeliveryJobs(state, envelope, now);
+  const jobIds = appendDeliveryJobs(state, envelope, now, jobOptions);
   if (envelope.to === 'jarvis' && !jobIds.length) fail('recipient_subscription_required', 503);
   state.messages[envelope.id] = { envelope, hash, storedAt: now, jobIds, authorization, ...(retainUntil ? { retainUntil } : {}) };
   return { messageId: envelope.id, queued: true, duplicate: false, jobIds };
 }
 
 export class Bridge {
-  constructor({ store, clock = Date.now, probeMessageId, probeSender = 'jarvis', messagePolicyIds, deliveryUntil = Infinity, dailyEnabled = false, prepareMessage, prepareReceipt }) {
-    this.prepareMessage = prepareMessage; this.prepareReceipt = prepareReceipt;
+  // canary: trusted fixed configuration (friday-canary.mjs). When present this
+  // instance admits only that one source and its server-created ACK.
+  constructor({ store, clock = Date.now, probeMessageId, probeSender = 'jarvis', messagePolicyIds, deliveryUntil = Infinity, dailyEnabled = false, prepareMessage, prepareReceipt, canary }) {
+    this.prepareMessage = prepareMessage; this.prepareReceipt = prepareReceipt; this.canary = canary;
     this.store = store; this.clock = clock; this.dailyEnabled = dailyEnabled; this.probeMessageId = probeMessageId;
     this.probeSender = probeSender;
     this.messagePolicyIds = messagePolicyIds; this.deliveryUntil = deliveryUntil;
@@ -86,9 +92,10 @@ export class Bridge {
       const prior = state.messages[input?.id?.toLowerCase?.()] || state.messageIds?.[input?.id?.toLowerCase?.()];
       const validated = validateMessage(input, principal, prior ? Date.parse(input.sentAt) : this.clock());
       if (prior?.hash !== undefined && prior.hash !== validated.hash) fail('message_id_conflict', 409);
+      if (this.canary) canaryEnvelope(validated.envelope, this.canary);
       if (!prior) {
         const authorization = verifiedMessageAuthorization(principal, validated.envelope, this.clock(), this.deliveryUntil);
-        requireAckPath(state, validated.envelope, authorization, this.messagePolicyIds, this.clock());
+        requireAckPath(state, validated.envelope, authorization, this.messagePolicyIds, this.clock(), this.canary?.subscriptionId);
         checkMessageCapacity(state);
         const now = this.clock();
         state.messagePreparations ||= {};
@@ -100,6 +107,8 @@ export class Bridge {
           state.messagePreparations[validated.envelope.id] = { hash: validated.hash, until: now + 60000 };
         }
       }
+      // Durable lifetime reservation commits after every check, before publishing.
+      if (this.canary) reserveCanary(state, this.canary, principal, validated.hash, !!prior, this.clock());
       return { id: validated.envelope.id, fresh: !prior };
     });
     if (preparation.fresh && this.prepareMessage) await this.prepareMessage(preparation.id);
@@ -109,31 +118,35 @@ export class Bridge {
       const prior = state.messages[id] || state.messageIds?.[id];
       const { envelope, hash } = validateMessage(input, principal, prior ? Date.parse(input.sentAt) : now);
       if (prior && prior.hash !== hash) fail('message_id_conflict', 409);
+      if (this.canary) { canaryEnvelope(envelope, this.canary); reserveCanary(state, this.canary, principal, hash, !!prior, now); }
       if (prior) return state.messages[id]
         ? { messageId: id, queued: true, duplicate: true, jobIds: state.messages[id].jobIds }
         : { messageId: id, queued: false, duplicate: true, expired: true, jobIds: [] };
       if (Date.parse(envelope.expiresAt) <= now) fail('message_expired', 403);
       const authorization = verifiedMessageAuthorization(principal, envelope, now, this.deliveryUntil);
-      requireAckPath(state, envelope, authorization, this.messagePolicyIds, now);
+      requireAckPath(state, envelope, authorization, this.messagePolicyIds, now, this.canary?.subscriptionId);
       delete state.messagePreparations?.[envelope.id];
-      return insert(state, envelope, hash, now, authorization);
+      return insert(state, envelope, hash, now, authorization, this.canary ? { maxAttempts: 1 } : undefined);
     });
   }
   async read(principal, params) {
     ownKeys(params, ['messageId']);
-    let candidate = false, output;
+    let candidate = false, canary = false, output;
     try { output = await this.store.transaction(state => {
       const now = this.clock();
       retainMessages(state, now);
       candidate = diagnosticReadCandidate(state, principal, params.messageId, now);
+      canary = canaryReadCandidate(state, principal, params.messageId, now);
       const message = incoming(state, principal, params.messageId, this.probeMessageId, this.probeSender);
       return { envelope: message.envelope, ...(dailyMessage(message.envelope) ? { authority: 'peer_data_requires_user_workflow',
         expired: Date.parse(message.envelope.expiresAt) <= this.clock() } : {}), receivedAt: new Date(message.storedAt).toISOString() };
     }); } catch (error) {
       if (candidate) await observeDiagnosticRead({ store: this.store, principal, messageId: params.messageId, error, failed: true, clock: this.clock });
+      if (canary) await observeCanaryRead({ store: this.store, principal, messageId: params.messageId, error, failed: true, clock: this.clock });
       throw error;
     }
     if (candidate) await observeDiagnosticRead({ store: this.store, principal, messageId: params.messageId, clock: this.clock });
+    if (canary) await observeCanaryRead({ store: this.store, principal, messageId: params.messageId, clock: this.clock });
     return output;
   }
   async claim(principal, params) {
@@ -142,10 +155,11 @@ export class Bridge {
       const now = this.clock();
       retainMessages(state, this.clock());
       const message = incoming(state, principal, params.messageId, this.probeMessageId, this.probeSender);
+      if (this.canary) canaryReceipt(state, this.canary, principal, params.messageId);
       const old = state.receipts[params.messageId];
       if (old?.state === 'complete') return { duplicate: true, completed: true, ackMessageId: old.ackMessageId };
       if (!messageAccessAllowed(state, message, this.messagePolicyIds, now)) fail('message_authorization_inactive', 403);
-      requireAckPath(state, message.envelope, message.authorization, this.messagePolicyIds, now);
+      requireAckPath(state, message.envelope, message.authorization, this.messagePolicyIds, now, this.canary?.subscriptionId);
       if (old?.leaseUntil > now) fail('receipt_busy', 409);
       const claimId = randomUUID();
       state.receipts[params.messageId] = { state: 'claimed', owner: principal.principalKey,
@@ -163,6 +177,7 @@ export class Bridge {
     if (this.prepareReceipt) {
       const prepare = await this.store.transaction(state => {
         const message = incoming(state, principal, params.messageId, this.probeMessageId, this.probeSender);
+        if (this.canary) canaryReceipt(state, this.canary, principal, params.messageId);
         const receipt = state.receipts[params.messageId];
         if (receipt?.owner !== principal.principalKey || receipt.claimId !== params.claimId) fail('receipt_claim_required', 409);
         if (receipt.state === 'complete') return false;
@@ -174,13 +189,14 @@ export class Bridge {
     return this.store.transaction(state => {
       const now = this.clock(); retainMessages(state, now);
       const message = incoming(state, principal, params.messageId, this.probeMessageId, this.probeSender), original = message.envelope;
+      if (this.canary) canaryReceipt(state, this.canary, principal, params.messageId);
       const receipt = state.receipts[params.messageId];
       if (receipt?.owner !== principal.principalKey) fail('receipt_claim_required', 409);
       if (receipt.state === 'complete') return { completed: true, duplicate: true,
         ackMessageId: receipt.ackMessageId, evidenceStatus: 'reported_requires_independent_host_confirmation' };
       if (!messageAccessAllowed(state, message, this.messagePolicyIds, now)) fail('message_authorization_inactive', 403);
       if (receipt.claimId !== params.claimId || receipt.leaseUntil <= now) fail('stale_receipt_claim', 409);
-      requireAckPath(state, original, message.authorization, this.messagePolicyIds, now);
+      requireAckPath(state, original, message.authorization, this.messagePolicyIds, now, this.canary?.subscriptionId);
       let ackMessageId = null; let jobIds = [];
       if (original.kind !== 'ack') {
         // All ACK creation, receipt completion, and outbound jobs commit together.
@@ -192,7 +208,10 @@ export class Bridge {
           : validateEnvelope({ id: ackMessageId, testId: original.testId,
             from: principal.role, to: original.from, kind: 'ack', sentAt: new Date(now).toISOString(),
             correlationId: original.id, marker: original.marker }, principal, now);
-        ({ jobIds } = insert(state, envelope, hash, now, verifiedMessageAuthorization(principal, envelope, now, this.deliveryUntil)));
+        // The canary ACK targets only the pinned return subscription, one attempt.
+        ({ jobIds } = insert(state, envelope, hash, now, verifiedMessageAuthorization(principal, envelope, now, this.deliveryUntil),
+          this.canary ? { subscriptionId: this.canary.subscriptionId, maxAttempts: 1 } : undefined));
+        if (this.canary) state.fridayCanary.ackMessageId = ackMessageId;
       }
       state.receipts[params.messageId] = { ...receipt, state: 'complete', completedAt: now,
         ackMessageId, hostedEventId: params.hostedEventId, hostedTurnId: params.hostedTurnId,
@@ -213,13 +232,14 @@ export class Bridge {
       }
       if (!message || ![message.envelope.from, message.envelope.to].includes(principal.role)) fail('message_not_found', 404);
       const receipt = state.receipts[params.messageId];
+      const canary = canaryReadStatus(state, params.messageId, this.clock());
       return { messageId: params.messageId,
         deliveries: message.jobIds.map(id => ({ eventId: state.jobs[id].eventId, state: state.jobs[id].state,
           attempts: state.jobs[id].attempts, transportAttempts: state.jobs[id].transportAttempts ?? null,
           firstTransportOutcome: state.jobs[id].firstTransportOutcome || null,
           lastStatus: state.jobs[id].lastStatus ?? null, lastError: state.jobs[id].lastError ?? null })), receiptCompleted: receipt?.state === 'complete',
         ackMessageId: receipt?.ackMessageId || null,
-        evidenceStatus: receipt?.evidenceStatus || 'no_hosted_receipt', wakeVerified: false };
+        evidenceStatus: receipt?.evidenceStatus || 'no_hosted_receipt', wakeVerified: false, ...(canary ? { canary } : {}) };
     });
   }
 }
