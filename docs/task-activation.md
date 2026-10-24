@@ -1,12 +1,26 @@
 # Task-data release candidate and staged activation contract
 
-The adapter, purge-disabled capability and default-off runtime hook are implemented
-and tested locally. The exported production `runtime = createRuntime()` passes no
-task option and remains v1-only. The owner has authorized the corrected release,
-native workflow integration and bounded two-direction acceptance. Publication,
-production opt-in and native acceptance remain unperformed until the reviewed
-candidate completes the release checks below. Credentials, OAuth grants and
-security configuration are unchanged and outside this release.
+The adapter, purge-disabled capability and default-off runtime hook are released.
+The core `runtime = createRuntime()` still passes no task option. The activation
+candidate explicitly opts in only in the API constructor, lazily on the first
+MCP request, with a60-second mutex,48-hour notice lookup and purge off. Optional
+task-constructor `BridgeError` codes beginning `task_` select the existing v1
+runtime for that instance instead; task tools remain absent. This preserves
+ordinary authenticated health/read/receipt/unsubscribe when task readiness is
+unavailable, without changing either verifier. Unexpected errors retain503.
+The fallback is sticky until a fresh instance/deployment; it never silently
+enables task tools later. The queue entry uses the unchanged core runtime.
+The owner has authorized activation after independent review and both native
+receiver preparations; acceptance is coordinated separately. Credentials,
+OAuth grants and security configuration are unchanged and outside this release.
+
+Task reads include the authenticated caller's role and next command sequence.
+Optional read `commandId` recovers only that caller's bounded cached receipt;
+`unknown` means absent or evicted, never permission to retry external work.
+Recovered start receipts always say `operationRecorded: false`. Use the current
+canonical task/operation, revision and next sequence for reconciliation after a
+restart; private scratch journals are not required. Exact replay still needs the
+original request and notice ID; recovery never reconstructs or guesses a payload.
 Earlier automatic-retention proposals are superseded by this purge-off contract.
 
 ## Candidate construction and owner binding
@@ -38,7 +52,8 @@ linkRetentionMs, ...limits})` remains the runtime's single construction path.
 It defaults disabled and rejects `purgeEnabled` other than literal `false`, or
 any supplied `retention` configuration. It constructs `createTaskAccess(policy)`
 and a kernel with no task-retention collector. The default-off runtime facade
-supplies the capability privately to `createMcpHandler`; production never opts in.
+supplies the capability privately to `createMcpHandler`; only the explicit API
+constructor opts in. The core singleton stays v1-only.
 Construction also requires both bridge delivery-policy IDs to match and the
 existing native prearm callback to be configured. Callback presence alone is not
 proof of provider readiness, delivery or hosted execution.

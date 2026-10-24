@@ -86,15 +86,16 @@ export class TaskNoticeTransactions {
     });
     return result(outcome);
   }
-  async getByMessageId(principal, messageId) {
+  async getByMessageId(principal, messageId, commandId) {
     if (!uuid(messageId)) fail('invalid_task_notice', 400);
+    if (commandId !== undefined && !uuid(commandId)) fail('invalid_task_command', 400);
     const outcome = await this.kernel.store.transaction(state => {
       const saved = links(state), link = saved[messageId];
       if (!link) {
         this.kernel.decision(principal, { operation: 'read', taskId: messageId }, undefined, this.kernel.now(), state);
         fail('task_notice_not_found', 404);
       }
-      const read = this.kernel.readState(state, principal, link.taskId);
+      const read = this.kernel.readState(state, principal, link.taskId, commandId);
       if (read.role !== link.recipient || read.ownerKey !== link.ownerKey) fail('task_notice_not_found', 404);
       if (this.pruneExpiredLinks) {
         if (this.kernel.retention) {
