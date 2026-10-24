@@ -336,6 +336,10 @@ test('real runtime delivers daily source and native signed ACK, then retains cle
   const ackId = done.body.result.structuredContent.ackMessageId;
   await f.consume({ dispatchReceiptOf: m.id });
   assert.ok(f.posts.some(body => body.name === 'bridge.message.received' && body.data.messageId === ackId));
+  const ackStatus = (await f.rpc('jarvis', 'tools/call', { name: 'bridge_status', arguments: { messageId: ackId } })).body.result.structuredContent;
+  assert.equal(ackStatus.deliveries[0].transportAttempts, 1);
+  assert.equal(ackStatus.deliveries[0].firstTransportOutcome.status, 200);
+  assert.equal(ackStatus.receiptCompleted, false); assert.equal(ackStatus.wakeVerified, false);
   const status = await f.rpc('jarvis', 'tools/call', { name: 'bridge_subscription_status', arguments: {} });
   assert.equal(status.body.result.structuredContent.subscriptions[0].active, true);
   const before = f.posts.length;
