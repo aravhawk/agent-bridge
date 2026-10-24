@@ -25,9 +25,10 @@ export const TASK_TOOLS = [
       operation: { const: operation }, taskId: id, commandId: id, sequence: number,
       ...(operation === 'create' ? {} : { expectedRevision: number }), ...extra })) },
       notice: object({ messageId: id, sentAt: { type: 'string', format: 'date-time' }, expiresAt: { type: 'string', format: 'date-time' } }) })),
-  tool('bridge_task_get', 'Read current task DATA by known task ID under fresh data access. Never poll.', object({ taskId: id }), true),
+  tool('bridge_task_get', 'Read current task DATA and caller sequence; optionally recover one caller command by ID. Never poll.',
+    { ...object({ taskId: id, commandId: id }), required: ['taskId'] }, true),
   tool('bridge_task_from_notice', 'Resolve this exact native event message ID to current task DATA. Never claims an expired receipt.',
-    object({ messageId: id }), true),
+    { ...object({ messageId: id, commandId: id }), required: ['messageId'] }, true),
 ];
 const fail = (code, status = 503) => { throw new BridgeError(code, status); };
 
@@ -74,9 +75,11 @@ export class TaskIntegration {
     return notices.apply(principal, command, binding);
   }
   async get(principal, params) {
-    this.active(); ownKeys(params, ['taskId']); return this.kernel.get(principal, params.taskId);
+    this.active(); ownKeys(params, ['taskId', 'commandId'], ['taskId']);
+    return this.kernel.get(principal, params.taskId, params.commandId);
   }
   async getByMessageId(principal, params) {
-    this.active(); ownKeys(params, ['messageId']); return this.notices.getByMessageId(principal, params.messageId);
+    this.active(); ownKeys(params, ['messageId', 'commandId'], ['messageId']);
+    return this.notices.getByMessageId(principal, params.messageId, params.commandId);
   }
 }

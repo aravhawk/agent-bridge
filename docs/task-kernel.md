@@ -62,6 +62,21 @@ results. Matching recent commands return their original result before revision
 checking. Changed content conflicts; evicted sequences cannot reapply effects.
 Replay never renews a mutex. Use `get` for current state, not a historical reply.
 
+Both reads now add `task.caller: {role, nextSequence}` (the direct get returns
+the task itself). This is the authenticated caller's watermark, never the peer's
+history. Optional read argument `commandId` returns exactly one caller-owned
+receipt as `caller.command`: `committed` includes its sequence, original notice
+ID when present, and historical result; `unknown` means absent or evicted and
+does not prove noncommit. Recovered start results always set
+`operationRecorded: false`. No payload, hash, full journal or peer receipt is
+exposed. The latest canonical task/operation plus current revision and next
+sequence support crash recovery without private scratch files. Sequence is a
+snapshot, not a reservation; concurrent writers still meet the same revision
+and sequence fences. A null next sequence means numeric exhaustion; stop rather
+than guessing or resetting it. Exact replay still requires the exact original command
+and notice ID. Without that request, reconcile current state; never guess an
+old sequence or relaunch work from a recovered/historical result.
+
 Before launching independently authorized external work, `start` records one
 immutable UUID operation identity under the current mutex, atomically with its
 notice. Only a newly committed start returns `operationRecorded: true`. Exact

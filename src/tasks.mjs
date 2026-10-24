@@ -81,9 +81,18 @@ function output(task) {
     ...(task.externalOperation ? { operationId: task.externalOperation.id } : {}),
     ...(task.lease ? { attemptId: task.lease.id, leaseUntil: task.lease.until } : {}) };
 }
-function view(task) {
+function view(task, role, commandId) {
   const { commands, ...safe } = task;
-  return structuredClone(safe);
+  const history = commands[role], next = (history?.through || 0) + 1;
+  const entry = commandId === undefined ? undefined : history?.recent.find(item => item.id === commandId);
+  // Expose one caller-owned cached receipt, never peer journals or payloads.
+  // Missing history is ambiguous (including eviction), not proof of noncommit.
+  const recovery = commandId === undefined ? {} : { command: entry ? {
+    commandId, status: 'committed', sequence: entry.sequence,
+    ...(entry.noticeId ? { noticeMessageId: entry.noticeId } : {}),
+    result: { ...entry.result, ...(Object.hasOwn(entry.result, 'operationRecorded') ? { operationRecorded: false } : {}) },
+  } : { commandId, status: 'unknown' } };
+  return structuredClone({ ...safe, caller: { role, nextSequence: Number.isSafeInteger(next) ? next : null, ...recovery } });
 }
 export function validateTaskLimits(limits = {}) {
   if (!limits || typeof limits !== 'object' || Array.isArray(limits)) fail('task_kernel_configuration_required', 503);
@@ -133,18 +142,20 @@ export class TaskKernel {
         bytes(state) + tasks.reduce((sum, task) => sum + reserve(task), 0) > 4194304)
       fail('task_capacity_reached', 429);
   }
-  readState(state, principal, id) {
-    if (typeof id !== 'string' || !uuid.test(id)) fail('invalid_task_command', 400);
+  readState(state, principal, id, commandId) {
+    if (typeof id !== 'string' || !uuid.test(id) ||
+        (commandId !== undefined && (typeof commandId !== 'string' || !uuid.test(commandId))))
+      fail('invalid_task_command', 400);
     const now = this.now(), task = collection(state)?.tasks[id], retired = retiredTask(state, id);
     const access = this.decision(principal, { operation: 'read', taskId: id }, task || retired, now, state);
     checkTaskClock(state, now);
     if (retired) fail('task_retired', 410);
     if (!task) fail('task_not_found', 404);
     normalize(task, now);
-    return { task: view(task), role: access.role, ownerKey: access.ownerKey, now };
+    return { task: view(task, access.role, commandId), role: access.role, ownerKey: access.ownerKey, now };
   }
-  async get(principal, id) {
-    return this.store.transaction(state => this.readState(state, principal, id).task);
+  async get(principal, id, commandId) {
+    return this.store.transaction(state => this.readState(state, principal, id, commandId).task);
   }
   change(task, access, request, now) {
     const history = task?.commands[access.role];

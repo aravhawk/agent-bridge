@@ -12,11 +12,52 @@ import { MemoryStore } from '../src/store.mjs';
 import { emptyState } from '../src/store.mjs';
 import { TOPIC, createQueueAdapter } from '../src/queue.mjs';
 import queueHandler from '../api/queue.mjs';
+import { execFileSync } from 'node:child_process';
 
 const headers = { 'content-type': 'application/json', accept: 'application/json, text/event-stream' };
 process.env.BRIDGE_OAUTH_ISSUER = ISSUER;
 const request = (path, extra = {}) => new Request('https://jarvis-friday-bridge.aravhawk.com' + path,
   { method: 'POST', headers, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }), ...extra });
+test('activation entrypoint assembles once on MCP requests with fixed purge-off task options', () => {
+  // Isolated module hook tests only API composition. Actual policy/crypto/task
+  // behavior is exercised by task-runtime tests; no native call or secret read.
+  execFileSync(process.execPath, ['--input-type=module'], { input: `
+    import assert from 'node:assert/strict';
+    import { registerHooks } from 'node:module';
+    const calls = [];
+    globalThis.activationFixture = options => {
+      calls.push(options); return { handler: role => () => Response.json({ role }) };
+    };
+    globalThis.activationV1Fixture = { handler: () => () => { throw Error('unexpected fallback'); } };
+    registerHooks({
+      resolve(specifier, context, next) {
+        if (context.parentURL === ${JSON.stringify(new URL('../api/index.mjs', import.meta.url).href)} && specifier === '../src/runtime.mjs')
+          return { url: 'activation:fixture', shortCircuit: true };
+        return next(specifier, context);
+      },
+      load(url, context, next) {
+        return url === 'activation:fixture'
+          ? { format: 'module', source: 'export const createRuntime = globalThis.activationFixture; export const runtime = globalThis.activationV1Fixture;', shortCircuit: true }
+          : next(url, context);
+      }
+    });
+    const { handle } = await import(${JSON.stringify(new URL('../api/index.mjs', import.meta.url).href)});
+    const origin = 'https://jarvis-friday-bridge.aravhawk.com';
+    assert.equal(calls.length, 0);
+    assert.equal((await handle(new Request(origin + '/health'))).status, 200);
+    assert.equal((await handle(new Request(origin + '/bridge/jarvis/mcp', { method: 'POST' }))).status, 401);
+    assert.equal(calls.length, 0);
+    for (const role of ['jarvis', 'friday', 'jarvis']) {
+      const response = await handle(new Request(origin + '/bridge/' + role + '/mcp', {
+        method: 'POST', headers: { authorization: 'Bearer OFFLINE_ROUTER_FIXTURE' }
+      }));
+      assert.equal((await response.json()).role, role);
+    }
+    assert.deepEqual(calls, [{ taskData: {
+      enabled: true, leaseMs: 60000, linkRetentionMs: 172800000, purgeEnabled: false
+    } }]);
+  `, stdio: ['pipe', 'pipe', 'pipe'] });
+});
 test('public discovery challenges both resources and describes only the real provider', async () => {
   for (const role of ['friday', 'jarvis']) {
     const r = await handle(request(`/bridge/${role}/mcp`));

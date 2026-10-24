@@ -8,6 +8,7 @@ import { SCOPES } from '../src/policy.mjs';
 import { resourceFor } from '../src/resource.mjs';
 import { TOPIC } from '../src/queue.mjs';
 import { ISSUER } from './fixtures/provider.mjs';
+import { registerHooks } from 'node:module';
 
 const hour = 3600000, owner = 'offline-runtime-task-owner';
 const on = { enabled: true, leaseMs: 60000, linkRetentionMs: 48 * hour, purgeEnabled: false };
@@ -19,7 +20,7 @@ const errorCode = value => value.error?.message || data(value)?.error;
 
 // Actual runtime/verifier/PostgresStore/queue/worker, with a serialized fake SQL
 // connection and fake transports. No deployment/native catalog is contacted.
-async function fixture({ taskData, overrides = {}, stats = {} } = {}) {
+async function fixture({ taskData, overrides = {}, stats = {}, apiAssembly = false } = {}) {
   let now = Date.now(), document = emptyState(), tail = Promise.resolve();
   const sends = [], posts = [];
   const clock = () => now;
@@ -46,7 +47,7 @@ async function fixture({ taskData, overrides = {}, stats = {} } = {}) {
     FRIDAY_RECEIVER_ID: 'jarvis-friday-bridge-inbox', FRIDAY_WEBHOOK_URL: 'https://receiver.example.test/runtime-tasks',
     FRIDAY_WEBHOOK_KEY: 'OFFLINE_FIXTURE_ONLY', ...overrides };
   const { privateKey, publicKey } = await generateKeyPair('RS256');
-  const rt = createRuntime({ env, Pool, taskData, clock, keyResolver: publicKey,
+  const options = { env, Pool, taskData, clock, keyResolver: publicKey,
     queueClient: { async send(topic, payload, options) {
       assert.equal(topic, TOPIC);
       if (payload.dispatchMessageId) assert.equal(document.messages[payload.dispatchMessageId], undefined, 'native prearm precedes content');
@@ -57,19 +58,43 @@ async function fixture({ taskData, overrides = {}, stats = {} } = {}) {
       if (body.type === 'verification') return { status: 200, body: JSON.stringify({ challenge: body.challenge }) };
       posts.push({ recipient: url === env.FRIDAY_WEBHOOK_URL ? 'friday' : 'jarvis', body });
       return { status: 202 };
-    } });
+    } };
+  let rt = createRuntime(options);
+  let apiHandle;
+  if (apiAssembly) {
+    // Exercise the real API entrypoint and real verifier/runtime. Only its
+    // private constructor dependencies and default v1 singleton are fixtures.
+    const key = 'activation_' + randomUUID().replaceAll('-', ''), stub = 'activation:' + key;
+    const entry = new URL('../api/index.mjs', import.meta.url); entry.searchParams.set('fixture', key);
+    globalThis[key] = { createRuntime: supplied => { stats.assemblies = (stats.assemblies || 0) + 1;
+      return createRuntime({ ...options, ...supplied }); }, runtime: rt };
+    const hook = registerHooks({
+      resolve(specifier, context, next) {
+        return context.parentURL === entry.href && specifier === '../src/runtime.mjs'
+          ? { url: stub, shortCircuit: true } : next(specifier, context);
+      },
+      load(url, context, next) {
+        return url === stub ? { format: 'module', shortCircuit: true,
+          source: `const f=globalThis[${JSON.stringify(key)}]; export const createRuntime=f.createRuntime; export const runtime=f.runtime;` }
+          : next(url, context);
+      }
+    });
+    try { apiHandle = (await import(entry.href)).handle; } finally { hook.deregister(); delete globalThis[key]; }
+  }
   const sign = (role, scopes = Object.values(SCOPES[role])) => new SignJWT({ [env.BRIDGE_OAUTH_SCOPE_CLAIM || 'scope']: scopes.join(' ') })
     .setProtectedHeader({ alg: 'RS256' }).setIssuer(ISSUER).setSubject(owner).setAudience(resourceFor(role))
     .setIssuedAt(Math.floor(now / 1000)).setExpirationTime(Math.floor(now / 1000) + 96 * 3600).sign(privateKey);
   const tokens = { jarvis: await sign('jarvis'), friday: await sign('friday') };
-  const rpc = async (role, method, params, token = tokens[role], handler = rt.handler(role)) => {
+  const rpc = async (role, method, params, token = tokens[role], handler) => {
+    handler ||= apiHandle || rt.handler(role);
     const response = await handler(new Request(resourceFor(role), { method: 'POST', headers: {
       'content-type': 'application/json', authorization: 'Bearer ' + token },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) }));
     return { status: response.status, ...await response.json() };
   };
   const tool = (role, name, args, token) => rpc(role, 'tools/call', { name, arguments: args }, token);
-  return { rt, env, stats, sends, posts, sign, rpc, tool, clock, state: () => structuredClone(document),
+  return { get rt() { return rt; }, env, stats, sends, posts, sign, rpc, tool, clock, state: () => structuredClone(document),
+    restart: () => { rt = createRuntime(options); },
     advance: ms => { now += ms; },
     list: async role => (await rpc(role, 'tools/list', {})).result.tools,
     subscribe: () => rpc('jarvis', 'events/subscribe', { name: 'bridge.message.received', arguments: { recipient: 'jarvis' },
@@ -102,6 +127,68 @@ test('default/explicit-off runtime catalogs remain exactly v1 for both direction
   assert.deepEqual(off.state(), emptyState()); assert.equal(off.sends.length, 0); assert.equal(off.posts.length, 0);
 });
 
+test('real activation entrypoint enables tasks only with verified policy and preserves v1 on optional cold assembly failure', async () => {
+  const active = await fixture({ apiAssembly: true }), base = await fixture();
+  for (const role of ['jarvis', 'friday']) {
+    assert.deepEqual((await active.list(role)).filter(t => !names.includes(t.name)), await base.list(role));
+    assert.deepEqual((await active.list(role)).filter(t => names.includes(t.name)).map(t => t.name), names);
+  }
+  assert.equal(active.stats.assemblies, 1); assert.equal(active.stats.pools || 0, 0);
+  active.env.BRIDGE_DELIVERY_ENABLED = 'false';
+  assert.equal((await active.list('jarvis')).some(t => names.includes(t.name)), false);
+  assert.equal(data(await active.tool('jarvis', 'bridge_health', {})).authenticated, true);
+  for (const setting of [{ BRIDGE_DELIVERY_ENABLED: 'false' }, { BRIDGE_OAUTH_CONTRACT_VERIFIED: 'false' },
+    { FRIDAY_WEBHOOK_CONTRACT_VERIFIED: 'false' }, { BRIDGE_RECEIVER_POLICY: '' }]) {
+    const fallback = await fixture({ apiAssembly: true, overrides: setting });
+    for (const role of ['jarvis', 'friday']) {
+      assert.equal((await fallback.list(role)).some(t => names.includes(t.name)), false);
+      assert.equal(data(await fallback.tool(role, 'bridge_health', {})).authenticated, true);
+      assert.equal(errorCode(await fallback.tool(role, 'bridge_task_get', { taskId: randomUUID() })), 'tool_not_available');
+    }
+    // Existing withdrawal remains callable even with an unattested contract.
+    const unsub = await fallback.rpc('jarvis', 'events/unsubscribe', { name: 'bridge.message.received',
+      arguments: { recipient: 'jarvis' }, delivery: { mode: 'webhook', url: 'https://callback.example.test/runtime-tasks' } });
+    assert.equal(unsub.status, 200); assert.ok(unsub.result);
+    assert.equal(fallback.stats.assemblies, 1, 'failed optional assembly is cached as v1-only for this instance');
+  }
+});
+
+test('both roles recover an uncertain command and finish an existing run after runtime restart using only public reads', async () => {
+  const f = await fixture({ taskData: on }); await f.subscribe();
+  for (const coordinator of ['jarvis', 'friday']) {
+    const peer = coordinator === 'jarvis' ? 'friday' : 'jarvis', create = f.create(peer), firstNotice = f.notice();
+    const send = (role, command, notice = f.notice()) => f.tool(role, 'bridge_task_command', { command, notice });
+    await send(coordinator, create, firstNotice); f.restart();
+    const own = data(await f.tool(coordinator, 'bridge_task_get', { taskId: create.taskId, commandId: create.commandId }));
+    assert.equal(own.caller.nextSequence, 2); assert.equal(own.caller.command.status, 'committed');
+    assert.equal(own.caller.command.noticeMessageId, firstNotice.messageId);
+    const lookup = data(await f.tool(peer, 'bridge_task_from_notice', { messageId: firstNotice.messageId,
+      commandId: create.commandId }, await f.sign(peer, [SCOPES[peer].ack])));
+    assert.deepEqual(lookup.task.caller, { role: peer, nextSequence: 1,
+      command: { commandId: create.commandId, status: 'unknown' } });
+    const claimId = randomUUID();
+    await send(peer, { operation: 'claim', taskId: create.taskId, commandId: claimId,
+      sequence: lookup.task.caller.nextSequence, expectedRevision: lookup.task.revision });
+    f.restart();
+    const claimed = data(await f.tool(peer, 'bridge_task_get', { taskId: create.taskId, commandId: claimId }));
+    assert.equal(claimed.caller.command.status, 'committed');
+    const startId = randomUUID(), operationId = randomUUID();
+    assert.equal(data(await send(peer, { operation: 'start', taskId: create.taskId, commandId: startId,
+      sequence: claimed.caller.nextSequence, expectedRevision: claimed.revision,
+      attemptId: claimed.lease.id, epoch: claimed.epoch, operationId })).operationRecorded, true);
+    f.advance(2 * hour); f.restart();
+    const fresh = data(await f.tool(peer, 'bridge_task_from_notice', { messageId: firstNotice.messageId, commandId: startId })).task;
+    assert.equal(fresh.phase, 'reconciliation_required'); assert.equal(fresh.caller.command.result.operationRecorded, false);
+    assert.equal(fresh.externalOperation.id, operationId); assert.equal(fresh.caller.nextSequence, 3);
+    assert.equal(data(await send(peer, { operation: 'reconcile', taskId: fresh.id, commandId: randomUUID(),
+      sequence: fresh.caller.nextSequence, expectedRevision: fresh.revision, operationId: fresh.externalOperation.id,
+      runRef: 'synthetic-existing-run', outcome: 'succeeded', evidence: 'Synthetic existing result queried; no new launch.',
+      result: 'Recovered without scratch files.' })).phase, 'succeeded');
+    assert.equal(errorCode(await f.tool(peer, 'bridge_task_get', { taskId: fresh.id, commandId: [startId] })), 'invalid_task_command');
+    assert.equal(errorCode(await f.tool(peer, 'bridge_task_from_notice', { messageId: firstNotice.messageId, commandId: [startId] })), 'invalid_task_command');
+  }
+});
+
 test('explicit opt-in adds only three identical directional task catalogs and strict argument schemas without storage access', async () => {
   const active = await fixture({ taskData: on }), base = await fixture();
   const directional = [];
@@ -124,6 +211,8 @@ test('explicit opt-in adds only three identical directional task catalogs and st
     }
     assert.deepEqual(tasks[1].inputSchema.required, ['taskId']);
     assert.deepEqual(tasks[2].inputSchema.required, ['messageId']);
+    assert.equal(tasks[1].inputSchema.properties.commandId.format, 'uuid');
+    assert.equal(tasks[2].inputSchema.properties.commandId.format, 'uuid');
     for (const task of tasks) assert.equal(task.inputSchema.additionalProperties, false);
   }
   assert.deepEqual(directional[0], directional[1]); assert.equal(active.stats.pools || 0, 0);

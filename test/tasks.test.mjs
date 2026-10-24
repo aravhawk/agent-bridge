@@ -409,3 +409,56 @@ test('a prior-prototype blocked/lease_lost snapshot also needs explicit coordina
   await f.update('assign', jarvis, { assignee: 'friday' });
   assert.equal((await f.update('claim', friday)).phase, 'running');
 });
+
+test('after restart each role recovers its next sequence and only its own known command, without a private journal', async () => {
+  for (const coordinator of [jarvis, friday]) {
+    const assignee = coordinator === jarvis ? friday : jarvis;
+    const f = fixture({ authorize: p => ({ dataAllowed: true, ownerKey, role: p.role, coordinate: true }) });
+    const created = f.createCommand({ assignee: assignee.role }); await f.apply(coordinator, created); f.restart();
+    const recovered = await f.kernel.get(coordinator, f.taskId, created.commandId);
+    assert.equal(recovered.caller.role, coordinator.role); assert.equal(recovered.caller.nextSequence, 2);
+    assert.equal(recovered.caller.command.status, 'committed'); assert.equal(recovered.caller.command.sequence, 1);
+    const peer = await f.kernel.get(assignee, f.taskId, created.commandId);
+    assert.deepEqual(peer.caller, { role: assignee.role, nextSequence: 1,
+      command: { commandId: created.commandId, status: 'unknown' } });
+    const claimCommand = { operation: 'claim', taskId: f.taskId, commandId: randomUUID(),
+      sequence: peer.caller.nextSequence, expectedRevision: peer.revision };
+    const claimed = await f.apply(assignee, claimCommand); f.restart();
+    const fresh = await f.kernel.get(assignee, f.taskId, claimCommand.commandId);
+    assert.equal(fresh.caller.nextSequence, 2); assert.equal(fresh.caller.command.result.attemptId, claimed.attemptId);
+    // A subsequent command is constructed only from the public result.
+    await f.apply(assignee, { operation: 'progress', taskId: fresh.id, commandId: randomUUID(),
+      sequence: fresh.caller.nextSequence, expectedRevision: fresh.revision,
+      attemptId: fresh.lease.id, epoch: fresh.epoch, checkpoint: 'Recovered without scratch files.' });
+    assert.equal((await f.kernel.get(coordinator, f.taskId)).caller.nextSequence, 2);
+    assert.equal((await f.kernel.get(assignee, f.taskId)).caller.nextSequence, 3);
+    assert.equal('commands' in fresh, false); assert.equal('hash' in fresh.caller.command, false);
+  }
+});
+
+test('known-command recovery suppresses launch flags and an evicted receipt remains unknown, not permission to retry work', async () => {
+  const f = fixture({ limits: { replay: 2 } }); await f.create(); const claim = await f.update('claim', friday);
+  const operationId = randomUUID(), intent = f.updateCommand('start', friday, { ...fence(claim), operationId });
+  await f.apply(friday, intent); f.restart();
+  assert.equal((await f.kernel.get(friday, f.taskId, intent.commandId)).caller.command.result.operationRecorded, false);
+  await f.update('reconcile', friday, observation(operationId, { outcome: 'running' }));
+  await f.update('reconcile', friday, observation(operationId, { outcome: 'unknown' })); f.restart();
+  const read = await f.kernel.get(friday, f.taskId, intent.commandId);
+  assert.deepEqual(read.caller.command, { commandId: intent.commandId, status: 'unknown' });
+  assert.equal(read.caller.nextSequence, 5); assert.equal(read.externalOperation.id, operationId);
+  await assert.rejects(f.update('claim', friday), code('task_reconciliation_required'));
+  await f.apply(friday, { operation: 'reconcile', taskId: f.taskId, commandId: randomUUID(),
+    sequence: read.caller.nextSequence, expectedRevision: read.revision, ...observation(operationId) });
+  const before = f.store.snapshot();
+  for (const commandId of [[intent.commandId], null, 'wrong'])
+    await assert.rejects(f.kernel.get(friday, f.taskId, commandId), code('invalid_task_command'));
+  assert.deepEqual(f.store.snapshot(), before);
+});
+
+test('the same command ID in both role histories resolves only within the authenticated caller history', async () => {
+  const f = fixture(), create = f.createCommand(); await f.apply(jarvis, create);
+  await f.apply(friday, f.updateCommand('claim', friday, { commandId: create.commandId })); f.restart();
+  const a = await f.kernel.get(jarvis, f.taskId, create.commandId), b = await f.kernel.get(friday, f.taskId, create.commandId);
+  assert.equal(a.caller.command.result.phase, 'queued'); assert.equal(b.caller.command.result.phase, 'running');
+  assert.equal(a.caller.role, 'jarvis'); assert.equal(b.caller.role, 'friday');
+});
