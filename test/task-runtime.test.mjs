@@ -1,0 +1,231 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { generateKeyPair, SignJWT } from 'jose';
+import { createRuntime } from '../src/runtime.mjs';
+import { emptyState } from '../src/store.mjs';
+import { SCOPES } from '../src/policy.mjs';
+import { resourceFor } from '../src/resource.mjs';
+import { TOPIC } from '../src/queue.mjs';
+import { ISSUER } from './fixtures/provider.mjs';
+
+const hour = 3600000, owner = 'offline-runtime-task-owner';
+const on = { enabled: true, leaseMs: 60000, linkRetentionMs: 48 * hour, purgeEnabled: false };
+const names = ['bridge_task_command', 'bridge_task_get', 'bridge_task_from_notice'];
+const ordinary = ['bridge_health', 'bridge_read', 'bridge_receipt_claim', 'bridge_receipt_complete', 'bridge_status', 'bridge_message_send'];
+const code = expected => error => error.code === expected;
+const data = value => value.result?.structuredContent;
+const errorCode = value => value.error?.message || data(value)?.error;
+
+// Actual runtime/verifier/PostgresStore/queue/worker, with a serialized fake SQL
+// connection and fake transports. No deployment/native catalog is contacted.
+async function fixture({ taskData, overrides = {}, stats = {} } = {}) {
+  let now = Date.now(), document = emptyState(), tail = Promise.resolve();
+  const sends = [], posts = [];
+  const clock = () => now;
+  class Pool {
+    constructor() { stats.pools = (stats.pools || 0) + 1; }
+    on() {} async end() {}
+    async connect() {
+      const previous = tail; let unlock; tail = new Promise(resolve => { unlock = resolve; }); await previous;
+      let pending;
+      return { release() { unlock(); }, async query(sql, args) {
+        if (sql === 'BEGIN') pending = structuredClone(document);
+        if (sql.startsWith('SELECT document')) return { rows: [{ document: structuredClone(pending) }] };
+        if (sql.startsWith('UPDATE bridge_runtime_v1')) pending = JSON.parse(args[0]);
+        if (sql === 'COMMIT') document = pending;
+        return { rows: [] };
+      } };
+    }
+  }
+  const env = { BRIDGE_OAUTH_ISSUER: ISSUER, BRIDGE_ALLOWED_SUBJECT_SHA256: createHash('sha256').update(owner).digest('hex'),
+    BRIDGE_OAUTH_CONTRACT_VERIFIED: 'true', BRIDGE_SUBSCRIPTIONS_ENABLED: 'true', BRIDGE_DELIVERY_ENABLED: 'true',
+    BRIDGE_SUBSCRIPTION_STORAGE_KEY: randomBytes(32).toString('base64'),
+    DATABASE_URL: 'postgresql://fixture.neon.tech/neondb?sslmode=require',
+    BRIDGE_RECEIVER_POLICY: 'inbox-v1', FRIDAY_WEBHOOK_CONTRACT_VERIFIED: 'true',
+    FRIDAY_RECEIVER_ID: 'jarvis-friday-bridge-inbox', FRIDAY_WEBHOOK_URL: 'https://receiver.example.test/runtime-tasks',
+    FRIDAY_WEBHOOK_KEY: 'OFFLINE_FIXTURE_ONLY', ...overrides };
+  const { privateKey, publicKey } = await generateKeyPair('RS256');
+  const rt = createRuntime({ env, Pool, taskData, clock, keyResolver: publicKey,
+    queueClient: { async send(topic, payload, options) {
+      assert.equal(topic, TOPIC);
+      if (payload.dispatchMessageId) assert.equal(document.messages[payload.dispatchMessageId], undefined, 'native prearm precedes content');
+      sends.push({ payload, options });
+    }, handleCallback: handler => handler },
+    transportFactory: () => async (url, request) => {
+      const body = JSON.parse(request.body);
+      if (body.type === 'verification') return { status: 200, body: JSON.stringify({ challenge: body.challenge }) };
+      posts.push({ recipient: url === env.FRIDAY_WEBHOOK_URL ? 'friday' : 'jarvis', body });
+      return { status: 202 };
+    } });
+  const sign = (role, scopes = Object.values(SCOPES[role])) => new SignJWT({ [env.BRIDGE_OAUTH_SCOPE_CLAIM || 'scope']: scopes.join(' ') })
+    .setProtectedHeader({ alg: 'RS256' }).setIssuer(ISSUER).setSubject(owner).setAudience(resourceFor(role))
+    .setIssuedAt(Math.floor(now / 1000)).setExpirationTime(Math.floor(now / 1000) + 96 * 3600).sign(privateKey);
+  const tokens = { jarvis: await sign('jarvis'), friday: await sign('friday') };
+  const rpc = async (role, method, params, token = tokens[role], handler = rt.handler(role)) => {
+    const response = await handler(new Request(resourceFor(role), { method: 'POST', headers: {
+      'content-type': 'application/json', authorization: 'Bearer ' + token },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) }));
+    return { status: response.status, ...await response.json() };
+  };
+  const tool = (role, name, args, token) => rpc(role, 'tools/call', { name, arguments: args }, token);
+  return { rt, env, stats, sends, posts, sign, rpc, tool, clock, state: () => structuredClone(document),
+    advance: ms => { now += ms; },
+    list: async role => (await rpc(role, 'tools/list', {})).result.tools,
+    subscribe: () => rpc('jarvis', 'events/subscribe', { name: 'bridge.message.received', arguments: { recipient: 'jarvis' },
+      ttlMs: null, delivery: { mode: 'webhook', url: 'https://callback.example.test/runtime-tasks',
+        secret: 'whsec_' + randomBytes(32).toString('base64') } }),
+    create: assignee => ({ operation: 'create', taskId: randomUUID(), commandId: randomUUID(), sequence: 1,
+      assignee, description: 'Offline runtime teamwork data.', deadline: now + 72 * hour }),
+    notice: () => ({ messageId: randomUUID(), sentAt: new Date(now).toISOString(), expiresAt: new Date(now + hour).toISOString() }),
+    update: (taskId, role, operation, extra = {}) => {
+      const task = document.collaboration.tasks[taskId];
+      return { operation, taskId, commandId: randomUUID(), sequence: (task.commands[role]?.through || 0) + 1,
+        expectedRevision: task.revision, ...extra };
+    },
+    consume: payload => rt.queueHandler()(payload, { topicName: TOPIC, region: 'iad1', deliveryCount: 1 }),
+  };
+}
+
+test('default/explicit-off runtime catalogs remain exactly v1 for both directions; env/request flags cannot enable tasks', async () => {
+  const normal = await fixture(), off = await fixture({ taskData: { enabled: false }, overrides: {
+    BRIDGE_TASK_DATA_ENABLED: 'true', BRIDGE_TASK_PURGE_ENABLED: 'true' } });
+  for (const role of ['jarvis', 'friday']) {
+    const a = await normal.list(role), b = await off.list(role);
+    assert.deepEqual(a, b);
+    assert.deepEqual(a.map(t => t.name).sort(), [...ordinary, ...(role === 'jarvis' ?
+      ['bridge_subscription_status', 'bridge_friday_webhook_diagnostic'] : [])].sort());
+    for (const name of names) assert.equal(errorCode(await off.tool(role, name, {})), 'tool_not_available');
+    assert.equal(errorCode(await off.rpc(role, 'tools/list', { taskData: on })), 'invalid_params');
+  }
+  assert.equal(normal.stats.pools || 0, 0); assert.equal(off.stats.pools || 0, 0);
+  assert.deepEqual(off.state(), emptyState()); assert.equal(off.sends.length, 0); assert.equal(off.posts.length, 0);
+});
+
+test('explicit opt-in adds only three identical directional task catalogs and strict argument schemas without storage access', async () => {
+  const active = await fixture({ taskData: on }), base = await fixture();
+  const directional = [];
+  for (const role of ['jarvis', 'friday']) {
+    const catalog = await active.list(role), tasks = catalog.filter(t => names.includes(t.name));
+    assert.deepEqual(catalog.filter(t => !names.includes(t.name)), await base.list(role));
+    assert.deepEqual(tasks.map(t => t.name), names); directional.push(tasks);
+    const schema = tasks[0].inputSchema;
+    assert.equal(schema.additionalProperties, false); assert.deepEqual(schema.required, ['command', 'notice']);
+    assert.deepEqual(schema.properties.notice.required, ['messageId', 'sentAt', 'expiresAt']);
+    assert.equal(schema.properties.notice.additionalProperties, false);
+    const commands = schema.properties.command.oneOf;
+    assert.deepEqual(commands.map(c => c.properties.operation.const).sort(), ['assign', 'block', 'cancel', 'claim', 'create', 'finish', 'progress', 'reconcile', 'start']);
+    for (const command of commands) {
+      assert.equal(command.additionalProperties, false);
+      assert.deepEqual(command.required, Object.keys(command.properties));
+      assert.equal(command.properties.taskId.format, 'uuid'); assert.equal(command.properties.commandId.format, 'uuid');
+      assert.equal(command.properties.sequence.minimum, 1);
+      assert.equal(command.required.includes('expectedRevision'), command.properties.operation.const !== 'create');
+    }
+    assert.deepEqual(tasks[1].inputSchema.required, ['taskId']);
+    assert.deepEqual(tasks[2].inputSchema.required, ['messageId']);
+    for (const task of tasks) assert.equal(task.inputSchema.additionalProperties, false);
+  }
+  assert.deepEqual(directional[0], directional[1]); assert.equal(active.stats.pools || 0, 0);
+  assert.deepEqual(active.state(), emptyState()); assert.equal(active.sends.length, 0);
+});
+
+test('opt-in actual runtime assembles both task directions through prearm, event ID, fresh read and claim/checkpoint/result', async () => {
+  const f = await fixture({ taskData: on }); assert.ok((await f.subscribe()).result.id);
+  for (const role of ['jarvis', 'friday']) {
+    const peer = role === 'jarvis' ? 'friday' : 'jarvis', command = f.create(peer), notice = f.notice();
+    const send = async (actor, request, n = f.notice()) => f.tool(actor, 'bridge_task_command', { command: request, notice: n });
+    assert.equal(data(await send(role, command, notice)).phase, 'queued');
+    const envelope = f.state().messages[notice.messageId].envelope;
+    assert.equal(envelope.from, role); assert.equal(envelope.to, peer); assert.equal(envelope.threadId, command.taskId);
+    await f.consume({ dispatchMessageId: notice.messageId }); await f.consume({ dispatchMessageId: notice.messageId });
+    const event = f.posts.at(-1); assert.equal(event.recipient, peer); assert.equal(event.body.data.messageId, notice.messageId);
+    assert.equal(event.body.event || event.body.name, 'bridge.message.received');
+    f.advance(100 * 60000);
+    const read = await f.tool(peer, 'bridge_task_from_notice', { messageId: event.body.data.messageId }, await f.sign(peer, [SCOPES[peer].ack]));
+    assert.equal(data(read).task.phase, 'queued'); assert.equal(data(read).task.id, command.taskId);
+    assert.equal(data(await f.tool(peer, 'bridge_read', { messageId: notice.messageId })).expired, true);
+    assert.equal(errorCode(await f.tool(peer, 'bridge_receipt_claim', { messageId: notice.messageId })), 'message_authorization_inactive');
+    const claim = data(await send(peer, f.update(command.taskId, peer, 'claim')));
+    const fence = { attemptId: claim.attemptId, epoch: claim.epoch };
+    assert.equal(claim.phase, 'running');
+    assert.equal(data(await send(peer, f.update(command.taskId, peer, 'progress', { ...fence, checkpoint: 'Runtime checkpoint.' }))).phase, 'running');
+    const operationId = randomUUID(), start = f.update(command.taskId, peer, 'start', { ...fence, operationId }), intentNotice = f.notice();
+    assert.equal(data(await send(peer, start, intentNotice)).operationRecorded, true);
+    f.advance(2 * hour); // Existing native work outlives the short mutex; the fixture never relaunches it.
+    const current = data(await f.tool(peer, 'bridge_task_get', { taskId: command.taskId }, await f.sign(peer)));
+    assert.equal(current.phase, 'reconciliation_required'); assert.equal(current.externalOperation.id, operationId);
+    assert.equal(errorCode(await send(peer, f.update(command.taskId, peer, 'claim'))), 'task_reconciliation_required');
+    assert.equal(data(await send(peer, start, intentNotice)).operationRecorded, false);
+    const finished = data(await send(peer, f.update(command.taskId, peer, 'reconcile', {
+      operationId, runRef: 'synthetic-runtime-existing-run', outcome: 'succeeded',
+      evidence: 'Synthetic existing-run result verified by the local workflow fixture.', result: 'Runtime reported result.' })));
+    await f.consume({ dispatchMessageId: finished.noticeMessageId });
+    const resultEvent = f.posts.at(-1); assert.equal(resultEvent.recipient, role);
+    const resolved = data(await f.tool(role, 'bridge_task_from_notice', { messageId: resultEvent.body.data.messageId })).task;
+    assert.equal(resolved.result.text, 'Runtime reported result.'); assert.equal(resolved.checkpoint.text, 'Runtime checkpoint.');
+    assert.equal(resolved.result.evidenceStatus, 'reported_not_independently_verified');
+  }
+  assert.deepEqual(f.state().receipts, {}); assert.equal(f.state().collaboration.retiredTasks, undefined);
+  assert.equal(f.state().collaboration.taskIdentity, undefined);
+});
+
+test('opt-in rejects absent or unverified policy before constructing storage or exposing a catalog', async () => {
+  for (const overrides of [{ BRIDGE_OAUTH_ISSUER: undefined }, { BRIDGE_ALLOWED_SUBJECT_SHA256: undefined },
+    { BRIDGE_OAUTH_CONTRACT_VERIFIED: 'false' }, { BRIDGE_RECEIVER_POLICY: '' },
+    { FRIDAY_WEBHOOK_CONTRACT_VERIFIED: 'false' }, { BRIDGE_DELIVERY_ENABLED: 'false' }]) {
+    const stats = {};
+    await assert.rejects(fixture({ taskData: on, overrides, stats }), code('task_runtime_policy_required'));
+    assert.equal(stats.pools || 0, 0);
+  }
+  for (const overrides of [{ BRIDGE_ALLOWED_SUBJECT: owner }, { BRIDGE_OAUTH_SCOPE_CLAIM: 'unverified_claim' }])
+    await assert.rejects(fixture({ taskData: on, overrides }), code('task_access_configuration_required'));
+});
+
+test('runtime opt-in is strict, server-bound and refuses permanent purge independently', async () => {
+  for (const taskData of [{ ...on, purgeEnabled: true }, { ...on, purgeEnabled: 'false' }, { ...on, retention: {} }])
+    await assert.rejects(fixture({ taskData }), code('task_purge_not_enabled'));
+  for (const taskData of [true, [], { ...on, enabled: 'true' }, { enabled: true }, { ...on, policy: {} }, { ...on, ownerKey: 'a'.repeat(64) }])
+    await assert.rejects(fixture({ taskData }), code('task_runtime_configuration_required'));
+});
+
+test('every accepted option bound is validated before advertising a catalog or constructing storage', async () => {
+  for (const extra of [{ maxLinks: 0 }, { maxLinks: 1001 }, { maxLinksPerTask: 0 }, { maxLinksPerTask: 33 }]) {
+    const stats = {};
+    await assert.rejects(fixture({ taskData: { ...on, ...extra }, stats }), code('task_notice_configuration_required'));
+    assert.equal(stats.pools || 0, 0);
+  }
+  for (const limits of [null, [], { tasks: 0 }, { tasks: 101 }, { bytes: 1048577 }, { taskBytes: 16385 }, { replay: 33 }, { unknown: 1 }]) {
+    const stats = {};
+    await assert.rejects(fixture({ taskData: { ...on, limits }, stats }), code('task_kernel_configuration_required'));
+    assert.equal(stats.pools || 0, 0);
+  }
+  const valid = await fixture({ taskData: { ...on, limits: { tasks: 2, replay: 2 }, maxLinks: 4, maxLinksPerTask: 3 } });
+  assert.equal((await valid.list('friday')).filter(t => names.includes(t.name)).length, 3);
+  assert.equal(valid.stats.pools || 0, 0);
+});
+
+test('opt-in runtime rejects catalog-incompatible arguments in both directions without queue publication or task mutation', async () => {
+  const f = await fixture({ taskData: on });
+  for (const role of ['jarvis', 'friday']) {
+    for (const [name, args, expected] of [
+      ['bridge_task_get', { taskId: 'not-a-uuid' }, 'invalid_task_command'],
+      ['bridge_task_get', { taskId: randomUUID(), ownerKey: 'a'.repeat(64) }, 'invalid_params'],
+      ['bridge_task_from_notice', { messageId: 'not-a-uuid' }, 'invalid_task_notice'],
+      ['bridge_task_command', { command: { ...f.create('friday'), operation: 'unknown' }, notice: f.notice() }, 'invalid_task_command'],
+      ['bridge_task_command', { command: f.create('friday'), notice: { ...f.notice(), from: role } }, 'invalid_params'],
+    ]) assert.equal(errorCode(await f.tool(role, name, args)), expected);
+  }
+  assert.deepEqual(f.state(), emptyState()); assert.equal(f.sends.length, 0); assert.equal(f.posts.length, 0);
+});
+
+test('an existing opt-in handler closes task discovery/calls if verified runtime policy is withdrawn', async () => {
+  const f = await fixture({ taskData: on }), handler = f.rt.handler('jarvis');
+  const list = () => f.rpc('jarvis', 'tools/list', {}, undefined, handler);
+  assert.equal((await list()).result.tools.filter(t => names.includes(t.name)).length, 3);
+  f.env.FRIDAY_WEBHOOK_CONTRACT_VERIFIED = 'false';
+  assert.equal((await list()).result.tools.some(t => names.includes(t.name)), false);
+  assert.equal(errorCode(await f.rpc('jarvis', 'tools/call', { name: 'bridge_task_get', arguments: { taskId: randomUUID() } },
+    undefined, handler)), 'tool_not_available');
+  assert.equal(f.stats.pools || 0, 0); assert.deepEqual(f.state(), emptyState());
+});
