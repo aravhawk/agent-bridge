@@ -5,7 +5,7 @@ import { Bridge } from '../src/bridge.mjs';
 import { MemoryStore } from '../src/store.mjs';
 import { NativeEvents } from '../src/events.mjs';
 import { createProtector } from '../src/webhook.mjs';
-import { VERIFIED_AUTHORIZATION, SCOPES } from '../src/policy.mjs';
+import { VERIFIED_AUTHORIZATION, SCOPES, BridgeError } from '../src/policy.mjs';
 import { DeliveryWorker } from '../src/worker.mjs';
 import { createFridaySender } from '../src/friday-sender.mjs';
 import { createQueueAdapter, TOPIC } from '../src/queue.mjs';
@@ -42,9 +42,102 @@ function fixture() {
   }
   const metadata = (deliveryCount, extra = {}) => ({ topicName: TOPIC, region: 'iad1', deliveryCount,
     messageId: 'queue_FIXTURE_initial', createdAt: new Date(start), expiresAt: new Date(start + hour), ...extra });
-  return { store, bridge, jarvis, friday, who, subscribe, message, complete, clock, queue, metadata, posts, published,
+  return { store, protector, bridge, jarvis, friday, who, subscribe, message, complete, clock, queue, metadata, posts, published,
     advance: ms => { now += ms; }, offline: value => { offline = value; } };
 }
+
+test('normal Jarvis callback records HTTP attempts separately from worker attempts and recipient completion', async () => {
+  const f = fixture(); await f.subscribe();
+  const m = { ...f.message(), from: 'friday', to: 'jarvis' };
+  const sent = await f.bridge.sendMessage(f.friday, m);
+  const calls = [];
+  const options = { store: f.store, protector: f.protector, clock: f.clock, enabled: true,
+    policyId: policyIds.jarvis, messagePolicyIds: policyIds,
+    accessAllowed: async () => true, transport: async (_url, request) => {
+      calls.push(request); return { status: calls.length === 1 ? 503 : 202 };
+    } };
+  const first = await new DeliveryWorker(options).run(sent.jobIds[0]);
+  assert.equal(first.transportAccepted, false);
+  let status = await f.bridge.status(f.jarvis, { messageId: m.id });
+  assert.equal(status.deliveries[0].transportAttempts, 1);
+  assert.deepEqual(status.deliveries[0].firstTransportOutcome, {
+    at: start, workerAttempt: 1, status: 503, error: 'transient_http', terminal: false,
+  });
+  assert.equal(status.receiptCompleted, false); assert.equal(status.wakeVerified, false);
+  assert.equal((await new DeliveryWorker(options).run(sent.jobIds[0])).attempted, false);
+  f.advance(1000);
+  assert.equal((await new DeliveryWorker(options).run(sent.jobIds[0])).transportAccepted, true);
+  status = await f.bridge.status(f.jarvis, { messageId: m.id });
+  assert.equal(status.deliveries[0].transportAttempts, 2);
+  assert.equal(status.deliveries[0].attempts, 2);
+  assert.equal(status.deliveries[0].lastStatus, 202);
+  assert.equal(status.deliveries[0].firstTransportOutcome.status, 503);
+  assert.equal(status.receiptCompleted, false); assert.equal(status.wakeVerified, false);
+  assert.equal(calls[0].body, calls[1].body);
+  assert.equal(calls[0].headers['webhook-id'], calls[1].headers['webhook-id']);
+  await new DeliveryWorker(options).run(sent.jobIds[0]);
+  assert.equal(calls.length, 2, 'accepted transport is never replayed to chase a missing receipt');
+});
+
+test('Jarvis callback timeout evidence survives restart, while pre-transport storage failures are not HTTP attempts', async () => {
+  const f = fixture(); await f.subscribe();
+  const m = { ...f.message(), from: 'friday', to: 'jarvis' };
+  const sent = await f.bridge.sendMessage(f.friday, m);
+  let checks = 0, calls = 0;
+  const options = { store: f.store, protector: f.protector, clock: f.clock, enabled: true,
+    policyId: policyIds.jarvis, messagePolicyIds: policyIds,
+    accessAllowed: async () => {
+      if (++checks === 1) throw new BridgeError('storage_unavailable', 503);
+      return true;
+    }, transport: async () => {
+      if (++calls === 1) throw new BridgeError('callback_timeout', 503);
+      return { status: 202 };
+    } };
+  await new DeliveryWorker(options).run(sent.jobIds[0]);
+  let job = f.store.snapshot().jobs[sent.jobIds[0]];
+  assert.equal(job.transportAttempts, undefined); assert.equal(job.firstTransportOutcome, undefined);
+  f.advance(1000);
+  await new DeliveryWorker(options).run(sent.jobIds[0]);
+  job = f.store.snapshot().jobs[sent.jobIds[0]];
+  assert.equal(job.transportAttempts, 1);
+  assert.deepEqual(job.firstTransportOutcome, {
+    at: start + 1000, workerAttempt: 2, status: null, error: 'transport_transient', terminal: false,
+  });
+  f.advance(2000);
+  const restarted = new MemoryStore(f.store.snapshot());
+  await new DeliveryWorker({ ...options, store: restarted }).run(sent.jobIds[0]);
+  const saved = restarted.snapshot().jobs[sent.jobIds[0]];
+  assert.equal(saved.state, 'accepted'); assert.equal(saved.transportAttempts, 2);
+  assert.deepEqual(saved.firstTransportOutcome, job.firstTransportOutcome);
+  assert.equal(saved.attempts, 3); assert.equal(calls, 2);
+});
+
+test('an accepted ACK can expire before hosted handling without retransmission or renewed receipt authority', async () => {
+  const f = fixture(); await f.subscribe();
+  const m = f.message(); await f.bridge.sendMessage(f.jarvis, m);
+  f.advance(44000);
+  const claim = await f.bridge.claim(f.friday, { messageId: m.id });
+  const done = await f.complete(m.id, claim.claimId);
+  const ackId = done.ackMessageId;
+  const read = await f.bridge.read(f.jarvis, { messageId: ackId });
+  assert.equal(read.receivedAt, new Date(start + 44000).toISOString(), 'receivedAt is server storage time');
+  assert.equal(read.envelope.expiresAt, m.expiresAt); assert.equal(read.expired, false);
+  await f.queue().consume({ dispatchReceiptOf: m.id }, f.metadata(1));
+  let status = await f.bridge.status(f.jarvis, { messageId: ackId });
+  assert.equal(status.deliveries[0].state, 'accepted');
+  assert.equal(status.deliveries[0].transportAttempts, 1);
+  assert.equal(status.receiptCompleted, false); assert.equal(status.wakeVerified, false);
+  f.advance(hour + 1);
+  const before = f.store.snapshot();
+  assert.equal((await f.bridge.read(f.jarvis, { messageId: ackId })).expired, true);
+  await assert.rejects(f.bridge.claim(f.jarvis, { messageId: ackId }), error('message_authorization_inactive'));
+  await f.queue(new MemoryStore(before)).consume({ dispatchReceiptOf: m.id }, f.metadata(2));
+  assert.equal(f.posts.length, 1);
+  assert.equal(f.store.snapshot().receipts[ackId], undefined);
+  assert.equal(Object.keys(f.store.snapshot().messages).length, 2);
+  status = await f.bridge.status(f.jarvis, { messageId: m.id });
+  assert.equal(status.receiptCompleted, true); assert.equal(status.ackMessageId, ackId);
+});
 
 test('missing, short, wrong-owner, stale-policy, revoked and expired return leases reject before publication or admission', async () => {
   for (const mode of ['missing', 'short', 'owner', 'policy', 'denied', 'unsubscribed', 'expired']) {

@@ -97,16 +97,20 @@ export class DeliveryWorker {
             if (!subscriptionAccessAllowed(current, current.subscription, this.policyId, when))
               throw new BridgeError('authorization_lease_expired', 403);
             const secrets = [config.secret, ...(config.previous || []).filter(x => x.until > when).map(x => x.secret)];
+            const headers = signedHeaders({ id: job.eventId, body: job.body, secrets, subscriptionId: subscription.id, now: when });
             transportStarted = true;
-            response = await this.transport(config.url, { body: job.body,
-              headers: signedHeaders({ id: job.eventId, body: job.body, secrets, subscriptionId: subscription.id, now: when }) });
+            // Ordinary signed callbacks have no adapter outcome marker. Record
+            // the invocation, including a timeout, without implying host wake.
+            // A restricted adapter's terminal marker still takes precedence.
+            transportOutcome = { terminal: false };
+            response = await this.transport(config.url, { body: job.body, headers });
           } else {
             if (!this.fridaySender) throw new BridgeError('friday_native_contract_unverified', 503);
             transportStarted = true;
             response = await this.fridaySender(job);
           }
           status = response.status;
-          transportOutcome = response[DELIVERY_TRANSPORT_OUTCOME] || null;
+          transportOutcome = response[DELIVERY_TRANSPORT_OUTCOME] || transportOutcome;
           accepted = status >= 200 && status < 300;
           retry = !accepted && transient(status) && transportOutcome?.terminal !== true;
           code = accepted ? null : transient(status) ? 'transient_http' : 'permanent_http';
@@ -117,7 +121,7 @@ export class DeliveryWorker {
       // permission or sent anything. Keep this work pending within the existing
       // attempt/backoff budget; every retry must pass all authorization fences.
       // Configuration, encryption and public-address rejection remain terminal.
-      transportOutcome = error?.[DELIVERY_TRANSPORT_OUTCOME] || null;
+      transportOutcome = error?.[DELIVERY_TRANSPORT_OUTCOME] || transportOutcome;
       const storageUnavailable = !transportStarted && error instanceof BridgeError && error.code === 'storage_unavailable';
       const transientError = ['callback_timeout', 'callback_transport_failed', 'callback_dns_failed'].includes(error?.code);
       retry = (storageUnavailable || transientError) && transportOutcome?.terminal !== true;

@@ -189,8 +189,13 @@ test('expired worker cannot overwrite accepted state after another worker reclai
   const first = slow.run(queued.jobIds[0]); await ready; f.advance(30001);
   const second = await new DeliveryWorker({ ...f, enabled: true, accessAllowed: async () => true }).run(queued.jobIds[0]);
   assert.equal(second.transportAccepted, true);
+  const accepted = f.store.snapshot().jobs[queued.jobIds[0]];
+  assert.equal(accepted.transportAttempts, 1);
+  assert.equal(accepted.firstTransportOutcome.workerAttempt, 2);
+  assert.equal(accepted.firstTransportOutcome.status, 202);
   finish({ status: 503, body: '' }); assert.equal((await first).committed, false);
-  assert.equal(f.store.snapshot().jobs[queued.jobIds[0]].state, 'accepted');
+  assert.equal(accepted.state, 'accepted');
+  assert.deepEqual(f.store.snapshot().jobs[queued.jobIds[0]], accepted);
 });
 test('receipt claims fence concurrent/expired turns; completion+ACK survives restart and duplicate completion', async () => {
   const f = await fixture(); const q = await f.bridge.send(friday, probe());

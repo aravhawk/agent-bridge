@@ -72,6 +72,14 @@ atomic transaction with this database. After a timeout, duplicate event delivery
 or a reclaimed claim can repeat hosted handling; consumers must respect the
 policy and actual current claim.
 
+`bridge_status` separates worker attempts from fenced transport invocations in
+both directions, including callback timeouts. An invocation can fail before an
+HTTP request reaches the host. Only a committed result contributes to these
+counters; they are not a complete transport log, and older missing observations
+are not backfilled. Acceptance is independent of `receiptCompleted` and never
+sets `wakeVerified`. The `receivedAt` returned by `bridge_read` is the message's
+server storage time, not a native event or hosted execution timestamp.
+
 ## Error and recovery semantics
 
 The [MCP tool error contract](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#error-handling)
