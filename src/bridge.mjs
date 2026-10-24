@@ -81,7 +81,7 @@ export class Bridge {
       return insert(state, envelope, hash, this.clock(), authorization);
     });
   }
-  async sendMessage(principal, input) {
+  async prepareMessageSend(principal, input) {
     if (!this.dailyEnabled) fail('daily_messages_not_enabled', 503);
     if (input?.kind === 'ack') fail('use_receipt_complete_for_ack');
     // Reserve native backend work BEFORE creating any content. If publishing
@@ -112,22 +112,30 @@ export class Bridge {
       return { id: validated.envelope.id, fresh: !prior };
     });
     if (preparation.fresh && this.prepareMessage) await this.prepareMessage(preparation.id);
-    return this.store.transaction(state => {
-      const now = this.clock(); retainMessages(state, now);
-      const id = typeof input?.id === 'string' ? input.id.toLowerCase() : '';
-      const prior = state.messages[id] || state.messageIds?.[id];
-      const { envelope, hash } = validateMessage(input, principal, prior ? Date.parse(input.sentAt) : now);
-      if (prior && prior.hash !== hash) fail('message_id_conflict', 409);
-      if (this.canary) { canaryEnvelope(envelope, this.canary); reserveCanary(state, this.canary, principal, hash, !!prior, now); }
-      if (prior) return state.messages[id]
-        ? { messageId: id, queued: true, duplicate: true, jobIds: state.messages[id].jobIds }
-        : { messageId: id, queued: false, duplicate: true, expired: true, jobIds: [] };
-      if (Date.parse(envelope.expiresAt) <= now) fail('message_expired', 403);
-      const authorization = verifiedMessageAuthorization(principal, envelope, now, this.deliveryUntil);
-      requireAckPath(state, envelope, authorization, this.messagePolicyIds, now, this.canary?.subscriptionId);
-      delete state.messagePreparations?.[envelope.id];
-      return insert(state, envelope, hash, now, authorization, this.canary ? { maxAttempts: 1 } : undefined);
-    });
+  }
+  // Synchronous final insertion shared by ordinary v1 sends and the disabled
+  // task prototype. Call only after prepareMessageSend has successfully prearmed.
+  stageMessage(state, principal, input) {
+    if (!this.dailyEnabled) fail('daily_messages_not_enabled', 503);
+    if (input?.kind === 'ack') fail('use_receipt_complete_for_ack');
+    const now = this.clock(); retainMessages(state, now);
+    const id = typeof input?.id === 'string' ? input.id.toLowerCase() : '';
+    const prior = state.messages[id] || state.messageIds?.[id];
+    const { envelope, hash } = validateMessage(input, principal, prior ? Date.parse(input.sentAt) : now);
+    if (prior && prior.hash !== hash) fail('message_id_conflict', 409);
+    if (this.canary) { canaryEnvelope(envelope, this.canary); reserveCanary(state, this.canary, principal, hash, !!prior, now); }
+    if (prior) return state.messages[id]
+      ? { messageId: id, queued: true, duplicate: true, jobIds: state.messages[id].jobIds }
+      : { messageId: id, queued: false, duplicate: true, expired: true, jobIds: [] };
+    if (Date.parse(envelope.expiresAt) <= now) fail('message_expired', 403);
+    const authorization = verifiedMessageAuthorization(principal, envelope, now, this.deliveryUntil);
+    requireAckPath(state, envelope, authorization, this.messagePolicyIds, now, this.canary?.subscriptionId);
+    delete state.messagePreparations?.[envelope.id];
+    return insert(state, envelope, hash, now, authorization, this.canary ? { maxAttempts: 1 } : undefined);
+  }
+  async sendMessage(principal, input) {
+    await this.prepareMessageSend(principal, input);
+    return this.store.transaction(state => this.stageMessage(state, principal, input));
   }
   async read(principal, params) {
     ownKeys(params, ['messageId']);

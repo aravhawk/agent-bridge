@@ -12,6 +12,12 @@ headers cannot select the issuer, JWKS, role, callback, destination or audience.
 | Jarvis | Origin + `/bridge/jarvis/mcp` | bridge:send:friday, bridge:ack:jarvis, offline_access | https://chatgpt.com/connector_platform_oauth_redirect |
 | Friday | Origin + `/bridge/friday/mcp` | bridge:send:jarvis, bridge:ack:friday, offline_access | https://www.cursor.com/agents/mcp/oauth/callback |
 
+Friday is Grok Bot. The Cursor callback above records an earlier observation,
+not proof of the current Grok Bot binding or an instruction to change it.
+Cursor-specific automation/API documentation does not establish Friday's
+webhook payload mapping or execution lifecycle. Confirm the actual native
+binding without copying its saved endpoint/key; see [task-kernel boundaries](task-kernel.md).
+
 Both clients are public, provided registrations, token authentication none,
 required S256 PKCE and provider-hosted consent. JWT access tokens must include
 the exact resource audience. No client Secret, DCR/CIMD, device grant, OIDC

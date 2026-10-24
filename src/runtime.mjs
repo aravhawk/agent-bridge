@@ -16,6 +16,8 @@ import { createFridaySender, fridaySenderConfigured } from './friday-sender.mjs'
 import { createFridayDiagnostic, diagnosticWindowOpen } from './friday-diagnostic.mjs';
 import { canaryConfiguration, canaryTarget, canaryJob, canaryDispatch } from './friday-canary.mjs';
 import { VERSION, RECEIVER_ID } from './release.mjs';
+import { createTaskCapability, validateTaskCapabilityOptions } from './task-capability.mjs';
+import { createTaskAccess } from './task-access.mjs';
 
 // Canary callbacks are one-shot: every invocation is recorded as a terminal
 // outcome, so no ambiguous result is retried. Response bodies are dropped.
@@ -35,12 +37,28 @@ function terminalTransport(transport) {
 // Resource server only. The approved production provider owns consent,
 // credentials, issuance and refresh. Secrets are injected by Vercel, never pulled.
 export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
-  queueClient, accessAllowed, fridaySender, clock = Date.now, transportFactory = createPublicWebhookTransport } = {}) {
+  queueClient, accessAllowed, fridaySender, clock = Date.now, transportFactory = createPublicWebhookTransport,
+  taskData } = {}) {
+  // Constructor-only opt-in. No environment variable or request can enable it;
+  // the exported production instance below deliberately supplies no option.
+  if (taskData !== undefined && (!taskData || typeof taskData !== 'object' || Array.isArray(taskData)))
+    throw new BridgeError('task_runtime_configuration_required', 503);
+  const taskOptions = taskData === undefined ? null : structuredClone(taskData);
+  if (taskOptions && ((taskOptions.purgeEnabled !== undefined && taskOptions.purgeEnabled !== false) ||
+      taskOptions.retention !== undefined)) throw new BridgeError('task_purge_not_enabled', 503);
+  if (taskOptions && (Object.keys(taskOptions).some(key => !['enabled', 'leaseMs', 'linkRetentionMs', 'limits',
+    'maxLinks', 'maxLinksPerTask', 'purgeEnabled', 'retention'].includes(key)) ||
+    (taskOptions.enabled !== undefined && typeof taskOptions.enabled !== 'boolean')))
+    throw new BridgeError('task_runtime_configuration_required', 503);
+  const taskOptedIn = taskOptions?.enabled === true;
+  if (taskOptedIn && [taskOptions.leaseMs, taskOptions.linkRetentionMs].some(value => !Number.isSafeInteger(value) || value <= 0))
+    throw new BridgeError('task_runtime_configuration_required', 503);
+  if (taskOptedIn) validateTaskCapabilityOptions(taskOptions);
   const provider = providerConfiguration(env.BRIDGE_OAUTH_ISSUER);
   const identityConfigured = !!provider &&
     (!!env.BRIDGE_ALLOWED_SUBJECT || /^[a-f0-9]{64}$/.test(env.BRIDGE_ALLOWED_SUBJECT_SHA256 || ''));
   const contractReady = identityConfigured && env.BRIDGE_OAUTH_CONTRACT_VERIFIED === 'true';
-  let pool, store, bridge, events, queue, diagnostic, transport, protector, authorize;
+  let pool, store, bridge, events, queue, diagnostic, transport, protector, authorize, taskCapability;
   const resolver = keyResolver || (provider ? createRemoteJWKSet(new URL(provider.jwks), { timeoutDuration: 5000 }) : undefined);
   const client = queueClient || new QueueClient({ region: 'iad1', telemetry: { isEnabled: false } });
   const policyIds = Object.fromEntries(['jarvis', 'friday'].map(role => [role, identityConfigured
@@ -68,6 +86,13 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
       subscriptionSetupEnabled: !!base && env.BRIDGE_SUBSCRIPTIONS_ENABLED === 'true',
       fridaySenderConfigured: senderConfigured, receiverPolicyVerified, fridayContractVerified, fridayWebhookDiagnosticArmed,
       canaryArmed, deliveryEnabled };
+  }
+  const taskPolicy = { issuer: provider?.issuer, subject: env.BRIDGE_ALLOWED_SUBJECT,
+    subjectHash: env.BRIDGE_ALLOWED_SUBJECT_SHA256, scopeClaim: env.BRIDGE_OAUTH_SCOPE_CLAIM || 'scope' };
+  const tasksReady = () => taskOptedIn && contractReady && env.BRIDGE_OAUTH_CONTRACT_VERIFIED === 'true' && readiness().deliveryEnabled;
+  if (taskOptedIn) {
+    if (!tasksReady()) throw new BridgeError('task_runtime_policy_required', 503);
+    createTaskAccess(taskPolicy); // Validate trusted policy before advertising any task tool.
   }
   const armedCanary = () => readiness().canaryArmed ? canaryConfiguration(env, clock()) : null;
   function configure() {
@@ -128,6 +153,15 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
       deliveryUntil: config.until, canary: config,
       prepareMessage: id => canaryQueue.prepareMessage(id), prepareReceipt: id => canaryQueue.prepareReceipt(id) }) };
   }
+  const taskOperations = taskOptedIn ? {
+    get enabled() { return tasksReady(); },
+    ...Object.fromEntries(['apply', 'get', 'getByMessageId'].map(method => [method, async (...args) => {
+      if (!tasksReady()) throw new BridgeError('task_runtime_policy_required', 503);
+      configure();
+      taskCapability ||= createTaskCapability({ ...taskOptions, enabled: true, store, bridge, policy: taskPolicy, clock });
+      return taskCapability[method](...args);
+    }])),
+  } : undefined;
   return {
     handler(role) {
       if (!identityConfigured) throw new BridgeError('provider_contract_verification_required', 503);
@@ -159,7 +193,7 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
         configure(); return diagnostic(principal);
       } };
       return createMcpHandler({ enabled: true, verify, bridge: operations, events: nativeEvents,
-        dailyEnabled: true, healthOnly: !contractReady, fridayDiagnostic,
+        dailyEnabled: true, healthOnly: !contractReady, fridayDiagnostic, tasks: taskOperations,
         health: () => ({ status: 'ok', authenticated: true, serverVersion: VERSION, readiness: readiness() }),
         scheduleJobs: async ids => {
           if (!readiness().deliveryEnabled) throw new BridgeError('queue_not_enabled', 503);
