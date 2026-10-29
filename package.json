@@ -17,5 +17,8 @@
     "jose": "6.2.12",
     "pg": "8.23.1",
     "standardwebhooks": "1.1.1"
+  },
+  "overrides": {
+    "zod": "4.6.7"
   }
 }
