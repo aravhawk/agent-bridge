@@ -4,7 +4,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { generateKeyPair, SignJWT } from 'jose';
 import { Webhook } from 'standardwebhooks';
 import { createRuntime } from '../src/runtime.mjs';
-import { CANARY_TEXT, CANARY_MAX_WINDOW_MS } from '../src/friday-canary.mjs';
+import { CANARY_TEXT, CANARY_MAX_WINDOW_MS } from '../src/canary.mjs';
 import { emptyState, PostgresStore } from '../src/store.mjs';
 import { resourceFor } from '../src/resource.mjs';
 import { SCOPES, BridgeError } from '../src/policy.mjs';

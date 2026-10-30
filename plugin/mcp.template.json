@@ -1,23 +1,23 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
   "mcpServers": {
-    "jarvis-friday-bridge": {
+    "agent-inbox-bridge": {
       "type": "streamable-http",
-      "url": "https://jarvis-friday-bridge.aravhawk.com/bridge/jarvis/mcp",
+      "url": "{{RESOURCE}}",
       "extensions": {
         "com.openai": {
           "auth": {
             "type": "oauth",
             "client": {
               "mode": "provided",
-              "clientId": "{{JARVIS_CLIENT_ID}}",
+              "clientId": "{{CLIENT_ID}}",
               "tokenEndpointAuthMethod": "none"
             },
             "authorizationServerBase": "{{OAUTH_ISSUER}}",
-            "resource": "https://jarvis-friday-bridge.aravhawk.com/bridge/jarvis/mcp",
+            "resource": "{{RESOURCE}}",
             "baseScopes": [
-              "bridge:ack:jarvis",
-              "bridge:send:friday",
+              "{{ACK_SCOPE}}",
+              "{{SEND_SCOPE}}",
               "offline_access"
             ],
             "defaultScopes": [],

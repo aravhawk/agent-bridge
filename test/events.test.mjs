@@ -8,8 +8,7 @@ import { MemoryStore, PostgresStore } from '../src/store.mjs';
 import { NativeEvents, EVENT_NAME } from '../src/events.mjs';
 import { Bridge } from '../src/bridge.mjs';
 import { DeliveryWorker, reconcileOutbox } from '../src/worker.mjs';
-import { createMcpHandler } from './fixtures/rollback-mcp.mjs';
-import { preparePrivatePlugin } from './fixtures/rollback-plugin-draft.mjs';
+import { createMcpHandler } from './fixtures/probe-mcp.mjs';
 import { callbackUrl, validSecret, publicAddress, createPublicWebhookTransport, createProtector } from '../src/webhook.mjs';
 
 // All callback domains and identities below are fake. Fake transports never
@@ -338,19 +337,6 @@ test('old rotation signature expires; unknown host evidence is explicit and neve
     hostedEventId: null, hostedTurnId: null });
   assert.ok(completed.ackMessageId);
   assert.equal((await f.bridge.status(jarvis, { messageId: queued.messageId })).wakeVerified, false);
-});
-test('plugin preparation refuses missing live discovery/client and rejects other projects or the existing health path', () => {
-  assert.throws(() => preparePrivatePlugin(), code('live_plugin_discovery_and_client_required'));
-  const fixture = { liveDiscoveryVerified: true, clientId: 'NONSECRET_FIXTURE_CLIENT',
-    discovery: { supportedVersions: ['2026-07-28'], capabilities: { events: {} } }, events: [{ name: EVENT_NAME }] };
-  for (const endpoint of ['https://other-project.vercel.app/bridge/jarvis/mcp',
-    'https://rn-jarvis-friday-discovery-20261018.vercel.app/mcp']) {
-    assert.throws(() => preparePrivatePlugin({ ...fixture, endpoint }), code('verified_mcp_endpoint_required'));
-  }
-  // Fixture result remains in memory only. No archive/account/plugin is created.
-  const files = preparePrivatePlugin({ ...fixture,
-    endpoint: 'https://rn-jarvis-friday-discovery-20261018.vercel.app/bridge/jarvis/mcp' });
-  assert.equal(JSON.parse(files['mcp.json']).mcpServers['rn-synthetic-bridge'].extensions['com.openai'].auth.client.tokenEndpointAuthMethod, 'none');
 });
 test('new Jarvis messages fail closed without native subscription; encrypted configuration is bound to its subscription ID', async () => {
   const store = new MemoryStore(); const bridge = new Bridge({ store, clock: () => now });

@@ -5,7 +5,8 @@ import { appendDeliveryJobs, authorizeRecipient, ownKeys } from './events.mjs';
 import { verifiedMessageAuthorization, messageAccessAllowed, subscriptionAccessAllowed, testEnvelopeAllowed } from './access.mjs';
 import { diagnosticReadCandidate, diagnosticReadStatus, observeDiagnosticRead,
   canaryReadCandidate, canaryReadStatus, observeCanaryRead } from './observability.mjs';
-import { canaryEnvelope, reserveCanary, canaryReceipt } from './friday-canary.mjs';
+import { canaryEnvelope, reserveCanary, canaryReceipt } from './canary.mjs';
+import { EVENTS_PEER, NAMES } from './config.mjs';
 
 const fail = (code, status = 400) => { throw new BridgeError(code, status); };
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
@@ -28,14 +29,14 @@ function incoming(state, principal, id, probeMessageId, probeSender) {
   return message;
 }
 function requireAckPath(state, envelope, authorization, policyIds, now, subscriptionId) {
-  if (!dailyMessage(envelope) || envelope.kind === 'ack' || envelope.from !== 'jarvis') return;
-  // Friday must not handle a source whose required ACK has no usable return
+  if (!dailyMessage(envelope) || envelope.kind === 'ack' || envelope.from !== EVENTS_PEER) return;
+  // The webhook peer must not handle a source whose required ACK has no usable return
   // path. Cover its entire immutable authority lifetime, not just this instant.
   // Revocation/shortening during handling still fails closed at completion.
   // A pinned subscriptionId (canary) admits only that exact return path.
   if (!Object.values(state.subscriptions).some(sub => sub.owner === authorization?.owner &&
       (!subscriptionId || sub.id === subscriptionId) &&
-      subscriptionAccessAllowed(state, sub, policyIds?.jarvis, now) &&
+      subscriptionAccessAllowed(state, sub, policyIds?.[EVENTS_PEER], now) &&
       sub.expiresAt >= authorization.expiresAt)) fail('return_subscription_required', 503);
 }
 function insert(state, envelope, hash, now, authorization, jobOptions) {
@@ -49,15 +50,15 @@ function insert(state, envelope, hash, now, authorization, jobOptions) {
   }
   const retainUntil = dailyMessage(envelope) ? reserveMessage(state, envelope, hash, now) : undefined;
   const jobIds = appendDeliveryJobs(state, envelope, now, jobOptions);
-  if (envelope.to === 'jarvis' && !jobIds.length) fail('recipient_subscription_required', 503);
+  if (envelope.to === EVENTS_PEER && !jobIds.length) fail('recipient_subscription_required', 503);
   state.messages[envelope.id] = { envelope, hash, storedAt: now, jobIds, authorization, ...(retainUntil ? { retainUntil } : {}) };
   return { messageId: envelope.id, queued: true, duplicate: false, jobIds };
 }
 
 export class Bridge {
-  // canary: trusted fixed configuration (friday-canary.mjs). When present this
+  // canary: trusted fixed configuration (canary.mjs). When present this
   // instance admits only that one source and its server-created ACK.
-  constructor({ store, clock = Date.now, probeMessageId, probeSender = 'jarvis', messagePolicyIds, deliveryUntil = Infinity, dailyEnabled = false, prepareMessage, prepareReceipt, canary }) {
+  constructor({ store, clock = Date.now, probeMessageId, probeSender = EVENTS_PEER, messagePolicyIds, deliveryUntil = Infinity, dailyEnabled = false, prepareMessage, prepareReceipt, canary }) {
     this.prepareMessage = prepareMessage; this.prepareReceipt = prepareReceipt; this.canary = canary;
     this.store = store; this.clock = clock; this.dailyEnabled = dailyEnabled; this.probeMessageId = probeMessageId;
     this.probeSender = probeSender;
@@ -219,7 +220,7 @@ export class Bridge {
         // The canary ACK targets only the pinned return subscription, one attempt.
         ({ jobIds } = insert(state, envelope, hash, now, verifiedMessageAuthorization(principal, envelope, now, this.deliveryUntil),
           this.canary ? { subscriptionId: this.canary.subscriptionId, maxAttempts: 1 } : undefined));
-        if (this.canary) state.fridayCanary.ackMessageId = ackMessageId;
+        if (this.canary) state[NAMES.canaryState].ackMessageId = ackMessageId;
       }
       state.receipts[params.messageId] = { ...receipt, state: 'complete', completedAt: now,
         ackMessageId, hostedEventId: params.hostedEventId, hostedTurnId: params.hostedTurnId,

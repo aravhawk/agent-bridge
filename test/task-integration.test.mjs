@@ -71,7 +71,7 @@ async function fixture({ subscribe = true, capability = true, healthOnly = false
   const events = new NativeEvents({ store, clock, protector, transport, policyId: policyIds.jarvis, enabled: true });
   const worker = new DeliveryWorker({ store, clock, protector, transport, enabled: true, messagePolicyIds: policyIds,
     policyId: policyIds.jarvis, accessAllowed: async () => true,
-    fridaySender: async job => { deliveries.push({ role: 'friday', body: JSON.parse(job.body) }); return { status: 202 }; } });
+    webhookSender: async job => { deliveries.push({ role: 'friday', body: JSON.parse(job.body) }); return { status: 202 }; } });
   const queue = createQueueAdapter({ store, clock, worker, enabled: true, maintenanceEnabled: true, client: {
     async send(topic, payload, options) {
       assert.equal(topic, TOPIC); calls.push({ payload, options });

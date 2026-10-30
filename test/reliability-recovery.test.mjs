@@ -7,7 +7,7 @@ import { NativeEvents } from '../src/events.mjs';
 import { createProtector } from '../src/webhook.mjs';
 import { VERIFIED_AUTHORIZATION, SCOPES, BridgeError } from '../src/policy.mjs';
 import { DeliveryWorker } from '../src/worker.mjs';
-import { createFridaySender } from '../src/friday-sender.mjs';
+import { createWebhookSender } from '../src/webhook-sender.mjs';
 import { createQueueAdapter, TOPIC } from '../src/queue.mjs';
 
 const start = Date.UTC(2026, 9, 21), hour = 3600000;
@@ -36,7 +36,7 @@ function fixture() {
     const faultingStore = { transaction: op => offline ? Promise.reject(Error('FIXTURE_DATABASE_OUTAGE')) : activeStore.transaction(op) };
     const worker = new DeliveryWorker({ store: faultingStore, clock, enabled: true, protector, transport,
       policyId: policyIds.jarvis, messagePolicyIds: policyIds, accessAllowed: async () => true,
-      fridaySender: createFridaySender({ enabled: true, contractVerified: true,
+      webhookSender: createWebhookSender({ enabled: true, contractVerified: true,
         endpoint: 'https://receiver.example.test/FIXTURE', secret: 'FIXTURE_ONLY', transport }) });
     return createQueueAdapter({ store: faultingStore, worker, client: { send }, enabled, clock });
   }

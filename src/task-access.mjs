@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { authorizationPolicyId, BridgeError, SCOPES, VERIFIED_AUTHORIZATION } from './policy.mjs';
 import { resourceFor } from './resource.mjs';
 import { resourceDenied } from './access.mjs';
+import { PEER_IDS } from './config.mjs';
 
 const digest = value => createHash('sha256').update(value).digest('hex');
 const hash = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
@@ -19,12 +20,12 @@ export function createTaskAccess({ issuer, subject, subjectHash, scopeClaim = 's
   if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) invalid();
   const pin = subject === undefined ? subjectHash : digest(subject);
   const ownerKey = digest(JSON.stringify(['bridge-task-owner/v1', issuer, pin]));
-  const policies = Object.fromEntries(['jarvis', 'friday'].map(role => [role,
+  const policies = Object.fromEntries(PEER_IDS.map(role => [role,
     authorizationPolicyId({ issuer, subject, subjectHash, scopeClaim, role, audience: resourceFor(role) })]));
   return (principal, request, now, state) => {
     const role = principal?.role, scopes = SCOPES[role], proof = principal?.[VERIFIED_AUTHORIZATION];
     const write = writes.has(request?.operation);
-    if (!['jarvis', 'friday'].includes(role) || !scopes || (!write && request?.operation !== 'read') || !Number.isSafeInteger(now) ||
+    if (!PEER_IDS.includes(role) || !scopes || (!write && request?.operation !== 'read') || !Number.isSafeInteger(now) ||
         state?.version !== 1 || !hash(principal.principalKey) || !Array.isArray(principal.scopes) ||
         proof?.policyId !== policies[role] || !Number.isSafeInteger(proof?.expiresAt) || proof.expiresAt <= now ||
         !principal.scopes.includes(scopes.ack) || (write && !principal.scopes.includes(scopes.probe)) ||

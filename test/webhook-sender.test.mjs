@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createFridaySender } from '../src/friday-sender.mjs';
+import { createWebhookSender } from '../src/webhook-sender.mjs';
 import { BridgeError } from '../src/policy.mjs';
 import { digest } from '../src/events.mjs';
 
@@ -15,18 +15,18 @@ const config = { enabled: true, endpoint: 'https://receiver.example.test/hook?op
 const code = name => e => e instanceof BridgeError && e.code === name;
 
 test('Friday sender stays closed without activation and independently verified contract or exact probe ID', () => {
-  assert.throws(() => createFridaySender(), code('delivery_not_enabled'));
-  assert.throws(() => createFridaySender({ ...config, contractVerified: false }), code('friday_native_contract_unverified'));
-  assert.throws(() => createFridaySender({ ...config, contractVerified: 'true' }), code('friday_native_contract_unverified'));
+  assert.throws(() => createWebhookSender(), code('delivery_not_enabled'));
+  assert.throws(() => createWebhookSender({ ...config, contractVerified: false }), code('friday_native_contract_unverified'));
+  assert.throws(() => createWebhookSender({ ...config, contractVerified: 'true' }), code('friday_native_contract_unverified'));
   for (const probeMessageId of ['', 'caller-selected', messageId.toUpperCase() + 'x']) {
-    assert.throws(() => createFridaySender({ ...config, contractVerified: false, probeMessageId }),
+    assert.throws(() => createWebhookSender({ ...config, contractVerified: false, probeMessageId }),
       code('friday_native_contract_unverified'));
   }
 });
 
 test('fixed destination and observed Bearer format carry only a canonical candidate event/message ID', async () => {
   const calls = [];
-  const send = createFridaySender({ ...config, transport: async (url, request) => {
+  const send = createWebhookSender({ ...config, transport: async (url, request) => {
     calls.push({ url, ...request });
     return { status: 202, get body() { assert.fail('must not inspect response body'); } };
   } });
@@ -42,7 +42,7 @@ test('fixed destination and observed Bearer format carry only a canonical candid
 
 test('forged recipient/body/identity and extra payload fields fail before transport', async () => {
   let calls = 0;
-  const send = createFridaySender({ ...config, transport: async () => { calls++; return { status: 200 }; } });
+  const send = createWebhookSender({ ...config, transport: async () => { calls++; return { status: 200 }; } });
   const invalid = [{ ...job, recipient: 'jarvis' }, { ...job, eventId: 'evt_' + 'a'.repeat(64) },
     { ...job, id: 'job_' + 'a'.repeat(64) }, { ...job, body: '{' },
     { ...job, body: JSON.stringify({ ...body, instruction: 'untrusted extra data' }) },
@@ -58,35 +58,35 @@ test('one-shot contract probe is fixed to one known message and cannot retry or 
   let calls = 0;
   const options = { ...config, contractVerified: false, probeMessageId: messageId,
     transport: async () => { calls++; return { status: 503 }; } };
-  const send = createFridaySender(options);
+  const send = createWebhookSender(options);
   assert.deepEqual(await send(job), { status: 503 });
   await assert.rejects(send(job), code('friday_contract_probe_exhausted'));
-  await assert.rejects(createFridaySender(options)({ ...job, attempts: 2 }), code('friday_contract_probe_exhausted'));
+  await assert.rejects(createWebhookSender(options)({ ...job, attempts: 2 }), code('friday_contract_probe_exhausted'));
   const otherId = '00000000-0000-4000-8000-000000000002';
   const otherEvent = 'evt_' + digest(JSON.stringify([otherId, 'friday']));
-  await assert.rejects(createFridaySender(options)({ ...job, messageId: otherId, eventId: otherEvent,
+  await assert.rejects(createWebhookSender(options)({ ...job, messageId: otherId, eventId: otherEvent,
     id: 'job_' + otherEvent.slice(4), body: JSON.stringify({ ...body, data: { messageId: otherId } }) }),
     code('friday_contract_probe_exhausted'));
   assert.equal(calls, 1);
 });
 
 test('probe transport failure consumes its single attempt and raw secret-bearing exceptions stay sanitized', async () => {
-  const send = createFridaySender({ ...config, contractVerified: false, probeMessageId: messageId,
+  const send = createWebhookSender({ ...config, contractVerified: false, probeMessageId: messageId,
     transport: async () => { throw new Error(config.secret); } });
   await assert.rejects(send(job), e => code('friday_transport_failed')(e) && !String(e).includes(config.secret));
   await assert.rejects(send(job), code('friday_contract_probe_exhausted'));
-  const timeout = createFridaySender({ ...config, transport: async () => { throw new BridgeError('callback_timeout', 503); } });
+  const timeout = createWebhookSender({ ...config, transport: async () => { throw new BridgeError('callback_timeout', 503); } });
   await assert.rejects(timeout(job), code('callback_timeout'));
 });
 
 test('invalid destination or header material cannot construct a sender and invalid transport status is sanitized', async () => {
   for (const endpoint of ['http://receiver.example.test/hook', 'https://user:pass@receiver.example.test/hook',
     'https://127.0.0.1/hook', 'https://receiver.example.test:444/hook', 'https://receiver.example.test/hook#fragment']) {
-    assert.throws(() => createFridaySender({ ...config, endpoint }), code('friday_sender_configuration_required'));
+    assert.throws(() => createWebhookSender({ ...config, endpoint }), code('friday_sender_configuration_required'));
   }
   for (const secret of ['', 'key\r\nInjected: header', 'key with spaces', 'x'.repeat(4097)]) {
-    assert.throws(() => createFridaySender({ ...config, secret }), code('friday_sender_configuration_required'));
+    assert.throws(() => createWebhookSender({ ...config, secret }), code('friday_sender_configuration_required'));
   }
-  const send = createFridaySender({ ...config, transport: async () => ({ status: '202' }) });
+  const send = createWebhookSender({ ...config, transport: async () => ({ status: '202' }) });
   await assert.rejects(send(job), code('friday_transport_invalid'));
 });

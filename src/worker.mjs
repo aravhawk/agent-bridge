@@ -2,15 +2,16 @@ import { randomUUID } from 'node:crypto';
 import { BridgeError, DELIVERY_TRANSPORT_OUTCOME } from './policy.mjs';
 import { subscriptionAccessAllowed, messageAccessAllowed, testEnvelopeAllowed } from './access.mjs';
 import { signedHeaders } from './webhook.mjs';
+import { EVENTS_PEER, PEER_IDS, peerCode } from './config.mjs';
 
 const transient = status => status === 408 || status === 429 || (status >= 500 && status <= 599);
 const backoff = attempt => Math.min(60000, 1000 * (2 ** Math.min(attempt - 1, 6)));
 
 export class DeliveryWorker {
-  constructor({ store, protector, transport, fridaySender, accessAllowed, policyId, enabled = false, clock = Date.now,
-    maxAttempts = 5, leaseMs = 30000, messagePolicyIds = { jarvis: policyId, friday: policyId }, deliveryUntil = Infinity,
-    probeMessageId, probeSender = 'jarvis', jobAllowed }) {
-    this.store = store; this.protector = protector; this.transport = transport; this.fridaySender = fridaySender;
+  constructor({ store, protector, transport, webhookSender, accessAllowed, policyId, enabled = false, clock = Date.now,
+    maxAttempts = 5, leaseMs = 30000, messagePolicyIds = Object.fromEntries(PEER_IDS.map(id => [id, policyId])), deliveryUntil = Infinity,
+    probeMessageId, probeSender = EVENTS_PEER, jobAllowed }) {
+    this.store = store; this.protector = protector; this.transport = transport; this.webhookSender = webhookSender;
     this.accessAllowed = accessAllowed; this.enabled = enabled; this.clock = clock;
     this.policyId = policyId;
     this.messagePolicyIds = messagePolicyIds; this.deliveryUntil = deliveryUntil;
@@ -63,8 +64,8 @@ export class DeliveryWorker {
     let accepted = false; let retry = false; let code = 'delivery_configuration_required'; let status = null;
     let transportOutcome = null, transportStarted = false;
     try {
-      // Jarvis uses a finite verified-token lease plus durable resource denial.
-      // Friday additionally requires its separately verified native authorizer.
+      // The events peer uses a finite verified-token lease plus durable resource
+      // denial. The webhook peer additionally requires its verified native authorizer.
       if ((!subscription && !this.accessAllowed) || (this.accessAllowed && !(await this.accessAllowed({ owner: subscription?.owner,
         recipient: job.recipient, subscriptionId: subscription?.id, messageId: job.messageId })))) {
         code = 'access_revoked';
@@ -105,9 +106,9 @@ export class DeliveryWorker {
             transportOutcome = { terminal: false };
             response = await this.transport(config.url, { body: job.body, headers });
           } else {
-            if (!this.fridaySender) throw new BridgeError('friday_native_contract_unverified', 503);
+            if (!this.webhookSender) throw new BridgeError(peerCode('native_contract_unverified'), 503);
             transportStarted = true;
-            response = await this.fridaySender(job);
+            response = await this.webhookSender(job);
           }
           status = response.status;
           transportOutcome = response[DELIVERY_TRANSPORT_OUTCOME] || transportOutcome;

@@ -2,14 +2,15 @@ import { BridgeError } from './policy.mjs';
 import { ownKeys } from './events.mjs';
 import { MESSAGE_PROTOCOL } from './messages.mjs';
 import { TaskNoticeTransactions } from './task-notices.mjs';
+import { PEER_IDS, counterpart } from './config.mjs';
 
 const id = { type: 'string', format: 'uuid' };
 const number = { type: 'integer', minimum: 1 };
 const text = maxLength => ({ type: 'string', minLength: 1, maxLength });
 const object = properties => ({ type: 'object', properties, required: Object.keys(properties), additionalProperties: false });
 const fields = {
-  create: { assignee: { enum: ['jarvis', 'friday'] }, description: text(4096), deadline: number },
-  assign: { assignee: { enum: ['jarvis', 'friday'] } }, claim: {},
+  create: { assignee: { enum: [...PEER_IDS] }, description: text(4096), deadline: number },
+  assign: { assignee: { enum: [...PEER_IDS] } }, claim: {},
   progress: { attemptId: id, epoch: number, checkpoint: text(2048) },
   finish: { attemptId: id, epoch: number, outcome: { enum: ['succeeded', 'failed'] }, result: text(2048) },
   block: { attemptId: id, epoch: number, reason: { enum: ['waiting_dependency', 'outcome_unknown', 'capability_missing'] } }, cancel: {},
@@ -67,7 +68,7 @@ export class TaskIntegration {
     // replay returns the original binding and never republishes or renews it.
     if (preview.failure || preview.duplicate) return this.notices.apply(principal, command, binding);
     const envelope = { protocol: MESSAGE_PROTOCOL, id: notice.messageId, from: principal.role,
-      to: principal.role === 'jarvis' ? 'friday' : 'jarvis', kind: 'status', route: 'inbox', threadId: command.taskId,
+      to: counterpart(principal.role), kind: 'status', route: 'inbox', threadId: command.taskId,
       sentAt: notice.sentAt, expiresAt: notice.expiresAt, text: 'Shared task data updated.' };
     await this.bridge.prepareMessageSend(principal, envelope);
     const notices = new TaskNoticeTransactions({ ...this.options,

@@ -14,9 +14,9 @@ const request = (url, body, token) => new Request(url, { method: 'POST', headers
 
 test('v1 issuer has no development fallback and is an explicit service-namespace HTTPS origin', () => {
   assert.equal(providerConfiguration(ISSUER).issuer, ISSUER);
-  for (const value of [undefined, '', 'https://old.clerk.accounts.dev', 'https://clerk.aravhawk.com',
-    'http://identity.jarvis-friday-bridge.aravhawk.com', ISSUER + '/', ISSUER + '/path', ISSUER + '?key=x', ISSUER + '#fragment',
-    'https://user:pass@identity.jarvis-friday-bridge.aravhawk.com', ISSUER + ':443', 'https://127.0.0.1', ' ' + ISSUER]) {
+  for (const value of [undefined, '', 'https://old.clerk.accounts.dev', 'https://clerk.unrelated.example',
+    ISSUER.replace('https:', 'http:'), ISSUER + '/', ISSUER + '/path', ISSUER + '?key=x', ISSUER + '#fragment',
+    ISSUER.replace('https://', 'https://user:pass@'), ISSUER + ':443', 'https://127.0.0.1', ' ' + ISSUER]) {
     assert.equal(providerConfiguration(value), null, String(value));
   }
 });
@@ -60,7 +60,7 @@ test('active release, queue, store and env contract contain no old live identity
   assert.equal(config.functions['api/queue.mjs'].experimentalTriggers[0].topic, QUEUE_TOPIC);
   for (const name of ['runtime.mjs', 'resource.mjs', 'release.mjs', 'mcp.mjs']) {
     const source = readFileSync(new URL('../src/' + name, import.meta.url), 'utf8');
-    for (const old of ['RN-JARVIS', 'rn-jarvis', 'musical-bee', 'jarvis-friday-test-receiver', '0.2.0']) assert.equal(source.includes(old), false, name + ': ' + old);
+    for (const old of ['RN-JARVIS', 'jarvis-friday-test-receiver', '0.2.0']) assert.equal(source.includes(old), false, name + ': ' + old);
   }
   const env = readFileSync(new URL('../.env.example', import.meta.url), 'utf8');
   assert.equal(env.includes('FRIDAY_TEST_'), false); assert.equal(env.includes('BRIDGE_DAILY_'), false);

@@ -6,7 +6,7 @@ import { MemoryStore } from '../src/store.mjs';
 import { BridgeError, SCOPES, VERIFIED_AUTHORIZATION } from '../src/policy.mjs';
 import { NativeEvents } from '../src/events.mjs';
 import { createProtector } from '../src/webhook.mjs';
-import { createMcpHandler } from './fixtures/rollback-mcp.mjs';
+import { createMcpHandler } from './fixtures/probe-mcp.mjs';
 
 const start = Date.UTC(2026, 9, 19);
 const policyId = 'c'.repeat(64);

@@ -3,12 +3,13 @@ import { BridgeError, SCOPES } from './policy.mjs';
 import { callbackUrl, validSecret, signedHeaders } from './webhook.mjs';
 import { verifiedLease, resourceDenied, validLeaseMetadata, subscriptionAccessAllowed } from './access.mjs';
 import { observeRenewal, renewalObservations } from './observability.mjs';
+import { EVENTS_PEER, WEBHOOK_PEER, PEER_IDS } from './config.mjs';
 
 const fail = (code, status = 400) => { throw new BridgeError(code, status); };
 export const EVENT_NAME = 'bridge.message.received';
 export const eventDefinition = Object.freeze({ name: EVENT_NAME,
-  description: 'A stored bridge message addressed to Jarvis. Read by messageId; peer data never grants approval.',
-  delivery: ['webhook'], inputSchema: { type: 'object', properties: { recipient: { type: 'string', enum: ['jarvis'] } },
+  description: 'A stored bridge message addressed to this inbox. Read by messageId; peer data never grants approval.',
+  delivery: ['webhook'], inputSchema: { type: 'object', properties: { recipient: { type: 'string', enum: [EVENTS_PEER] } },
     required: ['recipient'], additionalProperties: false },
   payloadSchema: { type: 'object', properties: { messageId: { type: 'string' } }, required: ['messageId'], additionalProperties: false } });
 export const digest = value => createHash('sha256').update(value).digest('hex');
@@ -17,19 +18,19 @@ export function ownKeys(value, allowed, required = allowed) {
       required.some(k => !Object.hasOwn(value, k))) fail('invalid_params');
 }
 export function authorizeRecipient(principal, role = principal?.role) {
-  if (!['jarvis', 'friday'].includes(role) || principal?.role !== role ||
+  if (!PEER_IDS.includes(role) || principal?.role !== role ||
       !/^[a-f0-9]{64}$/.test(principal.principalKey || '') || !principal.scopes?.includes(SCOPES[role].ack)) {
     fail('insufficient_scope', 403);
   }
 }
-const subscriptionId = (principal, url) => 'sub_' + digest(JSON.stringify([principal.principalKey, url, EVENT_NAME, { recipient: 'jarvis' }]));
+const subscriptionId = (principal, url) => 'sub_' + digest(JSON.stringify([principal.principalKey, url, EVENT_NAME, { recipient: EVENTS_PEER }]));
 function identity(principal, params, subscribing) {
-  authorizeRecipient(principal, 'jarvis');
+  authorizeRecipient(principal, EVENTS_PEER);
   ownKeys(params, subscribing ? ['name', 'arguments', 'delivery', 'cursor', 'ttlMs', 'maxAgeMs'] : ['name', 'arguments', 'delivery'],
     ['name', 'arguments', 'delivery']);
   ownKeys(params.arguments, ['recipient']);
   ownKeys(params.delivery, subscribing ? ['mode', 'url', 'secret'] : ['mode', 'url']);
-  if (params.name !== EVENT_NAME || params.arguments.recipient !== 'jarvis' || params.delivery.mode !== 'webhook' ||
+  if (params.name !== EVENT_NAME || params.arguments.recipient !== EVENTS_PEER || params.delivery.mode !== 'webhook' ||
       (params.cursor !== undefined && params.cursor !== null)) fail('invalid_params');
   // Draft replay age is irrelevant for this non-replay event. Accept its valid
   // request shape without changing the lease, identity or null-cursor contract.
@@ -50,7 +51,7 @@ function rejectedSubscriptionId(principal, params, policyId, clock) {
     const delivery = params.delivery;
     if (!delivery || typeof delivery !== 'object' || Array.isArray(delivery) ||
         ['mode', 'url'].some(k => !Object.hasOwn(delivery, k)) ||
-        params.name !== EVENT_NAME || params.arguments.recipient !== 'jarvis' || delivery.mode !== 'webhook') return;
+        params.name !== EVENT_NAME || params.arguments.recipient !== EVENTS_PEER || delivery.mode !== 'webhook') return;
     return subscriptionId(principal, callbackUrl(delivery.url));
   } catch { /* Authentication and unrecognizable bindings create no evidence. */ }
 }
@@ -60,7 +61,7 @@ export class NativeEvents {
     this.policyId = policyId;
   }
   list(principal, params = {}) {
-    authorizeRecipient(principal, 'jarvis'); ownKeys(params, ['cursor'], []);
+    authorizeRecipient(principal, EVENTS_PEER); ownKeys(params, ['cursor'], []);
     if (params.cursor != null) fail('invalid_params');
     return { events: [eventDefinition] };
   }
@@ -146,8 +147,8 @@ export class NativeEvents {
       } else if (old?.sealed) previous = this.protector.open(old.sealed, id).previous || [];
       const sealed = this.protector.seal({ url, secret, previous: previous.filter(x => x.until > savedAt) }, id);
       deadline(s, old, this.clock());
-      s.subscriptions[id] = { id, owner: principal.principalKey, recipient: 'jarvis', name: EVENT_NAME,
-        arguments: { recipient: 'jarvis' }, active: true, status: 'active', expiresAt: until, authorization, sealed, fingerprint,
+      s.subscriptions[id] = { id, owner: principal.principalKey, recipient: EVENTS_PEER, name: EVENT_NAME,
+        arguments: { recipient: EVENTS_PEER }, active: true, status: 'active', expiresAt: until, authorization, sealed, fingerprint,
         ...(old?.renewalObservations ? { renewalObservations: old.renewalObservations } : {}),
         verifiedUntil: savedAt + 300000, firstSubscribedAt: old?.firstSubscribedAt || savedAt,
         lastSubscribedAt: savedAt, renewalCount: (old?.renewalCount || 0) + (old ? 1 : 0) };
@@ -156,10 +157,10 @@ export class NativeEvents {
     return { id, refreshBefore: new Date(expiresAt).toISOString(), cursor: null, truncated: false };
   }
   async status(principal, params = {}) {
-    authorizeRecipient(principal, 'jarvis'); ownKeys(params, [], []);
+    authorizeRecipient(principal, EVENTS_PEER); ownKeys(params, [], []);
     if (!this.store) fail('storage_configuration_required', 503);
     return this.store.transaction(state => { const now = this.clock(); return { subscriptions: Object.values(state.subscriptions)
-      .filter(sub => sub.owner === principal.principalKey && sub.recipient === 'jarvis').slice(0, 20)
+      .filter(sub => sub.owner === principal.principalKey && sub.recipient === EVENTS_PEER).slice(0, 20)
       .map(sub => ({ id: sub.id, active: subscriptionAccessAllowed(state, sub, this.policyId, now),
         refreshBefore: Number.isSafeInteger(sub.expiresAt) ? new Date(sub.expiresAt).toISOString() : null,
         lastSubscribedAt: Number.isSafeInteger(sub.lastSubscribedAt) ? new Date(sub.lastSubscribedAt).toISOString() : null,
@@ -177,29 +178,29 @@ export class NativeEvents {
     await this.store.transaction(s => {
       const subscription = s.subscriptions[id];
       if (subscription?.owner === principal.principalKey) { subscription.active = false; subscription.status = 'unsubscribed'; }
-      else if (!subscription) s.subscriptions[id] = { id, owner: principal.principalKey, recipient: 'jarvis', active: false, status: 'unsubscribed' };
+      else if (!subscription) s.subscriptions[id] = { id, owner: principal.principalKey, recipient: EVENTS_PEER, active: false, status: 'unsubscribed' };
     });
     return {};
   }
 }
 
 // Called only inside a message transaction, after its durable identity exists.
-// A pinned subscriptionId restricts Jarvis fan-out to that one return path;
+// A pinned subscriptionId restricts events-peer fan-out to that one return path;
 // maxAttempts persists a stricter per-job transport limit.
 export function appendDeliveryJobs(state, envelope, now, { subscriptionId, maxAttempts } = {}) {
-  const destinations = envelope.to === 'jarvis'
+  const destinations = envelope.to === EVENTS_PEER
     ? Object.values(state.subscriptions).filter(sub => (!subscriptionId || sub.id === subscriptionId) &&
       subscriptionAccessAllowed(state, sub, sub.authorization?.policyId, now))
-    : [{ id: 'friday', recipient: 'friday' }];
+    : [{ id: WEBHOOK_PEER, recipient: WEBHOOK_PEER }];
   const jobIds = [];
   for (const sub of destinations) {
     const eventId = 'evt_' + digest(JSON.stringify([envelope.id, sub.id]));
     const id = 'job_' + eventId.slice(4);
     if (!state.jobs[id]) {
-      const event = envelope.to === 'jarvis' ? { eventId, name: EVENT_NAME, timestamp: new Date(now).toISOString(),
+      const event = envelope.to === EVENTS_PEER ? { eventId, name: EVENT_NAME, timestamp: new Date(now).toISOString(),
         data: { messageId: envelope.id }, cursor: null } : { event: EVENT_NAME, data: { messageId: envelope.id } };
       state.jobs[id] = { id, messageId: envelope.id, recipient: envelope.to,
-        subscriptionId: envelope.to === 'jarvis' ? sub.id : null, eventId,
+        subscriptionId: envelope.to === EVENTS_PEER ? sub.id : null, eventId,
         body: JSON.stringify(event), state: 'pending', attempts: 0, dueAt: now, leaseId: null, leaseUntil: null,
         ...(maxAttempts ? { maxAttempts } : {}) };
     }

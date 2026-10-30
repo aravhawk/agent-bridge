@@ -1,62 +1,197 @@
-# Jarvis Friday Bridge · v1.0.0
+# Agent Inbox Bridge
 
-Private, event-driven inbox messaging between Arav's Jarvis and Friday. Messages,
-status updates and handoff requests are data; they never grant permission to run
-code, perform production actions or change access. The receiver evaluates them
-under Arav's independently authorized workflow. No Mac relay or recipient polling.
+A small, self-hosted [MCP](https://modelcontextprotocol.io) server that lets
+**two AI assistants leave each other messages**. Each one gets an inbox. One
+assistant sends a bounded message, status update or handoff request. The bridge
+stores it, wakes the other assistant with an event that contains only a message
+ID, and records the receipt and acknowledgement atomically.
 
-Canonical service: **https://jarvis-friday-bridge.aravhawk.com**
+It is built for one owner running two assistants on different platforms, for
+example a chat assistant that supports MCP event subscriptions and an agent
+platform that is triggered by webhooks. Each assistant connects with its own
+OAuth token and can only send to the other one.
 
-- Jarvis MCP: `/bridge/jarvis/mcp`
-- Friday MCP: `/bridge/friday/mcp`
-- Public version/liveness: `/health` (no private readiness or delivery operations)
+> **Messages are data, never permission.** A message cannot grant approval, run
+> a tool, choose a destination or change access. The receiving assistant treats
+> it as inbox content and decides what to do under its owner's existing,
+> independently authorized workflow.
 
-This is the deployed v1 source. Normal delivery remains disabled pending native
-integration evidence; deployment does not attest readiness. Existing production
-bindings are reused, and setup documents do not authorize recreating them. The
-old disabled deployment remains a separate rollback snapshot at commit
-`fac3baf1ab0be6d70609b3520c97801fc734361b`.
+## How it works
 
-See [architecture and invariants](docs/architecture.md) for the active lifecycle,
-failure semantics and remaining integration limits. Historical setup records
-and fixtures are separate from active v1.
-
-## Verify source
-
-Node24 and Python3; no real credentials needed:
-
-```sh
-npm ci --ignore-scripts
-npm test
-python3 scripts/audit_repo.py
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Events peer<br/>(MCP client)
+    participant B as Bridge<br/>(Vercel function)
+    participant D as Postgres
+    participant Q as Vercel Queue
+    participant W as Webhook peer<br/>(agent platform)
+    A->>B: events/subscribe (callback URL + signing secret)
+    A->>B: bridge_message_send (bounded text)
+    B->>D: store message + outbox job (one transaction)
+    B->>Q: dispatch messageId
+    Q->>B: private queue callback
+    B->>W: POST {"event":"bridge.message.received","data":{"messageId":…}}<br/>Standard Webhooks signature
+    W->>B: bridge_read → bridge_receipt_claim → bridge_receipt_complete
+    B->>D: receipt + ACK (one transaction)
+    B-->>A: signed event callback for the ACK
 ```
 
-The suite covers signature/issuer/audience/scope isolation, canonical routing,
-health-only bootstrap, native subscription leases, atomic receipt/ACK handling,
-durable dispatch, bounded retries and retention. Rollback-model fixtures exercise
-old guard behavior without deploying old routes or configuration.
+Delivery works the same way in the other direction. The **webhook peer**
+sends, and the **events peer** is woken through the callback it subscribed
+with. Wake-ups carry only the message ID, so the content is always read
+through an authenticated MCP call.
 
-`npm run check:remote` makes credential-free requests only to the canonical v1
-service, with no messages, subscriptions, grants or real bearer tokens. Before
-an actual issuer is configured it expects metadata503 and closed bearer access.
-See [configuration](docs/configuration.md) before using its optional flags.
+## Security model
 
-## Deployment identity
+- **Resource server only.** Your OAuth provider (Clerk in the reference
+  setup) issues and refreshes tokens. The bridge only verifies RS256 JWTs
+  against a pinned issuer, a per-peer audience
+  (`<origin>/bridge/<peer>/mcp`) and a single allowed subject (the owner). It
+  never issues, stores or logs tokens.
+- **Directional scopes.** Each peer holds `bridge:send:<other>` and
+  `bridge:ack:<self>`. A peer can send only to its counterpart and can read,
+  claim and acknowledge only messages addressed to itself.
+- **Data, not instructions.** Text is at most 4 KiB, expires within one hour
+  and is validated against a fixed envelope. There are no free-form routes,
+  task selectors, URLs or tool choices. Reads return
+  `authority: "peer_data_requires_user_workflow"`.
+- **Closed by default.** Subscriptions, delivery and receiver policy are
+  separate operator gates. Each one stays off until you attest it, and
+  readiness is rechecked on every call.
+- **Hardened outbound HTTP.** Callbacks and webhooks are HTTPS only. DNS is
+  resolved first, and every address must be public unicast. The socket is
+  pinned to the checked address with TLS verification on the original
+  hostname. There are no redirects, and responses are bounded.
+- **Secrets at rest.** Subscription callback URLs and secrets are encrypted
+  with AES-256-GCM and bound to the subscription ID. Webhook-peer secrets live
+  only in environment variables.
+- **Honest guarantees.** Storage, receipts and ACKs are exactly-once per
+  message. External agent actions are not: an HTTP 2xx proves transport, not
+  that an assistant woke up or acted. See [architecture](docs/architecture.md).
 
-Only Arav's Projects, team `team_rCVvKJ5rUgNP0LOPEwzfyl0z`.
-New project **jarvis-friday-bridge**, `prj_rTBPrIoODxpC1A6sS2OQtlvc7cqE`.
-Reuse the private repository `aravhawk/jarvis-friday-bridge`.
-Do not modify the portfolio, other projects or the old deployment during cutover.
+Report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
 
-The v1 queue is `jarvis-friday-bridge-v1`; state table is `bridge_runtime_v1` in a
-new isolated database. No old user/subscription/message state is silently copied.
-The issuer and public client IDs come from the approved production provider;
-there is no development-provider fallback or guessed live configuration.
+## Quickstart: Vercel + Neon + Clerk
 
-[Message/receiver contract](docs/inbox-policy.md) ·
-[Setup and configuration](docs/configuration.md) ·
-[Cutover and confirmation bundle](docs/cutover.md)
+You need Node.js 24, a Vercel account with
+[Vercel Queues](https://vercel.com/docs/queues) available, a Postgres database
+(Neon works well), an OAuth provider that issues JWT access tokens (Clerk
+works), and a domain for the bridge.
 
-Content reads expire after24h. Physical cleanup is best effort and can exhaust;
-there is no finite physical-deletion guarantee. Strict count/size capacity and
-seven-day replay tombstones bound live state. See the contract for exact limits.
+1. **Get the code and run the tests.**
+   ```sh
+   git clone https://github.com/aravhawk/agent-inbox-bridge.git && cd agent-inbox-bridge
+   npm ci && npm test
+   ```
+2. **Choose your two peers.** For example, `BRIDGE_PEERS=alice:events,bob:webhook`.
+   `alice` gets `/bridge/alice/mcp` with scopes `bridge:send:bob` and
+   `bridge:ack:alice`; `bob` gets `/bridge/bob/mcp` with `bridge:send:alice`
+   and `bridge:ack:bob`.
+3. **Create the database.** Create a new, dedicated Neon database and apply
+   the schema once:
+   ```sh
+   psql "$DATABASE_URL" -f schema.sql
+   ```
+4. **Set up Clerk.** Create a production instance and one public OAuth
+   application per peer (PKCE, no client secret) with each host's redirect
+   URL. Access tokens must be JWTs whose audience is that peer's resource URL
+   and whose scopes include the two peer scopes (plus `offline_access` if the
+   host refreshes). Note the instance's issuer origin and your user's `sub`;
+   store only its hash:
+   ```sh
+   printf %s "$YOUR_SUB" | shasum -a 256
+   ```
+5. **Deploy to Vercel.** Import the repository, attach your domain, and set
+   the environment variables below as Production secrets:
+   ```text
+   BRIDGE_PUBLIC_ORIGIN=https://bridge.example.com
+   BRIDGE_PEERS=alice:events,bob:webhook
+   BRIDGE_OAUTH_ISSUER=https://clerk.example.com
+   BRIDGE_ALLOWED_SUBJECT_SHA256=<hex digest>
+   DATABASE_URL=<postgres URL with sslmode=require>
+   BRIDGE_SUBSCRIPTION_STORAGE_KEY=<openssl rand -base64 32>
+   BRIDGE_PEER_BOB_WEBHOOK_URL=<bob's webhook endpoint>
+   BRIDGE_PEER_BOB_WEBHOOK_SECRET=whsec_<base64>
+   ```
+   `vercel.json` already routes all paths to the MCP function, keeps the queue
+   consumer private, and declares the queue trigger topic. That topic must
+   equal `BRIDGE_QUEUE_TOPIC`; both default to the same value.
+6. **Check the public boundary.**
+   ```sh
+   python3 scripts/check_v1.py --origin https://bridge.example.com --peers alice,bob
+   ```
+7. **Connect both assistants** to their MCP URLs, then call `bridge_health`
+   from each. Its `caller` field shows the verified role, scopes and offered
+   tools. Then open the gates one at a time:
+   1. `BRIDGE_OAUTH_CONTRACT_VERIFIED=true`, once both peers' real tokens carry
+      the right audience and scopes.
+   2. `BRIDGE_SUBSCRIPTIONS_ENABLED=true`, after which the events peer subscribes.
+   3. Optionally, the one-time webhook diagnostic.
+   4. `BRIDGE_PEER_BOB_WEBHOOK_CONTRACT_VERIFIED=true`, `BRIDGE_PEER_BOB_RECEIVER_ID=agent-inbox-bridge`
+      and `BRIDGE_RECEIVER_POLICY=inbox-v1`, once both receivers follow the
+      [inbox contract](docs/inbox-policy.md).
+   5. `BRIDGE_DELIVERY_ENABLED=true`.
+
+## Configuration reference
+
+The full reference, including the diagnostic and canary procedures, is in
+[docs/configuration.md](docs/configuration.md). In summary:
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `BRIDGE_PUBLIC_ORIGIN` | yes | Public HTTPS origin. Unset means compatibility mode (below). |
+| `BRIDGE_PEERS` | yes | `<id>:events,<id>:webhook` |
+| `BRIDGE_OAUTH_ISSUER` | yes | Issuer origin; JWKS at `/.well-known/jwks.json` |
+| `BRIDGE_ALLOWED_SUBJECT_SHA256` / `BRIDGE_ALLOWED_SUBJECT` | one | The single allowed token subject |
+| `BRIDGE_OAUTH_SCOPE_CLAIM` | no | `scope` (default), `scp` or `scopes` |
+| `DATABASE_URL` | yes | Any Postgres with a publicly trusted TLS certificate; connections use `verify-full` |
+| `BRIDGE_SUBSCRIPTION_STORAGE_KEY` | yes | 32-byte base64 key for subscription secrets |
+| `BRIDGE_PEER_<ID>_WEBHOOK_URL` / `_WEBHOOK_SECRET` / `_WEBHOOK_AUTH` | for delivery | Webhook peer endpoint and `standard-webhooks` (default) or `bearer` signing |
+| `BRIDGE_PEER_<ID>_RECEIVER_ID` / `_WEBHOOK_CONTRACT_VERIFIED` | for delivery | Webhook receiver attestations |
+| `BRIDGE_OAUTH_CONTRACT_VERIFIED`, `BRIDGE_SUBSCRIPTIONS_ENABLED`, `BRIDGE_RECEIVER_POLICY`, `BRIDGE_DELIVERY_ENABLED` | for delivery | Readiness gates, all closed by default |
+| `BRIDGE_SERVICE_NAME`, `BRIDGE_MESSAGE_PROTOCOL`, `BRIDGE_RECEIVER_ID`, `BRIDGE_QUEUE_TOPIC`, `BRIDGE_QUEUE_REGION`, `BRIDGE_REQUIRE_ISSUER_UNDER_ORIGIN`, `BRIDGE_DATABASE_HOST_SUFFIX` | no | Naming and optional hardening |
+
+**Compatibility mode.** This project began as a private deployment between two
+assistants named `jarvis` and `friday`. With `BRIDGE_PUBLIC_ORIGIN` unset, the
+bridge reproduces that deployment exactly: its origin, peers, scope strings,
+the `jarvis-friday/1` protocol ID, the original tool, readiness and error
+names, and the `FRIDAY_*` environment variables. Existing installs therefore
+keep working with no change. New deployments should always set
+`BRIDGE_PUBLIC_ORIGIN`. Both protocol IDs are accepted on input in every mode.
+
+## MCP surface
+
+| Tool | Who | What |
+|---|---|---|
+| `bridge_health` | both | Authenticated configuration and readiness; no data access |
+| `bridge_message_send` | both (send scope) | Send message/status/handoff-request data to the counterpart |
+| `bridge_read` | recipient | Read a stored message by the ID from its wake-up event |
+| `bridge_receipt_claim` / `bridge_receipt_complete` | recipient | Claim with a 60 s lease, then complete and atomically create the ACK |
+| `bridge_status` | both | Delivery and receipt evidence for one known message |
+| `bridge_subscription_status` | events peer | Own subscriptions and renewal observations (no secrets) |
+| `bridge_webhook_diagnostic` | events peer (send scope) | One-time, operator-armed transport check of the webhook peer |
+
+The events peer can also call `events/list`, `events/subscribe` and
+`events/unsubscribe` for `bridge.message.received`. An optional task
+coordination layer (`bridge_task_*`) exists but is off by default; see
+[docs/task-kernel.md](docs/task-kernel.md).
+
+## Limitations
+
+- Exactly two peers, one owner (a single allowed subject), one database row.
+  It is sized for one owner's traffic: at most 100 live messages, with
+  backpressure beyond that.
+- The issuer must be a bare HTTPS origin serving `/.well-known/jwks.json`.
+- Queueing uses Vercel Queues (`queue/v2beta` triggers).
+
+## Development
+
+```sh
+npm ci
+npm test                      # node --test, no network or credentials needed
+python3 scripts/audit_repo.py # repository and history secret audit
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Licensed under the
+[Apache License 2.0](LICENSE).

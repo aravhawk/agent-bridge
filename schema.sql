@@ -1,8 +1,8 @@
--- Jarvis Friday Bridge v1.0.0 schema for a NEW isolated production database.
+-- Agent Inbox Bridge v1.0.0 schema. Apply once to a NEW, empty, dedicated database.
 -- Preparation only; this source does not migrate or mutate a live database.
 -- Existing applications and databases are outside this scope.
 -- A single locked aggregate provides atomic message/outbox/receipt transitions
--- for this low-volume personal bridge. This is not a high-throughput design.
+-- for this low-volume single-owner bridge. This is not a high-throughput design.
 CREATE TABLE bridge_runtime_v1 (
   id integer PRIMARY KEY CHECK (id=1),
   revision bigint NOT NULL DEFAULT 0,

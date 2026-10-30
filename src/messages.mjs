@@ -1,14 +1,17 @@
 import { createHash } from 'node:crypto';
 import { BridgeError, SCOPES } from './policy.mjs';
+import { CONFIG, PEER_IDS } from './config.mjs';
 
-export const MESSAGE_PROTOCOL = 'jarvis-friday/1';
+// Stored and emitted protocol ID. Every accepted alias is normalized to it.
+export const MESSAGE_PROTOCOL = CONFIG.protocol;
+export const ACCEPTED_PROTOCOLS = CONFIG.acceptedProtocols;
 export const MESSAGE_TTL_MS = 3600000;
 export const CONTENT_RETENTION_MS = 86400000;
 export const IDEMPOTENCY_RETENTION_MS = 7 * 86400000;
 const isoTime = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 const fail = (code, status = 400) => { throw new BridgeError(code, status); };
-export const dailyMessage = envelope => envelope?.protocol === MESSAGE_PROTOCOL;
+export const dailyMessage = envelope => ACCEPTED_PROTOCOLS.includes(envelope?.protocol);
 export const messageScope = (role, kind) => SCOPES[role]?.[kind === 'ack' ? 'ack' : 'probe'];
 
 // Text is data for a single inbox. It cannot choose a host task, endpoint,
@@ -16,9 +19,9 @@ export const messageScope = (role, kind) => SCOPES[role]?.[kind === 'ack' ? 'ack
 export function validateMessage(input, principal, now = Date.now()) {
   const keys = ['protocol', 'id', 'from', 'to', 'kind', 'sentAt', 'expiresAt', 'threadId', 'route', 'text', 'correlationId'];
   if (!input || typeof input !== 'object' || Array.isArray(input) ||
-      Object.keys(input).some(k => !keys.includes(k)) || !['jarvis', 'friday'].includes(principal?.role) ||
-      input.protocol !== MESSAGE_PROTOCOL || !uuid.test(input.id || '') || !uuid.test(input.threadId || '') ||
-      input.from !== principal.role || !['jarvis', 'friday'].includes(input.to) || input.to === input.from ||
+      Object.keys(input).some(k => !keys.includes(k)) || !PEER_IDS.includes(principal?.role) ||
+      !ACCEPTED_PROTOCOLS.includes(input.protocol) || !uuid.test(input.id || '') || !uuid.test(input.threadId || '') ||
+      input.from !== principal.role || !PEER_IDS.includes(input.to) || input.to === input.from ||
       input.route !== 'inbox' || !['message', 'status', 'handoff_request', 'ack'].includes(input.kind)) fail('invalid_message');
   if (!principal.scopes?.includes(messageScope(principal.role, input.kind))) fail('insufficient_scope', 403);
   const sentAt = Date.parse(input.sentAt), expiresAt = Date.parse(input.expiresAt);

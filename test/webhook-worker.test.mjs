@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { BridgeError, VERIFIED_AUTHORIZATION } from '../src/policy.mjs';
 import { Bridge } from '../src/bridge.mjs';
-import { createFridaySender } from '../src/friday-sender.mjs';
+import { createWebhookSender } from '../src/webhook-sender.mjs';
 import { DeliveryWorker } from '../src/worker.mjs';
 import { MemoryStore } from '../src/store.mjs';
 import { createQueueAdapter, TOPIC } from '../src/queue.mjs';
@@ -23,7 +23,7 @@ function fixture(transport, options = {}, snapshot) {
     testId: 'RN-JARVIS-FRIDAY-SYNTHETIC', from: 'jarvis', to: 'friday', kind: 'probe',
     sentAt: new Date(time).toISOString(), marker: 'RN-SYNTHETIC-NO-ACTIONS' });
   const makeWorker = (accessAllowed = async () => true) => new DeliveryWorker({ store, clock: () => time,
-    enabled: true, policyId, accessAllowed, fridaySender: createFridaySender({ ...config, ...options, transport }) });
+    enabled: true, policyId, accessAllowed, webhookSender: createWebhookSender({ ...config, ...options, transport }) });
   // This fixture authorizer is in-process only; no production access binding is supplied.
   return { store, seed, makeWorker, advance: ms => { time += ms; } };
 }

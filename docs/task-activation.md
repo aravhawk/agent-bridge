@@ -38,7 +38,7 @@ createRuntime({
 ```
 
 Only explicit trusted `enabled: true` opts in. It requires the existing verified
-OAuth contract and normal delivery/receiver/Friday-contract policy; the narrow
+OAuth contract and normal delivery/receiver/webhook-contract policy; the narrow
 canary exception cannot enable task tools. Constructor validation rejects absent
 or malformed policy and purge settings before storage. Catalog discovery stays
 storage-free. Task calls recheck readiness, then lazily assemble the existing
@@ -90,8 +90,9 @@ verifier; request arguments cannot select policy.
 | Every `bridge_task_command`, including cached replay | Current role's ACK and directional SEND scopes |
 | New native status notice | Complete unchanged v1 message admission/prearm/insertion |
 
-Jarvis uses `bridge:ack:jarvis` and `bridge:send:friday`; Friday uses
-`bridge:ack:friday` and `bridge:send:jarvis`. No OAuth scopes/grants, credentials,
+Each peer uses `bridge:ack:<self>` and `bridge:send:<counterpart>` (in
+compatibility mode: `bridge:ack:jarvis` + `bridge:send:friday`, and
+`bridge:ack:friday` + `bridge:send:jarvis`). No OAuth scopes/grants, credentials,
 registrations, access verifier or existing resource policy are changed.
 Both admitted roles may create data records. The stored creator coordinates its
 task; existing assignee/revision/attempt fences still govern progress/results.
@@ -136,12 +137,11 @@ remains synthetic-test-only and is not part of the live activation bundle.
 
 Runtime wiring is complete and locally tested in both modes/directions. After
 approval, deliberately opt in through the trusted production assembly. Refresh the
-actual ChatGPT/Grok Bot catalogs for the three existing candidate task tools;
+actual host catalogs for the three existing candidate task tools;
 make no new event schema. The unchanged production assembly still exposes ordinary
 v1 only. Local catalog tests do not verify native discovery. Before claiming
-native integration, verify the actual Grok receiver's
+native integration, verify the actual webhook receiver's
 supported payload-to-context mapping and run identity/start/completion evidence.
-Historical Cursor docs do not establish Grok's binding.
 
 Receiver workflow: on the existing event, resolve that exact message ID once with
 fresh data access. Read current task state; independently check the owner workflow
@@ -172,14 +172,14 @@ introduced. These native catalog/workflow changes remain unperformed.
 
 1. Use the corrected, reviewed/fingerprinted
    combined candidate, rebased/tested against current main, through the
-   existing branch/PR, exact-head green CI, merge and Vercel workflow. Verify the
+   normal reviewed pull request, green CI, merge and deployment. Verify the
    deployed source/alias while the task runtime gate stays off.
 2. Confirm trusted configuration matches the existing verifiers without exposing
    pin/token values. Deliberately supply the runtime's trusted `taskData` options,
    with purge off. Open the approved verification window, opt in, then refresh the actual
    catalogs/workflows and run bounded acceptance. Disable it if acceptance fails.
 3. Acceptance separates task/notice storage, native event emission, exact ID in
-   actual ChatGPT/Grok context, hosted execution, current claim/checkpoint/result
+   actual host context, hosted execution, current claim/checkpoint/result
    and terminal v1 receipt behavior. Include work exceeding the mutex and resolve
    its existing run without relaunch. HTTP acceptance or a peer-reported host ID is
    insufficient. Local tests cover denial races, crossed roles/owners, stale

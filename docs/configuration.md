@@ -1,353 +1,255 @@
-# Jarvis Friday Bridge v1.0.0 configuration
+# Configuration reference (v1.0.0)
 
-## Fixed service identity
+All configuration is environment variables. Nothing a caller sends can select
+the issuer, key source, peer, audience, callback destination or signing secret.
+Copy [`.env.example`](../.env.example) as a starting point and keep every
+secret in your platform's secret store, never in the repository.
 
-Origin: `https://jarvis-friday-bridge.aravhawk.com`.
-Only this origin accepts authenticated MCP and resource metadata. Default Vercel
-aliases may expose public liveness but do not accept MCP credentials. Request
-headers cannot select the issuer, JWKS, role, callback, destination or audience.
+## Deployment identity
 
-| Client | Resource audience | Directional scopes | Existing native callback to confirm in actual final form |
-|---|---|---|---|
-| Jarvis | Origin + `/bridge/jarvis/mcp` | bridge:send:friday, bridge:ack:jarvis, offline_access | https://chatgpt.com/connector_platform_oauth_redirect |
-| Friday | Origin + `/bridge/friday/mcp` | bridge:send:jarvis, bridge:ack:friday, offline_access | https://www.cursor.com/agents/mcp/oauth/callback |
+Read once when the function starts. An invalid value stops startup with a
+`ConfigurationError` instead of serving with a guessed default.
 
-Friday is Grok Bot. The Cursor callback above records an earlier observation,
-not proof of the current Grok Bot binding or an instruction to change it.
-Cursor-specific automation/API documentation does not establish Friday's
-webhook payload mapping or execution lifecycle. Confirm the actual native
-binding without copying its saved endpoint/key; see [task-kernel boundaries](task-kernel.md).
+| Variable | Default | Meaning |
+|---|---|---|
+| `BRIDGE_PUBLIC_ORIGIN` | *(required)* | Public HTTPS origin, e.g. `https://bridge.example.com`. No path, port or trailing slash. Only this origin accepts MCP and resource-metadata requests; other aliases (such as a default `*.vercel.app` domain) serve public health only. |
+| `BRIDGE_PEERS` | *(required)* | Exactly two peers: `<id>:events,<id>:webhook`. IDs are lowercase letters, digits and inner hyphens (max 32). |
+| `BRIDGE_SERVICE_NAME` | `Agent Inbox Bridge` | Name in `/health` and resource metadata. |
+| `BRIDGE_MESSAGE_PROTOCOL` | `agent-inbox/1` | Protocol ID stored and advertised. `agent-inbox/1` and `jarvis-friday/1` are both accepted on input and normalized to this value. |
+| `BRIDGE_RECEIVER_ID` | `agent-inbox-bridge` | Receiver ID the webhook peer's attestation must match. |
+| `BRIDGE_QUEUE_TOPIC` | `jarvis-friday-bridge-v1` | Vercel Queue topic. **Must equal** the trigger topic in `vercel.json`. The default is historical; change both together if you rename it. |
+| `BRIDGE_QUEUE_REGION` | `iad1` | Vercel Queue region; keep it aligned with `regions` in `vercel.json`. |
+| `BRIDGE_REQUIRE_ISSUER_UNDER_ORIGIN` | `false` | When `true`, the OAuth issuer must be a subdomain of the public origin (e.g. `https://clerk.bridge.example.com`). |
+| `BRIDGE_DATABASE_HOST_SUFFIX` | *(empty)* | Optional pin for the database hostname, e.g. `.neon.tech`. |
 
-Both clients are public, provided registrations, token authentication none,
-required S256 PKCE and provider-hosted consent. JWT access tokens must include
-the exact resource audience. No client Secret, DCR/CIMD, device grant, OIDC
-identity scopes or provider-admin API key is required by this resource server.
-Callbacks above are the previously observed native values; recheck the actual
-new client flow before saving an allowlist. Do not guess replacements.
+### Peers and scopes
 
-## Provider identity and bootstrap
+Each peer has its own MCP resource and audience, `<origin>/bridge/<id>/mcp`,
+and two OAuth scopes derived from its ID:
 
-BRIDGE_OAUTH_ISSUER is required and blank by default. Obtain the exact HTTPS
-origin from the new approved Clerk production instance's live metadata; verify
-issuer/JWKS endpoints after DNS/TLS. It must be beneath the service's namespace
-(`*.jarvis-friday-bridge.aravhawk.com`), without credentials, path, query, port or
-fragment. A development issuer or unrelated domain is rejected. There is no
-assumed production issuer/client ID in source. The fixture identity used by
-unit tests is not a deployed or proposed provider configuration.
+| Scope | Grants |
+|---|---|
+| `bridge:send:<counterpart>` | Send message/status/handoff-request data to the other peer's inbox (and, for the events peer, the one-time webhook diagnostic). |
+| `bridge:ack:<self>` | Read, claim and complete messages addressed to this peer (and, for the events peer, event subscriptions). |
 
-During Clerk setup, select the subdomain-scoped Secondary application when
-offered. A Primary application may use clerk.aravhawk.com, which is outside this
-issuer constraint. Confirm the actual issuer from production metadata before
-native grants; stop if a compatible setup is unavailable instead of weakening
-the constraint or guessing DNS records.
+Ask for `offline_access` as well if your host refreshes tokens. The
+**events peer** receives deliveries as signed MCP event callbacks that it
+registers itself with `events/subscribe`. The **webhook peer** receives a POST
+to a server-configured URL. The bridge is deliberately a two-party inbox; it
+does not fan out, relay or route between more peers.
 
-Pin the real new production user's subject using BRIDGE_ALLOWED_SUBJECT_SHA256
-as a Production Secret; do not reuse the development instance's subject pin.
-Never put raw tokens, user IDs, login flows or Secret values in source/reports.
-The displayed provider subject can be hashed locally without printing it and
-only the digest saved to the approved new Secret target. Actual sign-in or
-credential entry remains a native/human flow. No fabricated allow-all pin.
+### Compatibility mode
 
-Once provider + pin are configured, the resource can expose authenticated
-bridge_health alone even while BRIDGE_OAUTH_CONTRACT_VERIFIED=false. It still
-checks real JWT signature, issuer, role audience, subject and scopes. Bootstrap
-cannot list/subscribe to events or read/write message data; authenticated
-unsubscribe remains available to honor withdrawal. It never issues/echoes tokens
-or logs claims. Require successful native health under BOTH actual clients
-before attesting the OAuth contract and refreshing the same app's tools. Health
-accepts at least one appropriate directional scope; it does not prove both send
-AND ACK scopes. Independently verify both required scopes for each actual
-grant/token without exposing tokens/claims before attestation. If that proof is
-unavailable in the supported native flow, keep the OAuth contract unattested.
+If `BRIDGE_PUBLIC_ORIGIN` is **unset**, the bridge reproduces the original
+deployment it was extracted from. The original operator needs no
+environment change. The compatibility defaults are origin
+`https://jarvis-friday-bridge.aravhawk.com`, peers `jarvis:events,friday:webhook`,
+service name `Jarvis Friday Bridge`, protocol `jarvis-friday/1`, receiver ID
+`jarvis-friday-bridge-inbox`, the issuer-under-origin rule on, and the database
+host pinned to `.neon.tech`. Webhook-peer names keep their original spelling:
+the `bridge_friday_webhook_diagnostic` tool, the `friday*` readiness keys, the
+`friday_*` error codes and the `fridayWebhookDiagnostic`/`fridayCanary` state
+keys. In generic mode these become `bridge_webhook_diagnostic`, `webhook*` and
+`webhook_*`. New deployments should always set `BRIDGE_PUBLIC_ORIGIN`.
 
-Normal v1 catalog: seven Jarvis tools, six Friday tools. There is no synthetic
-bridge_send. bridge_message_send handles bounded data; read/receipt/status tools
-are scoped; Jarvis additionally has safe bridge_subscription_status metadata.
-After OAuth attestation, Jarvis callers with the send scope also discover the
-one-time diagnostic schema regardless of arming (eight tools with both scopes).
-An authenticated health result proves neither DB connectivity nor native wake.
+## OAuth provider and identity
 
-Delivery flags never change the catalog. After attestation every token with a
-directional scope is offered bridge_status, so a host showing only bridge_health
-is displaying a cached or filtered list, not this server's output. Health
-reports `caller`: the role, whether the token carries the send and ACK scopes,
-and the exact tool names this server offers that caller. Compare it with the
-host's displayed list before changing grants or reconnecting.
+| Variable | Meaning |
+|---|---|
+| `BRIDGE_OAUTH_ISSUER` | Required. The provider's exact issuer: a bare HTTPS origin (no path, port, query or credentials, not an IP or `localhost`) that serves its JWKS at `/.well-known/jwks.json`. Clerk production instances fit this shape. |
+| `BRIDGE_ALLOWED_SUBJECT_SHA256` | Hex SHA-256 of the one allowed token `sub`. Preferred over the raw value. |
+| `BRIDGE_ALLOWED_SUBJECT` | Alternative: the raw allowed `sub`. Set exactly one of the two. |
+| `BRIDGE_OAUTH_SCOPE_CLAIM` | `scope` (default), `scp` or `scopes`. |
+| `BRIDGE_OAUTH_CONTRACT_VERIFIED` | `true` only after you have verified real tokens for both peers (below). |
 
-## New project Secret/config bindings
+Tokens must be RS256 JWTs with `exp`, `iat` and `sub`, the exact peer resource
+as audience and the configured issuer. Both peer clients are public OAuth
+clients (PKCE S256, token auth `none`) registered in the provider. The bridge
+never issues, stores or logs tokens and needs no provider admin secret.
 
-Only Production on project prj_rTBPrIoODxpC1A6sS2OQtlvc7cqE, Arav's Projects.
-Do not pull environment files or copy/decrypt old project secrets.
+**Bootstrap.** Once the issuer and subject pin are set, each peer can call an
+authenticated `bridge_health` even while `BRIDGE_OAUTH_CONTRACT_VERIFIED=false`.
+Health still verifies signature, issuer, audience, subject and scopes; it reads
+no messages and lists no events. Its `caller` field reports the role, whether
+the token carries the send and ACK scopes, and the exact tool names offered.
+Compare that with what your host displays before attesting the contract.
 
-- DATABASE_URL: native Neon integration Secret for a NEW isolated database;
-  verified TLS (`verify-full`), Neon hostname, poolmax2. Apply schema.sql only
-  after approval to the new empty database. No auto-migration or memory fallback.
-- BRIDGE_SUBSCRIPTION_STORAGE_KEY: fresh32-byte key, stored as a sensitive
-  Production Secret. Protects native callback data with AES-GCM and ID-bound AAD.
-- FRIDAY_WEBHOOK_URL / FRIDAY_WEBHOOK_KEY: dedicated new receiver binding, saved
-  through approved private transfer. Never ask for either in chat or reveal it.
-- BRIDGE_ALLOWED_SUBJECT_SHA256: new production identity pin, Secret.
-- BRIDGE_OAUTH_ISSUER / BRIDGE_OAUTH_SCOPE_CLAIM=scope: verified public provider
-  contract. No Clerk backend Secret key is needed or copied into the backend.
+## Storage
 
-Closed defaults:
+| Variable | Meaning |
+|---|---|
+| `DATABASE_URL` | `postgres://` or `postgresql://` URL with `sslmode=require` or `verify-full`. The bridge always connects with `verify-full` against public CAs, so `sslrootcert`, `sslcert` and `sslkey` are rejected. Apply [`schema.sql`](../schema.sql) once to an empty database. |
+| `BRIDGE_SUBSCRIPTION_STORAGE_KEY` | 32 random bytes, base64 (e.g. `openssl rand -base64 32`). Encrypts subscription callback URLs and secrets with AES-256-GCM, bound to the subscription ID. |
 
-```text
-BRIDGE_OAUTH_CONTRACT_VERIFIED=false
-BRIDGE_SUBSCRIPTIONS_ENABLED=false
-BRIDGE_DELIVERY_ENABLED=false
-BRIDGE_RECEIVER_POLICY=
-FRIDAY_RECEIVER_ID=jarvis-friday-bridge-inbox
-FRIDAY_WEBHOOK_CONTRACT_VERIFIED=false
-FRIDAY_CANARY_MESSAGE_ID=
-FRIDAY_CANARY_FROM=
-FRIDAY_CANARY_UNTIL=
-FRIDAY_CANARY_RETURN_SUBSCRIPTION_ID=
+There is no auto-migration and no in-memory production fallback. State is a
+single row locked per transaction, sized for a single owner's workload
+(at most 100 live source messages and a 4 MiB document).
+
+## Readiness gates
+
+Every gate defaults to closed. A flag is an operator attestation, not evidence.
+
+| Variable | Opens |
+|---|---|
+| `BRIDGE_SUBSCRIPTIONS_ENABLED=true` | Events-peer `events/subscribe` (requires the OAuth contract, storage and storage key). |
+| `BRIDGE_RECEIVER_POLICY=inbox-v1` | Attests that both receivers enforce the [inbox contract](inbox-policy.md). |
+| `BRIDGE_DELIVERY_ENABLED=true` | Message send, receipts and queue delivery, only if every other gate is also satisfied. |
+
+`bridge_health` reports each gate under `readiness`. Delivery flags never
+change the tool catalog: the events peer sees seven tools (eight with the send
+scope after attestation, including the diagnostic), the webhook peer six.
+
+## Webhook peer
+
+Per-peer variables use the prefix `BRIDGE_PEER_<ID>_`, where `<ID>` is the
+webhook peer ID upper-cased with `-` replaced by `_` (peer `ops-bot` →
+`BRIDGE_PEER_OPS_BOT_`). The original `FRIDAY_*` names are still accepted as
+fallbacks; the per-peer name wins when both are set.
+
+| Suffix | Legacy fallback | Meaning |
+|---|---|---|
+| `WEBHOOK_URL` | `FRIDAY_WEBHOOK_URL` | HTTPS endpoint (port 443, no credentials, not an IP). DNS is resolved and must be public; the socket is pinned to the checked address. |
+| `WEBHOOK_SECRET` | `FRIDAY_WEBHOOK_KEY` | Signing secret. With a per-peer secret the default mode is Standard Webhooks and the secret must be `whsec_` + base64 (24–64 bytes). The legacy key defaults to bearer mode. |
+| `WEBHOOK_AUTH` | — | `standard-webhooks` or `bearer`. Overrides the default above. |
+| `RECEIVER_ID` | `FRIDAY_RECEIVER_ID` | Must equal `BRIDGE_RECEIVER_ID` to attest the receiver is configured for this bridge. |
+| `WEBHOOK_CONTRACT_VERIFIED` | `FRIDAY_WEBHOOK_CONTRACT_VERIFIED` | `true` only after the receiver's native run has shown the exact event (see the diagnostic below). |
+| `DIAGNOSTIC_FROM` / `DIAGNOSTIC_UNTIL` | `FRIDAY_WEBHOOK_DIAGNOSTIC_FROM` / `_UNTIL` | One-time diagnostic window. |
+| `CANARY_MESSAGE_ID`, `CANARY_RETURN_SUBSCRIPTION_ID`, `CANARY_FROM`, `CANARY_UNTIL` | `FRIDAY_CANARY_*` | One stored-message canary. |
+
+Every delivery is one POST with this exact body:
+
+```json
+{"event":"bridge.message.received","data":{"messageId":"<uuid>"}}
 ```
 
-After native health/contract proof, subscription setup can be enabled separately
-from delivery. Native ChatGPT creates exactly one new v1 subscription with its
-own callback/secret. Its lease is capped by verified JWT expiry. Each valid
-subscribe re-grants the requested TTL within that ceiling, including after a
-shorter TTL lapses. Reusing a token can renew a shorter grant but cannot extend
-past that token's expiry. Later verified expiry can raise the ceiling. Denial and
-unsubscribe tombstones survive renewal/restart. No provider introspection or
-immortal lease is claimed. Verify actual native renewal and exact subscription
-identity before transport activation; metadata count alone does not prove it.
+In `standard-webhooks` mode, the request carries `webhook-id` (the delivery's
+stable `evt_…` event ID, identical across retries), `webhook-timestamp` and
+`webhook-signature` per the [Standard Webhooks](https://www.standardwebhooks.com/)
+spec. Verify it with any Standard Webhooks library. In `bearer` mode it carries
+`Authorization: Bearer <secret>`. The body never contains message text; the
+receiver reads the message through its own authenticated MCP session. The
+response body is never read, and a 2xx status is transport evidence only.
 
-Delivery additionally requires verified Friday binding/contract and attested
-inbox-v1 policies on BOTH receivers, then global delivery true. New grants and
-these activations require the specifically reviewed action-time bundle. A flag
-is an operator attestation, not independent evidence. Do not reuse old test
-windows, IDs, grants, callbacks or activation approvals for the changed realm.
+## One-time webhook diagnostic
 
-## Bounded queue failure recovery
-
-An eligible private queue callback that still fails on delivery 18 or later
-attempts to publish one successor on the existing topic before acknowledging
-the old item. This happens in the asynchronous consumer, not the SDK's
-synchronous retry hook. The successor preserves its work identifier, uses a
-stable idempotency key for ambiguous publication/ACK outcomes, waits 60 seconds,
-and carries an absolute recovery deadline. Descendants cannot extend that
-deadline beyond the original queue item's expiry or one hour from its creation.
-Workers retain all original source/recipient expiry, authorization and attempt
-limits. Known-absent source/ACK commits do not spawn continuations.
-
-This requires no new environment variable, grant, endpoint, schedule or service.
-Healthy work adds no recovery publication. Prolonged handler/database failures
-add queue publishes and callbacks within the fixed window; the five-attempt
-transport cap stays unchanged. If the consumer cannot start, or every successor
-publish also fails through the remaining SDK attempts, work can still exhaust
-the platform budget. Cleanup remains best effort. This is bounded recovery of
-known backend work, not assistant inbox polling or a guarantee of delivery.
-
-HTTP acceptance does not schedule another hosted turn after a receiver fails.
-These continuations do not retry accepted transports or the one-shot diagnostic,
-and receipt leases alone do not recover hosted processing. Exactly-once durable
-receipt/ACK creation does not guarantee exactly-once external agent actions.
-
-A transient `storage_unavailable` during the worker's pre-send access or state
-check leaves the job pending under its existing five-attempt/backoff budget;
-every retry rechecks expiry, revocation and delivery gates. Configuration and
-decryption failures stay terminal. No send occurs on a failed access check.
-The pre-commit dispatcher provides bounded recovery when immediate scheduling
-fails. The tool reports `scheduling: not_confirmed`, never promises a running
-reconciliation daemon. Work can still exhaust after a long shutdown/outage;
-re-enabling a flag alone does not guarantee recovery of exhausted queue items.
-
-Known permitted tool execution failures use HTTP200 with `result.isError:true`
-and a sanitized structured error, including closed readiness gates. Existing
-HTTP401/403 errors retain their status and the401 metadata challenge; some local
-domain-expiry controls currently also return403.
-Malformed RPC envelopes and unavailable tools remain protocol errors. Callers
-must inspect the tool result, not interpret HTTP200 as successful execution.
-
-## One-time Friday webhook diagnostic
-
-Transport-only check of the saved Friday receiver binding while delivery stays
+This is a transport-only check of the webhook peer binding while delivery stays
 off. It is armed only when the OAuth contract is attested, storage and the
-Friday URL/key are configured, FRIDAY_RECEIVER_ID is `jarvis-friday-bridge-inbox`
-and FRIDAY_WEBHOOK_DIAGNOSTIC_FROM / FRIDAY_WEBHOOK_DIAGNOSTIC_UNTIL are fixed ISO
-start/end timestamps for an interval of at most two hours total. Both values
-are required: FROM must be at or before now, and UNTIL must be after now. Missing,
-invalid, reversed or overlong intervals stay closed, including after a restart;
-an overlong interval cannot become valid as time passes. This replaces the old
-deadline-only configuration. Prepare both timestamps together for the approved
-test window; no new credential or service is needed. Health reports
-`fridayWebhookDiagnosticArmed`. After OAuth attestation, Jarvis with its send
-scope alone sees `bridge_friday_webhook_diagnostic`, which takes no arguments,
-even while unarmed. Friday never sees it; pre-attestation bootstrap stays health
-only. Discovery grants no execution: every invocation checks readiness before
-storage or transport setup, and an unarmed/expired call fails with
-`friday_diagnostic_not_armed` without spending an attempt. This stable schema
-allows the native catalog to refresh while delivery and the diagnostic are off.
-Native caching or host filtering can still require a supported refresh.
+webhook URL/secret are configured, the receiver ID matches, and
+`DIAGNOSTIC_FROM`/`DIAGNOSTIC_UNTIL` are ISO timestamps for a window of at most
+two hours that contains the present. A missing, reversed or overlong window
+stays closed; an overlong window never becomes valid as time passes.
 
-The first call commits a durable spend marker with a fresh server UUID before
-any request starts, then makes ONE POST: the saved URL, `Authorization: Bearer`
-with the saved key, `Content-Type: application/json` and exactly
-`{"event":"bridge.message.received","data":{"messageId":"<uuid>"}}`. There are
-no retries. Concurrent calls, restarts, re-arming, timeouts and lost outcomes
-only return the recorded attempt (`duplicate: true`); a second send needs a
-code change. The window is checked again after the spend commits and before
-starting transport. If it has closed, no request starts, the spend remains
-permanent and the recorded result is `friday_diagnostic_expired`. Results carry
-the UUID, numeric status or sanitized error, never
-the URL, key or response body. No message is stored, so Friday's read of the
-UUID returns message_not_found by design.
+Once the OAuth contract is attested, the events peer with its send scope sees
+the diagnostic tool even while it is unarmed. The tool takes no arguments, and
+the webhook peer never sees it. Each call checks readiness before touching
+storage. The first armed call durably records a spend marker with a fresh UUID
+*before* sending, then makes exactly one POST in the configured mode. After
+that, concurrent calls, restarts, re-arming, timeouts and lost outcomes return
+only the recorded attempt (`duplicate: true`), so a second send needs a code
+change. If the window closed between the spend and the send, nothing is sent
+and the result is `<prefix>_diagnostic_expired`. Results carry the UUID and a
+numeric status or sanitized error, never the URL, secret or response body.
+No message is stored, so reading the UUID returns `message_not_found` by design.
 
-HTTP 2xx proves neither wake nor mapping. Evidence is the native Friday run
-showing this exact event and data.messageId. Only then may an operator consider
-FRIDAY_WEBHOOK_CONTRACT_VERIFIED; the diagnostic never sets it. Afterwards,
-clear both diagnostic timestamps (the window also lapses on its own).
+HTTP 2xx proves neither wake nor mapping. Only when the receiver's native run
+shows that exact event and `data.messageId` should you set
+`WEBHOOK_CONTRACT_VERIFIED`. Clear the window afterwards.
 
 ## One stored-message canary
 
-A server-armed exception that lets ONE fixed Jarvis -> Friday source and its
-server-created ACK use the existing tools, queue and Friday sender while
-`BRIDGE_DELIVERY_ENABLED`, `BRIDGE_RECEIVER_POLICY` and
-`FRIDAY_WEBHOOK_CONTRACT_VERIFIED` stay off. It is a diagnostic, not readiness
-evidence: it never sets a flag, `deliveryEnabled` stays false and no tool,
-endpoint, grant or credential is added. Health reports only `canaryArmed`.
+The canary is a server-armed exception that lets one fixed events-peer →
+webhook-peer source and its server-created ACK use the normal tools, queue and
+sender while delivery and the webhook contract are still off. It never sets a
+flag. `deliveryEnabled` stays false, and health reports only `canaryArmed`.
 
-Armed only when the OAuth contract is attested, storage, callback protector and
-Friday URL/key are configured, FRIDAY_RECEIVER_ID is exactly
-`jarvis-friday-bridge-inbox`, normal delivery is off, and all four values are
-valid: FRIDAY_CANARY_MESSAGE_ID (a fresh lowercase UUID), FRIDAY_CANARY_FROM /
-FRIDAY_CANARY_UNTIL (fixed ISO interval of at most 30 minutes total, FROM at or
-before now, UNTIL after now) and FRIDAY_CANARY_RETURN_SUBSCRIPTION_ID (the
-existing active `sub_...` Jarvis return subscription). Missing, malformed,
-reversed, overlong, future or expired settings stay closed; an overlong interval
-never opens as time passes. Callers choose no ID, target, window or setting.
+It is armed when the OAuth contract is attested, storage, storage key and
+webhook URL/secret are configured, the receiver ID matches, normal delivery is
+off, and all four canary values are valid:
+- `CANARY_MESSAGE_ID`: a fresh lowercase UUID.
+- `CANARY_FROM`/`CANARY_UNTIL`: a window of at most 30 minutes containing now.
+- `CANARY_RETURN_SUBSCRIPTION_ID`: the events peer's existing active `sub_…`
+  subscription.
 
-The only admissible source is Jarvis `bridge_message_send` with protocol
-`jarvis-friday/1`, `id` and `threadId` both the configured UUID, from `jarvis`,
-to `friday`, kind `status`, route `inbox`, `expiresAt` exactly UNTIL (same
-instant), `sentAt` within the normal 5-minute validation and text exactly
-`CANARY_TEXT` from `src/friday-canary.mjs`:
+The only admissible source is a `bridge_message_send` from the events peer to
+the webhook peer with `id` and `threadId` both equal to the canary UUID, kind
+`status`, route `inbox`, `expiresAt` exactly `CANARY_UNTIL`, and text exactly:
 
 ```text
-Jarvis Friday Bridge canary: one-time status data only. No action is requested.
+<BRIDGE_SERVICE_NAME> canary: one-time status data only. No action is requested.
 ```
 
-Any other source, body, thread, direction, kind or expiry is refused with
-`friday_canary_only`; manual ACK sends still return
-`use_receipt_complete_for_ack`. All existing JWT, pinned role/scope, hard-expiry,
-denial and message validation checks still run first. The return-path check is
-pinned to the configured subscription, which must be active, owned by the
-sending Jarvis identity and outlive the source. In canary mode, claim/complete
-admit only that source (Friday) and its ACK (the reserving Jarvis owner); every
-other stored message returns `friday_canary_only`. Read/status authorization is
-unchanged. Without an armed canary every gated path returns
-`receiver_readiness_required` as before.
+Anything else returns `<prefix>_canary_only`. All normal JWT, scope, expiry,
+denial and validation checks still run first. The first admitted send commits
+a durable lifetime reservation before any queue publication. Nothing clears it,
+and a different UUID, window, subscription or body returns
+`<prefix>_canary_spent`. Source and ACK jobs carry a one-attempt limit, and
+timeouts, 5xx results and restarts are never retried. The ACK goes only to the
+pinned return subscription.
 
-The first admitted send commits a durable lifetime reservation
-(`fridayCanary`: UUID, hashed owner, FROM/UNTIL, return subscription, source
-hash, reservation time, later the ACK ID and bounded read results) before any
-queue publication. It is separate from the spent webhook diagnostic marker,
-which it never modifies; that marker's UUID is refused as a canary ID.
-Nothing clears it. A new UUID, moved/extended window, other subscription or
-changed body returns `friday_canary_spent` (or `message_id_conflict` once the
-source is stored); an exact replay is idempotent. Retry a failed send only
-with identical arguments. A spend whose window closes during commit stays spent.
+To run it:
+1. Set the four values.
+2. The events peer sends the fixed source once.
+3. The webhook peer reads, claims and completes it.
+4. The events peer reads, claims and completes the ACK.
+5. Inspect `bridge_status` for both messages, then clear the values.
 
-Source and ACK jobs persist a one-attempt limit; the Friday POST uses the sender's
-unverified one-job probe mode and the Jarvis callback records every invocation as
-terminal. Timeouts, 5xx results, crashes, lease expiry and restarts are never
-retried: conservative loss is accepted for this one-shot diagnostic. The worker
-rechecks UNTIL after the access check and state recheck commits, immediately
-before transport. The ACK has exactly one job, for the pinned subscription; other
-active subscriptions receive nothing. In canary mode the private queue callback
-accepts only `{dispatchMessageId|dispatchReceiptOf: <canary UUID>}` while armed;
-direct job IDs and all other work stay closed and untouched (not leased, counted or
-marked dead). Canary tool results report `scheduling: not_confirmed` because
-direct job scheduling stays closed; dispatch comes from the pre-commit
-preparation item, so this alone does not indicate a failure.
+The results are server operation evidence only (`wakeVerified: false`).
 
-Procedure: set the four values (FROM now, UNTIL at most 30 minutes later), then
-Jarvis sends the fixed source once. Friday `bridge_read`, `bridge_receipt_claim`
-and `bridge_receipt_complete` (null host IDs unless independently known), then
-Jarvis reads, claims and completes the ACK (terminal, no further ACK). Inspect
-`bridge_status` for the source and ACK: deliveries (attempts, transport attempts,
-first outcome), `receiptCompleted`, `ackMessageId` and `canary.readObservations`.
-Clear the four values afterwards. Results are server operation evidence only
-(`server_operation_results_only_not_native_wake`, `wakeVerified: false`); they
-prove neither native event context nor host IDs, nor ordinary bidirectional
-delivery or lease renewal.
+## Bounded queue recovery
+
+An eligible queue callback that still fails on delivery 18 or later publishes
+one successor before acknowledging the old item. The successor keeps the same
+work identifier and a stable idempotency key, waits 60 seconds, and carries an
+absolute deadline. That deadline is capped at the original item's expiry or one
+hour after its creation, whichever is earlier. Workers keep every original
+expiry, authorization and attempt limit (five transport attempts). This is
+bounded recovery of known backend work, not polling, and not a delivery
+guarantee. A long outage can still exhaust the platform's retry budget.
+
+When scheduling right after a send fails, the tool result reports
+`scheduling: not_confirmed`; dispatch then comes from the pre-commit
+preparation item. A transient `storage_unavailable` during the worker's
+pre-send checks keeps the job pending within its budget. Configuration and
+decryption failures are terminal.
+
+Permitted tool execution failures return HTTP 200 with `result.isError: true`
+and a sanitized error code. Authentication and permission failures keep their
+HTTP 401/403 status (401 with the resource-metadata challenge). Callers must
+inspect the tool result, not just the HTTP status.
 
 ## Bounded operation evidence
 
-Subscription requests accept an optional non-negative safe-integer `maxAgeMs`
-as in the [MCP Events draft's cursor lifecycle](https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md#cursor-lifecycle).
-It has no effect on this event: replay is
-unsupported and the cursor remains null. It never alters subscription identity,
-lease expiry, callback verification or delivery admission. Non-null cursors and
-unknown fields remain rejected. This compatibility allowance is not evidence
-that the native host has sent this field or that it caused a renewal failure.
+The bridge keeps a small amount of sanitized evidence for operators:
+- **Subscription renewals:** up to eight recent results per subscription, each
+  under 24 hours old. The owner sees them through `bridge_subscription_status`
+  together with `inactiveReason`.
+- **Diagnostic UUID reads:** after the diagnostic spend, up to eight results of
+  reads of its UUID, visible through `bridge_status`.
 
-The existing store retains at most eight renewal-result observations per saved
-subscription and eight read-result observations for the single diagnostic UUID.
-Only records less than 24 hours old are visible. Retention is lazy: relevant
-successful transactions prune stale records; idle storage does not have a timed
-deletion guarantee. No new table, binding, schedule, service or credential is
-needed. Each qualifying operation adds one best-effort store transaction and
-its associated database latency. Recording failures are ignored without retry,
-preserving the original result or error.
+Each record holds a time, success/error, an allowlisted code and the granted
+deadlines. Records never hold tokens, callback URLs, secrets, error messages or
+message content. Recording is best effort, and it never extends a lease or
+reopens denied access. An optional `maxAgeMs` on `events/subscribe` is accepted
+for compatibility with the
+[MCP Events draft](https://github.com/modelcontextprotocol/experimental-ext-triggers-events/blob/main/docs/design-sketch-proposal.md#cursor-lifecycle);
+it has no effect, because replay is unsupported and the cursor stays null.
 
-The existing subscription-status tool returns `inactiveReason` and
-`renewalObservations` only for the caller's own subscriptions. Records contain
-time, success/error, an allowlisted result code, an optional sanitized callback
-failure reason, the granted refresh deadline, and whether the presented
-authority expiry was new, same, later, earlier or unknown. They never retain
-tokens, callback URLs, callback secrets, error messages or message content.
-Failed initial setup without a saved identity, pre-authentication rejection,
-runtime preflight failure and unavailable storage can leave no observation.
-These records are not a complete request log. Recording never extends a lease,
-reopens denied/unsubscribed access or changes subscription identity.
+## Public checks and plugin packaging
 
-Rejected subscription parameter shapes can also record `invalid_params` when
-the caller has current verified Jarvis/ACK authority and the known event,
-exact filter and validated callback identify an existing caller-owned binding.
-Only the usual fixed result metadata is saved, never parameter names/values or
-callback URLs. Validation still rejects the request with its original error.
-Unknown or malformed bindings are not invented from a supplied ID. A recognizable
-binding requires one store lookup transaction; an unmatched owner/ID rolls it
-back without a durable UPDATE. Unauthenticated, wrong-scope, expired-authority
-or unrecognizable requests make no observation-store call. Recording is best
-effort and cannot turn a malformed request into a subscription or retry.
-
-After the diagnostic spend, an authorized Friday `bridge_read` of its exact
-UUID can record its original success/error without storing the source payload.
-Capture closes at the earlier of the original arm deadline and 30 minutes after
-the spend, even if settings are subsequently changed. `bridge_status` exposes
-these sanitized results when no source message exists: the original Jarvis
-operator with ACK scope may inspect all records; Friday with ACK scope may see
-only its own records. New first-spend markers save the operator's existing
-hashed principal identity solely for this isolation. Legacy ownerless markers
-are never backfilled and grant no new Jarvis status access. The permanent spend
-marker is never cleared by evidence expiry. Existing stored-message status
-responses stay unchanged.
-
-`evidenceStatus: server_read_result_only_not_native_wake` and `wakeVerified:
-false` are deliberate: a recorded read result proves a server call by that
-authenticated principal, not the original native event context, routine wake,
-claim, completion or ACK. No observation retries a request or enables delivery.
-Deploying this change cannot recover the earlier diagnostic's missing trace.
-
-## Public metadata/package checks
-
-`npm run check:remote` expects an unconfigured, closed v1 deployment. After
-actual verified issuer setup, use `python3 scripts/check_v1.py --issuer <actual>`;
-after JWT policy is configured add `--auth-configured`. These compare public
-metadata and send only an invalid nonsecret fixture, never a real token/event.
-
-Portable plugin source is v1.0.0 with an explicitly non-live MCP template. Render
-only after obtaining actual approved public client metadata:
+`scripts/check_v1.py` makes credential-free requests against a deployment:
+health, the per-peer 401 challenge, metadata, cross-origin rejection, an
+invalid token, and the absence of the private queue and legacy paths.
 
 ```sh
-python3 scripts/package_plugin.py --issuer <actual-issuer-origin> --jarvis-client-id <actual-public-id>
+python3 scripts/check_v1.py --origin https://bridge.example.com --peers alice,bob \
+  --issuer https://clerk.bridge.example.com --auth-configured
 ```
 
-Output stays in ignored .reports/. Rendering does not install a plugin, create
-a grant or replace the actual native custom MCP registration. Do not install
-unresolved templates or create duplicate registrations to refresh discovery.
+`scripts/package_plugin.py` renders the MCP plugin template in `plugin/` for
+one peer into the ignored `.reports/` directory. It never uploads or installs
+anything:
+
+```sh
+python3 scripts/package_plugin.py --origin https://bridge.example.com --peer alice \
+  --counterpart bob --issuer https://clerk.bridge.example.com --client-id <public-client-id>
+```

@@ -24,6 +24,15 @@ RULES = {
     'message-or-real-user-id': re.compile(rb'\b(?:Sentinel_[0-9a-f]+|user_[A-Za-z0-9]{20,})\b'),
     'private-contact-email': re.compile(rb'[A-Za-z0-9._%+-]+@(?:gmail|outlook|hotmail|icloud)\.com\b'),
 }
+# Current-tree-only identity rules. Git history predates the open-source scrub
+# and is rewritten separately, so these are not applied to history blobs.
+# Patterns are assembled so this file does not match itself.
+INDEX_RULES = {
+    'deployment-resource-id': re.compile(rb'\b(?:team|prj)_[A-Za-z0-9]{20,}\b'),
+    'provider-dev-instance': re.compile(rb'\b[a-z]+-[a-z]+-[0-9]+\.clerk\.accounts\.dev\b'),
+    'retired-deployment-name': re.compile(b'rn-' + b'jarvis-friday-discovery'),
+    'personal-name': re.compile(b'Arav' + b' Jain'),
+}
 DB_URI = re.compile(rb'postgres(?:ql)?://[^\s\x22\x27]+:[^\s\x22\x27]+@[^\s\x22\x27]+')
 findings = []
 seen = set()
@@ -42,6 +51,10 @@ def inspect(path, data, source):
     for name, pattern in RULES.items():
         if pattern.search(data):
             findings.append({'source': source, 'path': path, 'rule': name})
+    if source == 'index':
+        for name, pattern in INDEX_RULES.items():
+            if pattern.search(data):
+                findings.append({'source': source, 'path': path, 'rule': name})
     for match in DB_URI.finditer(data):
         # The existing unit fixture is deliberately fake and has no authority.
         fixture_prefix = b'postgresql:' + b'//fixture:' + b'fixture@fixture.neon.tech/'
