@@ -97,7 +97,9 @@ works), and a domain for the bridge.
    application per peer (PKCE, no client secret) with each host's redirect
    URL. Access tokens must be JWTs whose audience is that peer's resource URL
    and whose scopes include the two peer scopes (plus `offline_access` if the
-   host refreshes). Note the instance's issuer origin and your user's `sub`;
+   host refreshes). Clerk issues opaque OAuth access tokens by default, which
+   the bridge rejects: enable JWT access tokens in the Clerk Dashboard's OAuth
+   application settings. Note the instance's issuer origin and your user's `sub`;
    store only its hash:
    ```sh
    printf %s "$YOUR_SUB" | shasum -a 256
@@ -119,8 +121,11 @@ works), and a domain for the bridge.
    equal `BRIDGE_QUEUE_TOPIC`; both default to the same value.
 6. **Check the public boundary.**
    ```sh
-   python3 scripts/check_v1.py --origin https://bridge.example.com --peers alice,bob
+   python3 scripts/check_v1.py --origin https://bridge.example.com --peers alice,bob \
+     --issuer https://clerk.example.com --auth-configured
    ```
+   `--issuer` must equal `BRIDGE_OAUTH_ISSUER` (metadata returns 503 without
+   it), and `--auth-configured` expects an invalid token to get 401.
 7. **Connect both assistants** to their MCP URLs, then call `bridge_health`
    from each. Its `caller` field shows the verified role, scopes and offered
    tools. Then open the gates one at a time:
@@ -173,8 +178,10 @@ keep working with no change. New deployments should always set
 | `bridge_webhook_diagnostic` | events peer (send scope) | One-time, operator-armed transport check of the webhook peer |
 
 The events peer can also call `events/list`, `events/subscribe` and
-`events/unsubscribe` for `bridge.message.received`. An optional task
-coordination layer (`bridge_task_*`) exists but is off by default; see
+`events/unsubscribe` for `bridge.message.received`. The deployed entrypoint
+(`api/index.mjs`) also opts in to a task coordination layer (`bridge_task_*`);
+its tools are offered only once the OAuth contract is verified and delivery is
+enabled, and otherwise the bridge serves the v1 tools above unchanged. See
 [docs/task-kernel.md](docs/task-kernel.md).
 
 ## Limitations
