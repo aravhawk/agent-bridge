@@ -7,7 +7,7 @@ import { diagnosticReadCandidate, diagnosticReadStatus, observeDiagnosticRead,
   canaryReadCandidate, canaryReadStatus, observeCanaryRead } from './observability.mjs';
 import { canaryEnvelope, reserveCanary, canaryReceipt } from './canary.mjs';
 import { EVENTS_PEER, NAMES } from './config.mjs';
-import { classify, enqueueSync, supersedeBySubject, cutBatch, batchView, flushDue, markDispatched } from './sync.mjs';
+import { classify, enqueueSync, supersedeBySubject, cutBatch, presentBatch, ackBatch, outstandingBatches, flushDue, markDispatched } from './sync.mjs';
 
 const fail = (code, status = 400) => { throw new BridgeError(code, status); };
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
@@ -76,9 +76,11 @@ function insert(state, envelope, hash, now, authorization, jobOptions, routing) 
 // Additive status for wake/sync messages only; v1 messages report nothing new.
 function syncStatus(message) {
   const s = message.sync, b = message.syncBatch;
-  return { ...(s ? { sync: { class: 'sync', state: s.state, ...(s.batchId ? { batchMessageId: s.batchId, via: s.via,
-    deliveredAt: new Date(s.deliveredAt).toISOString() } : {}), ...(s.supersededBy ? { supersededBy: s.supersededBy } : {}) } } : {}),
-    ...(b ? { syncBatch: { reason: b.reason, itemCount: b.itemIds.length } } : {}),
+  return { ...(s ? { sync: { class: 'sync', state: s.state, ...(s.deliveredAt ? { via: s.via,
+    deliveredAt: new Date(s.deliveredAt).toISOString() } : {}), ...(s.batchId ? { batchMessageId: s.batchId } : {}),
+    ...(s.redeliveries ? { redeliveries: s.redeliveries } : {}), ...(s.supersededBy ? { supersededBy: s.supersededBy } : {}) } } : {}),
+    ...(b ? { syncBatch: { reason: b.reason, ...(b.trigger ? { trigger: b.trigger } : {}), itemCount: b.itemIds.length,
+      presented: !!b.presentedAt, acknowledged: !!b.ackedAt, reclaimed: !!b.reclaimedAt } } : {}),
     ...(message.syncBatchIds ? { piggybackedBatchIds: [...message.syncBatchIds] } : {}) };
 }
 
@@ -204,35 +206,39 @@ export class Bridge {
     if (canary) await observeCanaryRead({ store: this.store, principal, messageId: params.messageId, clock: this.clock });
     return output;
   }
-  // Batches attached to a read message (its own items when it is a batch, then
-  // those piggybacked on it). An enabled recipient's read also drains pending
-  // SYNC data into a new batch attached to this message, so re-reads are stable.
+  // Batches presented with a read message: its own items when it is a batch,
+  // then those piggybacked on it. While the message is not yet completed, an
+  // enabled recipient's read also drains pending SYNC data into a new batch
+  // attached to it, so a re-read (e.g. after a lost response) is identical and
+  // completing the message acknowledges what was presented with it.
   syncBatches(state, message, role, now) {
     if (!dailyMessage(message.envelope)) return [];
-    if (this.syncEnabled(role)) {
+    if (this.syncEnabled(role) && state.receipts[message.envelope.id]?.state !== 'complete') {
       const batch = cutBatch(state, role, now, { reason: 'read', policyIds: this.messagePolicyIds });
       if (batch) (message.syncBatchIds ||= []).push(batch.envelope.id);
     }
     return [...(message.syncBatch ? [message.envelope.id] : []), ...(message.syncBatchIds || [])]
-      .map(id => batchView(state, id, now)).filter(Boolean);
+      .map(id => presentBatch(state, id, now)).filter(Boolean);
   }
-  // Start-of-turn inbox read for an enabled recipient: pending SYNC data as
-  // one delta batch (deduplicated by subject). Delivered items never repeat.
+  // Start-of-turn inbox read for an enabled recipient. Returns every delivered
+  // but unacknowledged batch (replayed until acknowledged, so a lost response or
+  // crash loses nothing) plus any pending SYNC data cut into one new delta batch.
+  // Reads serialize on the store lock: concurrent readers get the same batches.
   async inboxRead(principal, params = {}) {
     authorizeRecipient(principal); ownKeys(params, [], []);
     if (!this.syncEnabled(principal.role)) fail('wake_sync_not_enabled', 503);
     return this.store.transaction(state => {
       const now = this.clock(); retainMessages(state, now);
-      const batch = cutBatch(state, principal.role, now, { reason: 'inbox', policyIds: this.messagePolicyIds });
-      return { syncBatches: batch ? [batchView(state, batch.envelope.id, now)] : [] };
+      cutBatch(state, principal.role, now, { reason: 'inbox', policyIds: this.messagePolicyIds });
+      return { syncBatches: outstandingBatches(state, principal.role, now).map(id => presentBatch(state, id, now)) };
     });
   }
-  // Scheduled flush (cron): one batch per recipient per Chicago even-hour
-  // boundary, returning batch message IDs still to be published for dispatch.
+  // Hourly flush (trigger route): see flushDue. Returns message IDs still to be
+  // published for dispatch.
   async flushSync() {
     return this.store.transaction(state => {
       const now = this.clock(); retainMessages(state, now);
-      return flushDue(state, now, { policyIds: this.messagePolicyIds });
+      return flushDue(state, now, { policyIds: this.messagePolicyIds, recipients: this.wakeSync?.() || [] });
     });
   }
   async markSyncDispatched(ids) {
@@ -286,6 +292,8 @@ export class Bridge {
         ackMessageId: receipt.ackMessageId, evidenceStatus: 'reported_requires_independent_host_confirmation' };
       if (!messageAccessAllowed(state, message, this.messagePolicyIds, now)) fail('message_authorization_inactive', 403);
       if (receipt.claimId !== params.claimId || receipt.leaseUntil <= now) fail('stale_receipt_claim', 409);
+      // A batch is handled only after its full items were returned by a read.
+      if (message.syncBatch && !message.syncBatch.presentedAt) fail('sync_batch_not_presented', 409);
       const ackSuppressed = original.kind !== 'ack' && this.ackSuppressed(message);
       requireAckPath(state, original, message.authorization, this.messagePolicyIds, now, this.canary?.subscriptionId, ackSuppressed);
       let ackMessageId = null; let jobIds = [];
@@ -307,15 +315,15 @@ export class Bridge {
       state.receipts[params.messageId] = { ...receipt, state: 'complete', completedAt: now,
         ackMessageId, hostedEventId: params.hostedEventId, hostedTurnId: params.hostedTurnId,
         evidenceStatus: 'reported_requires_independent_host_confirmation', ...(ackSuppressed ? { ackSuppressed: true } : {}) };
-      // Completing a batch records the receipt of every item it carried.
-      for (const itemId of message.syncBatch?.itemIds || []) {
-        if (!state.messages[itemId] || state.receipts[itemId]?.state === 'complete') continue;
-        state.receipts[itemId] = { state: 'complete', owner: principal.principalKey, completedAt: now, ackMessageId: null,
-          viaBatch: params.messageId, hostedEventId: params.hostedEventId, hostedTurnId: params.hostedTurnId,
-          evidenceStatus: 'reported_requires_independent_host_confirmation', ackSuppressed: true };
-      }
+      // Completing a batch acknowledges it and every item it presented.
+      // Completing a message also acknowledges the batches presented with it.
+      const evidence = { hostedEventId: params.hostedEventId, hostedTurnId: params.hostedTurnId };
+      if (message.syncBatch) ackBatch(state, params.messageId, principal, now, evidence);
+      const syncBatchesAcked = (message.syncBatchIds || [])
+        .filter(id => ackBatch(state, id, principal, now, { ...evidence, via: params.messageId }));
       return { completed: true, duplicate: false, ackMessageId, jobIds,
-        evidenceStatus: 'reported_requires_independent_host_confirmation', ...(ackSuppressed ? { ackSuppressed: true } : {}) };
+        evidenceStatus: 'reported_requires_independent_host_confirmation', ...(ackSuppressed ? { ackSuppressed: true } : {}),
+        ...(syncBatchesAcked.length ? { syncBatchesAcked } : {}) };
     });
   }
   async status(principal, params) {

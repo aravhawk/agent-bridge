@@ -69,9 +69,19 @@ function classification(input) {
 // Lazy bounded retention on ordinary authenticated storage transitions; no
 // timer, receiving-agent poll, migration or provider credential is introduced.
 // Synthetic history, subscription ciphertext and revocation tombstones survive.
+// SYNC data that is still pending, or in a batch not yet acknowledged, is held
+// past content retention (bounded by SYNC_HOLD_MS and capacity backpressure)
+// so queued context is never silently purged before the recipient has it.
+export const SYNC_HOLD_MS = 6 * 86400000;
+function heldForSync(state, m, now) {
+  if (!(m.storedAt + SYNC_HOLD_MS > now)) return false;
+  if (m.sync?.state === 'pending') return true;
+  const batch = m.syncBatch ? m : m.sync?.state === 'delivered' && m.sync.batchId ? state.messages[m.sync.batchId] : null;
+  return !!batch?.syncBatch && !batch.syncBatch.ackedAt && !batch.syncBatch.reclaimedAt;
+}
 export function retainMessages(state, now) {
   for (const [id, m] of Object.entries(state.messages)) {
-    if (dailyMessage(m.envelope) && m.retainUntil <= now) {
+    if (dailyMessage(m.envelope) && m.retainUntil <= now && !heldForSync(state, m, now)) {
       for (const jobId of m.jobIds) delete state.jobs[jobId];
       delete state.receipts[id]; delete state.messages[id];
     }

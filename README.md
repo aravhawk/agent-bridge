@@ -177,7 +177,7 @@ keep working with no change. New deployments should always set
 | `bridge_read` | recipient | Read a stored message by the ID from its wake-up event |
 | `bridge_receipt_claim` / `bridge_receipt_complete` | recipient | Claim with a 60 s lease, then complete and atomically create the ACK |
 | `bridge_status` | both | Delivery and receipt evidence for one known message |
-| `bridge_inbox_read` | wake/sync recipient | Start-of-turn read of pending SYNC data as one delta batch |
+| `bridge_inbox_read` | wake/sync recipient | Start-of-turn read of every unacknowledged SYNC batch plus pending data as one new delta batch |
 | `bridge_subscription_status` | events peer | Own subscriptions and renewal observations (no secrets) |
 | `bridge_webhook_diagnostic` | events peer (send scope) | One-time, operator-armed transport check of the webhook peer |
 
@@ -202,31 +202,39 @@ by clearing it), that recipient gets:
   |---|---|
   | `class` | `wake` (default; needs action, a decision, a blocker, urgent, an awaited reply, or effect within 2 h) or `sync` (routine FYI: status, logged decisions, owner changes, later reminders) |
   | `subject` | Topic key (≤ 200 chars). A newer pending item with the same subject replaces the older one |
-  | `effectiveAt` / `dueAt` | ISO 8601 times. Either at or before now + 2 h promotes `sync` to `wake` |
-  | `expiresAt` | Up to 12 h for `sync` (1 h otherwise). A `sync` item that would expire before the next flush is sent as `wake` |
+  | `effectiveAt` / `dueAt` | ISO 8601 times. Either within 2 h 30 min (the 2 h maximum wait plus scheduler slack) promotes `sync` to `wake` |
+  | `expiresAt` | Up to 12 h for `sync` (1 h otherwise). A `sync` item expiring within 2 h 30 min is sent as `wake` |
 
   Messages without `class` behave exactly as before.
 - **One batch, not one wake per item.** Pending SYNC items are coalesced (delta
-  only, deduplicated by subject) and delivered once: with the next WAKE, on the
+  only, deduplicated by subject) into a batch: with the next WAKE, on the
   recipient's next `bridge_read`/`bridge_inbox_read`, or as a single webhook at
-  the next even hour in America/Chicago (00:00, 02:00, … 22:00), at most 12 per
-  day, never for an empty window. A batch is an ordinary `status` message, so
-  its wake payload is unchanged; `bridge_read` adds a `syncBatches` field with
-  each item.
+  the next even hour in America/Chicago (00:00, 02:00, … 22:00), and never more
+  than 2 elapsed hours after the oldest item was queued (DST included). At most
+  12 batch wakes per day (13 on the 25-hour fall-back day), none for an empty
+  window. A batch is an ordinary `status` message, so its wake payload is
+  unchanged; `bridge_read` adds a `syncBatches` field with each item.
+- **Nothing lost.** A batch is replayed by `bridge_inbox_read` until the
+  recipient acknowledges it (claim and complete it, or complete the WAKE it
+  came with) after its items were presented; expired items are still
+  delivered, flagged late. The receiver contract is in
+  [inbox policy](docs/inbox-policy.md#flagged-receiver-contract).
 
 The flush is triggered hourly by the GitHub Actions workflow
 `.github/workflows/bridge-cron-flush.yml` (Vercel Hobby only allows daily
-crons). It POSTs to `/api/cron` with `Authorization: Bearer $CRON_SECRET`; the
-route flushes only in minutes 0–29 after a Chicago even hour, handles DST, and
-is a 200 no-op otherwise. To roll out, in this order:
+crons). It POSTs to `/api/cron` with `Authorization: Bearer $CRON_SECRET`; each
+run flushes only what is due (a Chicago even hour has passed, or waiting
+another hour would exceed the 2-hour maximum) and is a 200 no-op otherwise. To
+roll out, in this order:
 
 1. Set `CRON_SECRET` (16+ random characters, e.g. `openssl rand -hex 32`) in
    Vercel and redeploy.
 2. Add the same value as the GitHub Actions repository secret `CRON_SECRET`.
 3. Add the GitHub Actions repository variable `BRIDGE_CRON_URL`, the full URL
    of the deployed route, e.g. `https://<your-bridge-host>/api/cron`.
-4. Update the recipient's receiver to read `syncBatches`, then set
-   `BRIDGE_WAKE_SYNC_RECIPIENTS=friday` in Vercel and redeploy.
+4. Update the recipient's receiver to follow the
+   [flagged receiver contract](docs/inbox-policy.md#flagged-receiver-contract),
+   then set `BRIDGE_WAKE_SYNC_RECIPIENTS=friday` in Vercel and redeploy.
 
 Until the secret and variable exist the workflow skips without failing. Roll
 back by clearing `BRIDGE_WAKE_SYNC_RECIPIENTS`. Details:

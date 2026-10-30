@@ -205,6 +205,9 @@ The results are server operation evidence only (`wakeVerified: false`).
 | `CRON_SECRET` | Flush-route secret (16+ random characters), set in Vercel and, with the same value, as the GitHub Actions secret `CRON_SECRET`. Callers send `Authorization: Bearer <secret>` to `/api/cron`; without it the route answers 503 and SYNC data only leaves on a WAKE or an inbox read. |
 | `BRIDGE_CRON_URL` | GitHub Actions repository **variable** (not a Vercel setting): the full HTTPS URL of the deployed `/api/cron` route. |
 
+With the flag unset nothing below applies: every wake names the native
+message ID, ACKs are created, and no tool, field or state is added.
+
 For an enabled recipient:
 
 - **No ACK wakes.** Completing a receipt still records it exactly as before
@@ -213,25 +216,43 @@ For an enabled recipient:
   subscription for its own sends. The completion result says `ackSuppressed: true`.
 - **Two classes.** `bridge_message_send` takes optional `class` (`wake` or
   `sync`), `subject`, `effectiveAt` and `dueAt`. A message with no class is
-  WAKE, unchanged. SYNC is promoted to WAKE when `effectiveAt` or `dueAt` is at
-  or before now + 2 h, and when its `expiresAt` falls at or before the end of
-  the next flush window (so queued data can never expire unseen). Only `class: sync`
-  may set `expiresAt` up to 12 h after `sentAt`; everything else keeps 1 h.
+  WAKE, unchanged. SYNC is promoted to WAKE when its `effectiveAt`, `dueAt` or
+  `expiresAt` is at or before now + 2 h 30 min: the 2-hour maximum wait plus
+  30 minutes of scheduler slack, so queued data always arrives before it takes
+  effect, is due or expires. Only `class: sync` may set `expiresAt` up to 12 h
+  after `sentAt`; everything else keeps 1 h.
 - **Batching.** Pending SYNC items coalesce per recipient: delta only, and a
   later item with the same `subject` (case and spacing ignored) replaces the
-  earlier pending one, as does a WAKE with that subject. The batch is delivered
-  once: piggybacked on the next WAKE to that recipient, returned by the
-  recipient's next `bridge_read` or `bridge_inbox_read`, or flushed as one
-  webhook at the next even America/Chicago hour (00:00, 02:00, … 22:00, run up
-  to 30 minutes late). Empty windows send nothing; at most 12 flushes per
-  recipient per Chicago day.
+  earlier pending one, as does a WAKE with that subject. Pending data is cut
+  into one batch when it is piggybacked on the next WAKE to that recipient,
+  returned by the recipient's next `bridge_read` (of a message it has not yet
+  completed) or `bridge_inbox_read`, or flushed as one webhook (below).
+- **Acknowledgement and replay.** A batch stays outstanding until it is
+  acknowledged, and `bridge_inbox_read` returns every outstanding batch on
+  every call, so a lost response or a crash loses nothing and concurrent reads
+  return the same batches (reads serialize on the store lock and never cut
+  twice). A batch is acknowledged either by claiming and completing its own
+  `messageId`, or by completing the message it was presented with. Completion
+  is refused with `sync_batch_not_presented` until the batch's full items were
+  returned by a read (`bridge_read` of the batch or its WAKE, or
+  `bridge_inbox_read`), and only an acknowledged batch marks its items handled.
+  A batch still unacknowledged after 12 hours is retired and its unhandled
+  items are queued again.
+- **Nothing is silently dropped.** Items whose own `expiresAt` passes while
+  queued or re-queued are still delivered, flagged `expired` and `late`.
+  Pending items and items in unacknowledged batches are held past the 24-hour
+  content retention (up to 6 days, within the 100-message capacity). Only a
+  policy change or a durable access denial withdraws queued data
+  (`bridge_status` then shows `sync.state: "withdrawn"`).
 
 A batch is stored as an ordinary v1 `status` message from the counterpart, so
 its wake is the unchanged `{"event":"bridge.message.received","data":{"messageId":…}}`
 (or the events-peer callback). Its text is a bounded digest that names every
 item's messageId; `bridge_read` adds a `syncBatches` array with each item's
-full data. Claiming and completing the batch records every item's receipt and
-never creates an ACK. Items stay individually readable by ID.
+full data. The exact receiver contract is in
+[inbox policy](inbox-policy.md#flagged-receiver-contract).
+
+### Flush schedule and the 2-hour maximum
 
 The flush is triggered by the GitHub Actions workflow
 `.github/workflows/bridge-cron-flush.yml` (`0 * * * *`, hourly UTC, plus manual
@@ -242,20 +263,34 @@ non-overlapping concurrency group. If the secret or URL is not configured it
 logs a notice and succeeds; otherwise any non-2xx response fails the run
 (curl retries 3 times with a 30-second limit per attempt).
 
-The route accepts POST and GET. It flushes only when the current time is in
-minutes 0–29 after a Chicago even-hour boundary, because scheduled Actions
-runs start late; any other run returns `200 {"status":"skipped","reason":"outside_flush_window"}`
-without touching storage. Each recipient is flushed at most once per boundary,
-so a duplicate run in the same window sends nothing new, and a window missed
-entirely waits for the next boundary (or a WAKE or inbox read). On the
-spring-forward day the missing 02:00 is flushed at 03:00 CDT; on the fall-back
-day (e.g. 1 November 2026) neither 01:00 counts and the 02:00 CST window
-flushes. Batches are published to the queue after the flush commits; a failed
-publication is re-offered by a repeated run in the same window or by the next
-boundary's run.
+The route accepts POST and GET. Every run checks each enabled recipient with
+pending SYNC data and flushes one batch when:
+
+1. **scheduled** - an America/Chicago even hour (00:00, 02:00, … 22:00) has
+   passed since its last flush and items were queued before it. A run that
+   starts late, or the run after a skipped one, still delivers;
+2. **max_wait** - waiting for the next hourly run would push the oldest pending
+   item past 2 hours of elapsed time since it was queued; or
+3. **expiring** - an item expires before the next run (plus slack), or already
+   has (re-queued data).
+
+Otherwise the run is a `200` no-op (`flushed: 0`) and empty queues send
+nothing. Each recipient is flushed at most once per boundary, so duplicate
+runs send nothing new. The maximum is elapsed time, not wall-clock hours: on
+the fall-back day (e.g. 1 November 2026) 00:00 CDT to 02:00 CST is three real
+hours, so data queued after midnight is flushed by the 01:00 CST run instead;
+on the spring-forward day (e.g. 8 March 2026) the nonexistent 02:00 is flushed
+at 03:00 CDT. The daily cap is `ceil(hours in the Chicago day / 2)`: 12 batch
+wakes normally and on the 23-hour spring-forward day, 13 on the 25-hour
+fall-back day, which can need one more to keep every item within 2 hours. A
+capped recipient's items stay pending (held, delivered with the next WAKE,
+inbox read or the next day's first run). Batches are published to the queue
+after the flush commits; anything unpublished is re-offered by the next run.
 Queued SYNC items stay deliverable after the sender's access token expires
-(a FYI must survive until the next boundary), but a policy change, durable
-denial, the item's own `expiresAt` or content retention still withdraws them.
+(a FYI must survive until it is flushed), but a policy change or durable
+denial still withdraws them.
+
+### Rollout and rollback
 
 Rollout (in this order; nothing here is set by the repository):
 
@@ -267,17 +302,20 @@ Rollout (in this order; nothing here is set by the repository):
 4. In the same place, add a repository variable `BRIDGE_CRON_URL` with the full
    HTTPS URL of the deployed flush route, e.g. `https://<your-bridge-host>/api/cron`.
 5. Optionally run the "Bridge SYNC flush" workflow by hand (`workflow_dispatch`).
-   Outside an even Chicago hour it should succeed with
-   `{"status":"skipped","reason":"outside_flush_window"}`; a 401 means the two
-   secrets differ, a 503 means the Vercel value is missing or shorter than 16.
-6. Update the recipient's receiver to treat `syncBatches` as inbox data (and,
-   optionally, call `bridge_inbox_read` at the start of a turn).
+   With nothing queued it should succeed with `"status":"ok"` and
+   `"flushed":0`; a 401 means the two secrets differ, a 503 means the Vercel
+   value is missing or shorter than 16 characters.
+6. Update the recipient's receiver to follow the
+   [flagged receiver contract](inbox-policy.md#flagged-receiver-contract).
 7. Set `BRIDGE_WAKE_SYNC_RECIPIENTS=friday` in Vercel and redeploy.
 
 Rollback: clear `BRIDGE_WAKE_SYNC_RECIPIENTS` and redeploy. New SYNC messages
-are then delivered as WAKE, ACKs resume, and anything still queued is flushed
-at the next even-hour window as a standard message (leave the secrets and the
-workflow in place until then).
+are then delivered as WAKE and ACKs resume. On the next hourly run, anything
+still queued is re-sent under its own message ID where its original v1
+authority is still valid (an unchanged receiver handles it like any message,
+ACK included); the rest goes out once as a standard `status` batch whose text
+lists each item's message ID. Leave the secrets and the workflow in place until
+that run has happened.
 
 ## Bounded queue recovery
 

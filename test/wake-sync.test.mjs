@@ -6,7 +6,7 @@ import { generateKeyPair, SignJWT } from 'jose';
 import { Bridge } from '../src/bridge.mjs';
 import { MemoryStore, emptyState } from '../src/store.mjs';
 import { VERIFIED_AUTHORIZATION, SCOPES } from '../src/policy.mjs';
-import { validateMessage, MESSAGE_PROTOCOL, SYNC_MESSAGE_TTL_MS } from '../src/messages.mjs';
+import { validateMessage, MESSAGE_PROTOCOL, SYNC_MESSAGE_TTL_MS, CONTENT_RETENTION_MS } from '../src/messages.mjs';
 import { createProtector } from '../src/webhook.mjs';
 import { NativeEvents, EVENT_NAME } from '../src/events.mjs';
 import { createRuntime } from '../src/runtime.mjs';
@@ -14,11 +14,13 @@ import { resourceFor } from '../src/resource.mjs';
 import { TOPIC } from '../src/queue.mjs';
 import { ISSUER } from './fixtures/provider.mjs';
 import { classify, wakeSyncRecipients, isFlushBoundary, latestFlushBoundary, nextFlushBoundary, chicagoDate,
-  chicagoWall, flushWindowBoundary, SYNC_DAILY_FLUSH_CAP, WAKE_WINDOW_MS, FLUSH_WINDOW_MS } from '../src/sync.mjs';
+  chicagoWall, chicagoDayHours, dailyFlushCap, SYNC_DAILY_FLUSH_CAP, WAKE_WINDOW_MS, SYNC_DEADLINE_MS,
+  SYNC_BATCH_TTL_MS } from '../src/sync.mjs';
 
-const HOUR = 3600000, policy = 'c'.repeat(64);
-// 2026-10-19 10:30 America/Chicago (CDT, UTC-5). Next even boundary: 12:00 CDT.
+const HOUR = 3600000, MINUTE = 60000, policy = 'c'.repeat(64);
+// 2026-10-19 10:30 America/Chicago (CDT, UTC-5). Next even boundary: 12:00 CDT = 17:00Z.
 const start = Date.UTC(2026, 9, 19, 15, 30);
+const noon = Date.UTC(2026, 9, 19, 17);
 const iso = ms => new Date(ms).toISOString();
 function who(role, until = start + 7 * 86400000) {
   return Object.defineProperty({ role, scopes: Object.values(SCOPES[role]), principalKey: (role === 'jarvis' ? 'a' : 'b').repeat(64) },
@@ -39,15 +41,20 @@ async function fixture({ recipients = ['friday'], at = start, wakeSync = true } 
     to: from === 'jarvis' ? 'friday' : 'jarvis', kind: 'status', sentAt: iso(now), expiresAt: iso(now + HOUR),
     threadId: randomUUID(), route: 'inbox', text: 'Fixture status data only.', ...extra });
   const sync = (from = 'jarvis', extra = {}) => message(from, { class: 'sync', expiresAt: iso(now + 6 * HOUR), ...extra });
-  const send = (m, principal = who(m.from, at + 7 * 86400000)) => bridge.sendMessage(principal, m);
-  const handle = async (principal, id) => {
-    const claim = await bridge.claim(principal, { messageId: id });
-    return bridge.complete(principal, { messageId: id, claimId: claim.claimId, hostedEventId: null, hostedTurnId: null });
+  const principal = role => who(role, at + 7 * 86400000);
+  const send = (m, as = principal(m.from)) => bridge.sendMessage(as, m);
+  const handle = async (as, id) => {
+    const claim = await bridge.claim(as, { messageId: id });
+    return bridge.complete(as, { messageId: id, claimId: claim.claimId, hostedEventId: null, hostedTurnId: null });
   };
-  return { store, bridge, clock, enabled, message, sync, send, handle, snapshot: () => store.snapshot(),
+  // A flagged receiver: read (full items), then claim/complete the batch receipt.
+  const ack = async (id, as = principal('friday')) => { await bridge.read(as, { messageId: id }); return handle(as, id); };
+  return { store, bridge, clock, enabled, message, sync, send, handle, ack, principal, snapshot: () => store.snapshot(),
     set: ms => { now = ms; }, advance: ms => { now += ms; } };
 }
 const jobsFor = (s, id) => Object.values(s.jobs).filter(job => job.messageId === id);
+const batchesIn = s => Object.values(s.messages).filter(m => m.syncBatch);
+const ids = batches => batches.map(b => b.items.map(i => i.messageId));
 
 test('flag parsing: unset/empty is off, unknown peers close the whole flag', () => {
   assert.deepEqual(wakeSyncRecipients(undefined), { configured: false, valid: true, recipients: [] });
@@ -57,21 +64,22 @@ test('flag parsing: unset/empty is off, unknown peers close the whole flag', () 
   assert.deepEqual(wakeSyncRecipients('friday,bogus'), { configured: true, valid: false, recipients: [] });
 });
 
-test('classification: unclassified and wake are WAKE, sync is SYNC; auto-promotion is inclusive at exactly now + 2h', () => {
-  const now = start, base = { class: 'sync', expiresAt: iso(now + 6 * HOUR) };
+test('classification: promotion covers the 2h maximum wait plus scheduler slack, inclusive', () => {
+  const now = start, base = { class: 'sync', expiresAt: iso(now + 6 * HOUR) }, deadline = now + SYNC_DEADLINE_MS;
+  assert.equal(SYNC_DEADLINE_MS, 2.5 * HOUR);
   assert.deepEqual(classify({ expiresAt: iso(now + HOUR) }, now), { class: 'wake' });
   assert.deepEqual(classify({ ...base, class: 'wake' }, now), { class: 'wake' });
   assert.deepEqual(classify(base, now), { class: 'sync' });
-  for (const [field, reason] of [['effectiveAt', 'effective_within_2h'], ['dueAt', 'due_within_2h']]) {
-    assert.deepEqual(classify({ ...base, [field]: iso(now + WAKE_WINDOW_MS) }, now), { class: 'wake', promoted: reason });
-    assert.deepEqual(classify({ ...base, [field]: iso(now + WAKE_WINDOW_MS + 1) }, now), { class: 'sync' });
-    assert.deepEqual(classify({ ...base, [field]: iso(now - HOUR) }, now), { class: 'wake', promoted: reason });
+  for (const [field, reason] of [['effectiveAt', 'effective_before_sync_deadline'], ['dueAt', 'due_before_sync_deadline'],
+    ['expiresAt', 'expires_before_sync_deadline']]) {
+    assert.deepEqual(classify({ ...base, [field]: iso(now + WAKE_WINDOW_MS) }, now), { class: 'wake', promoted: reason }, 'now + 2h');
+    assert.deepEqual(classify({ ...base, [field]: iso(deadline) }, now), { class: 'wake', promoted: reason }, 'deadline');
+    assert.deepEqual(classify({ ...base, [field]: iso(deadline + 1) }, now), { class: 'sync' }, 'deadline + 1ms');
   }
-  // Safety net: SYNC data that would expire before the next flush window closes is never lost.
-  const closes = Date.UTC(2026, 9, 19, 17) + FLUSH_WINDOW_MS;
-  assert.equal(nextFlushBoundary(now), Date.UTC(2026, 9, 19, 17));
-  assert.deepEqual(classify({ ...base, expiresAt: iso(closes) }, now), { class: 'wake', promoted: 'expires_before_flush' });
-  assert.deepEqual(classify({ ...base, expiresAt: iso(closes + 1) }, now), { class: 'sync' });
+  assert.deepEqual(classify({ ...base, dueAt: iso(now - HOUR) }, now), { class: 'wake', promoted: 'due_before_sync_deadline' });
+  // Formerly an expiry one second after the next theoretical boundary stayed SYNC.
+  assert.equal(nextFlushBoundary(now), noon);
+  assert.deepEqual(classify({ ...base, expiresAt: iso(noon + 1000) }, now), { class: 'wake', promoted: 'expires_before_sync_deadline' });
 });
 
 test('validation: optional class fields are bounded; only sync may outlive one hour (max 12h); ACK-free v1 envelope is unchanged', () => {
@@ -93,188 +101,278 @@ test('validation: optional class fields are bounded; only sync may outlive one h
   }
 });
 
-test('SYNC is queued without a wake; promotion at exactly now + 2h delivers immediately', async () => {
+test('SYNC is queued without a wake; promotion delivers immediately with the pending items piggybacked', async () => {
   const f = await fixture();
   const queued = f.sync(), sent = await f.send(queued);
   assert.deepEqual(sent, { messageId: queued.id, queued: true, duplicate: false, jobIds: [], class: 'sync', delivery: 'batched' });
   assert.equal(Object.keys(f.snapshot().jobs).length, 0);
   const due = f.sync('jarvis', { dueAt: iso(start + WAKE_WINDOW_MS) }), promoted = await f.send(due);
-  assert.equal(promoted.class, 'wake'); assert.equal(promoted.promoted, 'due_within_2h'); assert.equal(promoted.jobIds.length, 1);
-  // The promoted WAKE carries the earlier pending SYNC item with it.
+  assert.equal(promoted.class, 'wake'); assert.equal(promoted.promoted, 'due_before_sync_deadline'); assert.equal(promoted.jobIds.length, 1);
   assert.equal(promoted.piggybackedSyncItems, 1);
-  const later = f.sync('jarvis', { effectiveAt: iso(start + WAKE_WINDOW_MS + 1) });
-  assert.equal((await f.send(later)).class, 'sync');
+  assert.equal((await f.send(f.sync('jarvis', { effectiveAt: iso(start + SYNC_DEADLINE_MS + 1) }))).class, 'sync');
 });
 
-test('coalescing: pending SYNC dedupes by subject (latest wins), delta only, delivered items never repeat', async () => {
+test('coalescing: pending SYNC dedupes by subject (latest wins); after acknowledgement only the delta follows', async () => {
   const f = await fixture();
   const v1 = f.sync('jarvis', { subject: 'Deploy status', text: 'v1' }); await f.send(v1);
   const v2 = f.sync('jarvis', { subject: '  deploy   STATUS ', text: 'v2' }); await f.send(v2);
-  const other = f.sync('jarvis', { subject: 'Owner change', text: 'other' }); await f.send(other);
-  const bare = f.sync('jarvis', { text: 'no subject' }); await f.send(bare);
+  await f.send(f.sync('jarvis', { subject: 'Owner change', text: 'other' }));
+  await f.send(f.sync('jarvis', { text: 'no subject' }));
   const first = await f.bridge.inboxRead(friday);
   assert.equal(first.syncBatches.length, 1);
   assert.deepEqual(first.syncBatches[0].items.map(i => i.text), ['v2', 'other', 'no subject']);
-  assert.deepEqual((await f.bridge.inboxRead(friday)).syncBatches, []);
   assert.equal((await f.bridge.status(jarvis, { messageId: v1.id })).sync.state, 'superseded');
   assert.equal((await f.bridge.status(jarvis, { messageId: v1.id })).sync.supersededBy, v2.id);
-  assert.equal((await f.bridge.status(jarvis, { messageId: v2.id })).sync.via, 'inbox');
+  await f.handle(friday, first.syncBatches[0].messageId);
+  assert.deepEqual((await f.bridge.inboxRead(friday)).syncBatches, []);
   const v3 = f.sync('jarvis', { subject: 'Deploy status', text: 'v3' }); await f.send(v3);
-  assert.deepEqual((await f.bridge.inboxRead(friday)).syncBatches[0].items.map(i => i.messageId), [v3.id]);
+  assert.deepEqual(ids((await f.bridge.inboxRead(friday)).syncBatches), [[v3.id]]);
   assert.equal(Object.keys(f.snapshot().jobs).length, 0, 'no item ever produced its own wake');
 });
 
-test('Chicago even-hour boundaries: twelve per local day, across both DST transitions', () => {
+test('inbox read survives a lost response: unacknowledged batches replay until their receipt is acknowledged', async () => {
+  const f = await fixture();
+  const a = f.sync(); await f.send(a);
+  const lost = await f.bridge.inboxRead(friday); // response never reaches the receiver
+  const again = await f.bridge.inboxRead(friday);
+  assert.deepEqual(again, lost, 're-read returns the same batch and items');
+  assert.equal(batchesIn(f.snapshot()).length, 1, 'no second cut');
+  const b = f.sync(); await f.send(b);
+  const both = await f.bridge.inboxRead(friday);
+  assert.deepEqual(ids(both.syncBatches), [[a.id], [b.id]]);
+  const done = await f.handle(friday, lost.syncBatches[0].messageId);
+  assert.equal(done.ackMessageId, null);
+  assert.equal(f.snapshot().receipts[a.id].state, 'complete');
+  assert.equal(f.snapshot().receipts[b.id], undefined, 'only the acknowledged batch is handled');
+  assert.deepEqual(ids((await f.bridge.inboxRead(friday)).syncBatches), [[b.id]]);
+  await f.handle(friday, both.syncBatches[1].messageId);
+  assert.deepEqual((await f.bridge.inboxRead(friday)).syncBatches, []);
+});
+
+test('concurrent inbox readers neither double-cut nor lose items', async () => {
+  const f = await fixture();
+  const sent = [];
+  for (let i = 0; i < 5; i++) { const m = f.sync('jarvis', { subject: `s${i}` }); sent.push(m.id); await f.send(m); }
+  const reads = await Promise.all(Array.from({ length: 6 }, () => f.bridge.inboxRead(friday)));
+  for (const r of reads) assert.deepEqual(r, reads[0]);
+  assert.equal(batchesIn(f.snapshot()).length, 1);
+  assert.deepEqual(ids(reads[0].syncBatches).flat().sort(), sent.sort());
+  await Promise.all([f.handle(friday, reads[0].syncBatches[0].messageId).catch(() => null),
+    f.bridge.inboxRead(friday), f.send(f.sync('jarvis', { subject: 'late' }))]);
+  const after = await f.bridge.inboxRead(friday);
+  assert.equal(after.syncBatches.length, 1); assert.equal(after.syncBatches[0].items[0].subject, 'late');
+});
+
+test('an unacknowledged batch is reclaimed after its replay lifetime and its items are re-sent flagged late', async () => {
+  const f = await fixture();
+  const a = f.sync(); await f.send(a);
+  const first = (await f.bridge.inboxRead(friday)).syncBatches[0];
+  f.advance(SYNC_BATCH_TTL_MS);
+  const next = (await f.bridge.inboxRead(friday)).syncBatches;
+  assert.equal(next.length, 1); assert.notEqual(next[0].messageId, first.messageId);
+  assert.deepEqual(next[0].items.map(i => [i.messageId, i.expired, i.late]), [[a.id, true, true]]);
+  const status = await f.bridge.status(jarvis, { messageId: first.messageId });
+  assert.equal(status.syncBatch.reclaimed, true); assert.equal(status.syncBatch.acknowledged, false);
+  assert.equal((await f.bridge.status(jarvis, { messageId: a.id })).sync.redeliveries, 1);
+});
+
+test('Chicago even-hour boundaries and day lengths across both 2026 DST transitions', () => {
   const boundaries = (y, m, d) => {
-    const out = [];
-    for (let u = Date.UTC(y, m, d - 1); u < Date.UTC(y, m, d + 2); u += HOUR) {
-      if (isFlushBoundary(u) && chicagoDate(u) === `${y}-${String(m + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`) out.push(u);
-    }
+    const out = [], date = `${y}-${String(m + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    for (let u = Date.UTC(y, m, d - 1); u < Date.UTC(y, m, d + 2); u += HOUR) if (isFlushBoundary(u) && chicagoDate(u) === date) out.push(u);
     return out;
   };
-  const normal = boundaries(2026, 9, 19);
-  assert.equal(normal.length, 12);
-  assert.deepEqual(normal.map(u => chicagoWall(u).hour), [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]);
-  // Spring forward 2026-03-08: 02:00 CST does not exist; its boundary is 03:00 CDT.
-  const spring = boundaries(2026, 2, 8);
-  assert.equal(spring.length, 12);
+  assert.deepEqual(boundaries(2026, 9, 19).map(u => chicagoWall(u).hour), [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22]);
+  assert.equal(boundaries(2026, 2, 8).length, 12);
   assert.equal(isFlushBoundary(Date.UTC(2026, 2, 8, 7)), false, '01:00 CST');
   assert.equal(isFlushBoundary(Date.UTC(2026, 2, 8, 8)), true, '03:00 CDT replaces 02:00');
-  assert.equal(chicagoWall(Date.UTC(2026, 2, 8, 8)).hour, 3);
-  assert.equal(isFlushBoundary(Date.UTC(2026, 2, 8, 9)), true, '04:00 CDT');
-  // Fall back 2026-11-01: 01:00 repeats; neither instance is a boundary, 02:00 CST is.
-  const fall = boundaries(2026, 10, 1);
-  assert.equal(fall.length, 12);
+  assert.equal(boundaries(2026, 10, 1).length, 12);
   assert.equal(isFlushBoundary(Date.UTC(2026, 10, 1, 5)), true, '00:00 CDT');
   assert.equal(isFlushBoundary(Date.UTC(2026, 10, 1, 6)), false, '01:00 CDT');
   assert.equal(isFlushBoundary(Date.UTC(2026, 10, 1, 7)), false, '01:00 CST');
-  assert.equal(isFlushBoundary(Date.UTC(2026, 10, 1, 8)), true, '02:00 CST');
-  // Winter (CST, UTC-6): 12:00 local is 18:00Z.
-  assert.equal(isFlushBoundary(Date.UTC(2026, 11, 15, 18)), true);
-  assert.equal(isFlushBoundary(Date.UTC(2026, 11, 15, 17)), false);
-  assert.equal(isFlushBoundary(Date.UTC(2026, 9, 19, 17, 1)), false, 'only top of hour');
-  assert.equal(latestFlushBoundary(Date.UTC(2026, 9, 19, 18, 59)), Date.UTC(2026, 9, 19, 17));
-  assert.equal(nextFlushBoundary(Date.UTC(2026, 9, 19, 17)), Date.UTC(2026, 9, 19, 19));
-  // Lateness window: minutes 0-29 after the boundary only.
-  assert.equal(flushWindowBoundary(Date.UTC(2026, 9, 19, 17)), Date.UTC(2026, 9, 19, 17));
-  assert.equal(flushWindowBoundary(Date.UTC(2026, 9, 19, 17, 29, 59, 999)), Date.UTC(2026, 9, 19, 17));
-  assert.equal(flushWindowBoundary(Date.UTC(2026, 9, 19, 17, 30)), null);
-  assert.equal(flushWindowBoundary(Date.UTC(2026, 9, 19, 18, 5)), null, '13:05 CDT is odd');
-  assert.equal(flushWindowBoundary(Date.UTC(2026, 10, 1, 6, 5)), null, '01:05 CDT on fall-back day');
-  assert.equal(flushWindowBoundary(Date.UTC(2026, 10, 1, 7, 5)), null, '01:05 CST on fall-back day');
-  assert.equal(flushWindowBoundary(Date.UTC(2026, 10, 1, 8, 5)), Date.UTC(2026, 10, 1, 8), '02:05 CST');
-  assert.equal(flushWindowBoundary(Date.UTC(2026, 2, 8, 7, 5)), null, '01:05 CST on spring-forward day');
-  assert.equal(flushWindowBoundary(Date.UTC(2026, 2, 8, 8, 5)), Date.UTC(2026, 2, 8, 8), '03:05 CDT replaces 02:00');
+  assert.equal(isFlushBoundary(Date.UTC(2026, 10, 1, 8)), true, '02:00 CST: three elapsed hours after 00:00 CDT');
+  assert.equal(isFlushBoundary(Date.UTC(2026, 11, 15, 18)), true, 'CST noon');
+  assert.equal(latestFlushBoundary(Date.UTC(2026, 9, 19, 18, 59)), noon);
+  assert.equal(nextFlushBoundary(noon), Date.UTC(2026, 9, 19, 19));
+  assert.deepEqual([chicagoDayHours('2026-03-08'), chicagoDayHours('2026-10-19'), chicagoDayHours('2026-11-01')], [23, 24, 25]);
+  assert.deepEqual([dailyFlushCap('2026-03-08'), dailyFlushCap('2026-10-19'), dailyFlushCap('2026-11-01')], [12, 12, 13]);
 });
 
-test('scheduled flush: one webhook per even Chicago hour, odd hours and empty windows send nothing', async () => {
+test('scheduled flush: one webhook at the even hour, late runs still deliver, odd hours and duplicates send nothing', async () => {
   const f = await fixture();
   // Sender authority (token) expires before the flush; queued data still goes.
   const a = f.sync('jarvis', { subject: 'A' }), b = f.sync('jarvis', { subject: 'B' });
-  await f.send(a, who('jarvis', start + 600000)); await f.send(b);
-  f.set(Date.UTC(2026, 9, 19, 16, 0, 5)); // 11:00 CDT, odd
-  assert.deepEqual(await f.bridge.flushSync(), { boundary: Date.UTC(2026, 9, 19, 15), results: [], dispatch: [], skipped: 'outside_flush_window' });
-  f.set(Date.UTC(2026, 9, 19, 17, 0, 5)); // 12:00 CDT
+  await f.send(a, who('jarvis', start + 10 * MINUTE)); await f.send(b);
+  f.set(Date.UTC(2026, 9, 19, 16, 0, 5)); // 11:00 CDT
+  assert.deepEqual(await f.bridge.flushSync(), { boundary: Date.UTC(2026, 9, 19, 15), results: [], dispatch: [] });
+  f.set(noon + 40 * MINUTE); // 12:40 CDT: the 12:00 run arrives 40 minutes late
   const flushed = await f.bridge.flushSync();
-  assert.deepEqual(flushed.results, [{ recipient: 'friday', outcome: 'flushed', items: 2 }]);
-  assert.equal(flushed.dispatch.length, 1);
-  const batchId = flushed.dispatch[0], s = f.snapshot(), jobs = jobsFor(s, batchId);
+  assert.deepEqual(flushed.results, [{ recipient: 'friday', outcome: 'flushed', reason: 'scheduled', items: 2 }]);
+  const batchId = flushed.dispatch[0], s = f.snapshot();
   assert.equal(Object.keys(s.jobs).length, 1, 'exactly one webhook for the whole batch');
-  assert.deepEqual(JSON.parse(jobs[0].body), { event: EVENT_NAME, data: { messageId: batchId } });
-  // Same boundary again: no second batch; the batch stays queued for publication until marked.
-  assert.deepEqual((await f.bridge.flushSync()).dispatch, [batchId]);
+  assert.deepEqual(JSON.parse(jobsFor(s, batchId)[0].body), { event: EVENT_NAME, data: { messageId: batchId } });
+  assert.deepEqual((await f.bridge.flushSync()).dispatch, [batchId], 'unpublished batch is re-offered, not re-cut');
   await f.bridge.markSyncDispatched([batchId]);
-  assert.deepEqual((await f.bridge.flushSync()).dispatch, []);
-  // A late run after the 12:00 window closes is a no-op, not a catch-up.
-  f.set(Date.UTC(2026, 9, 19, 17, 30));
+  assert.deepEqual(await f.bridge.flushSync(), { boundary: noon, results: [], dispatch: [] });
+  f.set(Date.UTC(2026, 9, 19, 19, 0, 5)); // 14:00 CDT, nothing pending: empty window sends nothing
   assert.deepEqual((await f.bridge.flushSync()).results, []);
-  f.set(Date.UTC(2026, 9, 19, 19, 0, 5)); // 14:00 CDT, nothing pending
-  const empty = await f.bridge.flushSync();
-  assert.deepEqual(empty.results, [{ recipient: 'friday', outcome: 'empty' }]);
-  assert.equal(Object.keys(f.snapshot().jobs).length, 1); assert.equal(Object.keys(f.snapshot().messages).length, 3);
-  // The batch is a v1 status message an unchanged receiver can read/claim/complete.
+  assert.equal(Object.keys(f.snapshot().jobs).length, 1);
+});
+
+test('a skipped even-hour run is caught up by the next hourly run instead of waiting or dropping', async () => {
+  const f = await fixture();
+  const a = f.sync(); await f.send(a);
+  // The 12:00 CDT run never happens; 13:00 CDT delivers.
+  f.set(Date.UTC(2026, 9, 19, 18, 0, 5));
+  assert.deepEqual((await f.bridge.flushSync()).results, [{ recipient: 'friday', outcome: 'flushed', reason: 'scheduled', items: 1 }]);
+  // Items that were queued but whose run was skipped long enough to expire are delivered, flagged late.
+  const g = await fixture();
+  const late = g.sync('jarvis', { expiresAt: iso(start + 3 * HOUR) }); await g.send(late);
+  g.set(start + 4 * HOUR); // runs at 12:00 and 13:00 CDT both missed; item already expired
+  const out = await g.bridge.flushSync();
+  assert.equal(out.results[0].outcome, 'flushed');
+  const view = (await g.bridge.read(friday, { messageId: out.dispatch[0] })).syncBatches[0].items[0];
+  assert.deepEqual([view.messageId, view.expired, view.late], [late.id, true, true]);
+});
+
+test('scheduled batches are only handled once their full items were presented by a read', async () => {
+  const f = await fixture();
+  const a = f.sync('jarvis', { subject: 'A' }); await f.send(a);
+  f.set(noon + 5000);
+  const batchId = (await f.bridge.flushSync()).dispatch[0];
+  const claim = await f.bridge.claim(friday, { messageId: batchId });
+  await assert.rejects(f.bridge.complete(friday, { messageId: batchId, claimId: claim.claimId, hostedEventId: null, hostedTurnId: null }),
+    /sync_batch_not_presented/);
+  assert.equal(f.snapshot().receipts[a.id], undefined);
   const read = await f.bridge.read(friday, { messageId: batchId });
   assert.equal(read.envelope.kind, 'status'); assert.equal(read.envelope.from, 'jarvis');
-  assert.match(read.envelope.text, /2 update\(s\)/); assert.match(read.envelope.text, /\[A\]/);
-  assert.deepEqual(read.syncBatches[0].items.map(i => i.messageId), [a.id, b.id]);
-  const done = await f.handle(friday, batchId);
+  assert.match(read.envelope.text, new RegExp(a.id));
+  assert.deepEqual(read.syncBatches[0].items.map(i => [i.messageId, i.text]), [[a.id, a.text]]);
+  const done = await f.bridge.complete(friday, { messageId: batchId, claimId: claim.claimId, hostedEventId: 'evt_1', hostedTurnId: null });
   assert.equal(done.ackMessageId, null); assert.equal(done.ackSuppressed, true);
-  const itemStatus = await f.bridge.status(jarvis, { messageId: a.id });
-  assert.equal(itemStatus.receiptCompleted, true); assert.equal(itemStatus.sync.via, 'flush');
-  assert.equal(itemStatus.sync.batchMessageId, batchId);
-  assert.deepEqual((await f.bridge.inboxRead(friday)).syncBatches, [], 'flushed items are not redelivered');
+  const item = await f.bridge.status(jarvis, { messageId: a.id });
+  assert.equal(item.receiptCompleted, true); assert.equal(item.sync.via, 'flush'); assert.equal(item.sync.batchMessageId, batchId);
+  assert.equal(f.snapshot().receipts[a.id].viaBatch, batchId);
+  assert.deepEqual((await f.bridge.inboxRead(friday)).syncBatches, []);
   assert.equal(Object.keys(f.snapshot().jobs).length, 1, 'batch receipt creates no ACK wake');
 });
 
-test('daily cap: at most twelve batch wakes per recipient per Chicago day; capped items wait, the next day resets', async () => {
-  const midnight = Date.UTC(2026, 9, 19, 5); // 00:00 CDT
-  const f = await fixture({ at: midnight - 30 * 60000 });
-  let flushes = 0;
-  for (let hour = 0; hour < 24; hour++) {
-    await f.send(f.sync('jarvis', { text: `hour ${hour}` }));
-    f.set(midnight + hour * HOUR + 5000);
-    const out = await f.bridge.flushSync();
-    flushes += out.results.filter(r => r.outcome === 'flushed').length;
-    await f.bridge.markSyncDispatched(out.dispatch);
-    f.advance(30 * 60000);
-  }
-  assert.equal(flushes, SYNC_DAILY_FLUSH_CAP);
-  assert.equal(f.snapshot().syncQueues.friday.flushCount, 12);
-  // Force a thirteenth attempt on the same local day.
-  const nextDay = midnight + 24 * HOUR;
-  await f.store.transaction(s => { s.syncQueues.friday.lastFlushBoundary = nextDay - 4 * HOUR; });
-  f.set(nextDay - 2 * HOUR + 5000); // 22:00 CDT, same day
-  const capped = await f.bridge.flushSync();
-  assert.deepEqual(capped.results, [{ recipient: 'friday', outcome: 'daily_cap' }]);
-  assert.equal(Object.keys(f.snapshot().syncQueues.friday.pending).length, 1);
-  f.set(nextDay + 5000);
-  const reset = await f.bridge.flushSync();
-  assert.deepEqual(reset.results, [{ recipient: 'friday', outcome: 'flushed', items: 1 }]);
-  assert.equal(f.snapshot().syncQueues.friday.flushCount, 1);
-});
-
-for (const [name, enqueueAt, quiet, boundary] of [
-  ['spring forward', Date.UTC(2026, 2, 8, 6, 30), [Date.UTC(2026, 2, 8, 7)], Date.UTC(2026, 2, 8, 8)],
-  ['fall back', Date.UTC(2026, 10, 1, 5, 30), [Date.UTC(2026, 10, 1, 6), Date.UTC(2026, 10, 1, 7)], Date.UTC(2026, 10, 1, 8)],
-]) {
-  test(`scheduled flush across DST (${name}) fires only at the even local boundary`, async () => {
-    const f = await fixture({ at: enqueueAt });
-    await f.send(f.sync());
-    for (const at of quiet) { f.set(at + 5000); assert.deepEqual((await f.bridge.flushSync()).results, [], iso(at)); }
-    f.set(boundary + 5000);
-    assert.deepEqual((await f.bridge.flushSync()).results, [{ recipient: 'friday', outcome: 'flushed', items: 1 }]);
+// Hourly runs on time across a whole Chicago day, an item every 30 minutes:
+// nobody waits more than 2 elapsed hours, and flushes stay within the day's cap.
+for (const [name, y, m, d, flushes] of [['spring forward', 2026, 2, 8, 12], ['normal day', 2026, 9, 19, 12], ['fall back', 2026, 10, 1, 13]]) {
+  test(`2h elapsed maximum holds all day (${name} ${y}-${m + 1}-${d})`, async () => {
+    const date = `${y}-${String(m + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    let midnight = Date.UTC(y, m, d, 4);
+    while (chicagoDate(midnight) !== date) midnight += HOUR;
+    const end = midnight + chicagoDayHours(date) * HOUR;
+    const f = await fixture({ at: midnight + 10 * MINUTE });
+    let count = 0;
+    for (let t = midnight + 10 * MINUTE; t < end; t += 30 * MINUTE) {
+      f.set(t); await f.send(f.sync('jarvis', { text: iso(t) }));
+      const run = Math.ceil(t / HOUR) * HOUR;
+      if (t + 30 * MINUTE > run) {
+        f.set(run + 5000);
+        const out = await f.bridge.flushSync();
+        count += out.results.filter(r => r.outcome === 'flushed').length;
+        await f.bridge.markSyncDispatched(out.dispatch);
+        for (const id of out.dispatch) await f.ack(id); // the woken receiver reads and acknowledges
+      }
+    }
+    const items = Object.values(f.snapshot().messages).filter(x => x.sync && x.sync.state === 'delivered');
+    const max = Math.max(...items.map(x => x.sync.deliveredAt - x.storedAt));
+    assert.ok(max <= WAKE_WINDOW_MS, `max wait ${max / MINUTE} min`);
+    assert.equal(count, flushes); assert.ok(count <= dailyFlushCap(date));
   });
 }
 
-test('piggyback on WAKE: pending SYNC rides the next WAKE with no extra webhook and is not flushed again', async () => {
+for (const [name, queuedAt, runs] of [
+  // 00:10 CDT; the next even hour (02:00 CST) is three elapsed hours away, so 01:00 CST flushes.
+  ['fall back, Nov 1 2026', Date.UTC(2026, 10, 1, 5, 10), [[Date.UTC(2026, 10, 1, 6), null], [Date.UTC(2026, 10, 1, 7), 'max_wait'],
+    [Date.UTC(2026, 10, 1, 8), null]]],
+  // 00:10 CST; 03:00 CDT replaces the nonexistent 02:00, 1h50m later.
+  ['spring forward, Mar 8 2026', Date.UTC(2026, 2, 8, 6, 10), [[Date.UTC(2026, 2, 8, 7), null], [Date.UTC(2026, 2, 8, 8), 'scheduled'],
+    [Date.UTC(2026, 2, 8, 9), null]]],
+]) {
+  test(`DST (${name}): flushed before 2 elapsed hours, exactly once`, async () => {
+    const f = await fixture({ at: queuedAt });
+    await f.send(f.sync());
+    for (const [at, reason] of runs) {
+      f.set(at + 5000);
+      const results = (await f.bridge.flushSync()).results;
+      assert.deepEqual(results, reason ? [{ recipient: 'friday', outcome: 'flushed', reason, items: 1 }] : [], iso(at));
+      if (reason) assert.ok(at + 5000 - queuedAt <= WAKE_WINDOW_MS);
+    }
+  });
+}
+
+test('daily cap: capped items wait (held, not dropped) and the next Chicago day resets the count', async () => {
+  const f = await fixture();
+  await f.send(f.sync());
+  await f.store.transaction(s => { Object.assign(s.syncQueues.friday, { flushDay: '2026-10-19', flushCount: SYNC_DAILY_FLUSH_CAP }); });
+  f.set(noon + 5000);
+  assert.deepEqual((await f.bridge.flushSync()).results, [{ recipient: 'friday', outcome: 'daily_cap' }]);
+  assert.equal(Object.keys(f.snapshot().syncQueues.friday.pending).length, 1);
+  f.set(Date.UTC(2026, 9, 20, 5, 0, 5)); // 00:00 CDT next day
+  assert.equal((await f.bridge.flushSync()).results[0].outcome, 'flushed');
+  assert.equal(f.snapshot().syncQueues.friday.flushCount, 1);
+});
+
+test('undeliverable SYNC data is held past content retention instead of being purged', async () => {
+  const f = await fixture({ recipients: ['jarvis'] });
+  const m = f.sync('friday'); await f.send(m);
+  await f.store.transaction(s => { for (const sub of Object.values(s.subscriptions)) sub.expiresAt = start + 1; });
+  f.set(noon + 5000);
+  assert.deepEqual((await f.bridge.flushSync()).results, [{ recipient: 'jarvis', outcome: 'no_destination' }]);
+  f.advance(CONTENT_RETENTION_MS + HOUR);
+  await f.bridge.flushSync();
+  assert.ok(f.snapshot().messages[m.id], 'still held');
+  assert.equal((await f.bridge.status(friday, { messageId: m.id })).sync.state, 'pending');
+});
+
+test('piggyback on WAKE: completing the read WAKE acknowledges the batch presented with it', async () => {
   const f = await fixture();
   const a = f.sync('jarvis', { subject: 'A' }), stale = f.sync('jarvis', { subject: 'Budget' });
   await f.send(a); await f.send(stale);
   const wake = f.message('jarvis', { subject: 'budget', text: 'Budget decision needed now.' });
   const sent = await f.send(wake);
-  assert.equal(sent.class, 'wake'); assert.equal(sent.delivery, 'immediate'); assert.equal(sent.piggybackedSyncItems, 1);
+  assert.equal(sent.delivery, 'immediate'); assert.equal(sent.piggybackedSyncItems, 1);
   assert.equal(Object.keys(f.snapshot().jobs).length, 1, 'only the WAKE webhook');
   assert.equal((await f.bridge.status(jarvis, { messageId: stale.id })).sync.supersededBy, wake.id);
   const read = await f.bridge.read(friday, { messageId: wake.id });
-  assert.equal(read.envelope.text, wake.text);
-  assert.deepEqual(read.syncBatches.map(b => b.items.map(i => i.messageId)), [[a.id]]);
+  assert.deepEqual(ids(read.syncBatches), [[a.id]]);
   assert.deepEqual((await f.bridge.read(friday, { messageId: wake.id })).syncBatches, read.syncBatches, 're-read is stable');
-  f.set(Date.UTC(2026, 9, 19, 17, 0, 5));
-  assert.deepEqual((await f.bridge.flushSync()).results, [{ recipient: 'friday', outcome: 'empty' }]);
-  assert.equal(Object.keys(f.snapshot().jobs).length, 1);
+  const done = await f.handle(friday, wake.id);
+  assert.deepEqual(done.syncBatchesAcked, [read.syncBatches[0].messageId]);
+  assert.equal(f.snapshot().receipts[a.id].state, 'complete');
+  assert.equal(f.snapshot().receipts[read.syncBatches[0].messageId].viaMessage, wake.id);
+  assert.deepEqual((await f.bridge.inboxRead(friday)).syncBatches, []);
+  f.set(noon + 5000);
+  assert.deepEqual((await f.bridge.flushSync()).results, [], 'nothing is flushed again');
 });
 
-test('piggyback on inbox read: bridge_read drains pending SYNC into a batch attached to the read message', async () => {
+test('a WAKE completed without being read does not acknowledge its batch; the inbox read replays it', async () => {
+  const f = await fixture();
+  const a = f.sync(); await f.send(a);
+  const wake = f.message(); await f.send(wake);
+  const done = await f.handle(friday, wake.id);
+  assert.equal(done.syncBatchesAcked, undefined);
+  assert.equal(f.snapshot().receipts[a.id], undefined);
+  assert.deepEqual(ids((await f.bridge.inboxRead(friday)).syncBatches), [[a.id]]);
+});
+
+test('bridge_read drains pending SYNC into a batch attached to an open message only', async () => {
   const f = await fixture();
   const wake = f.message(); await f.send(wake);
   const a = f.sync(); await f.send(a);
   const read = await f.bridge.read(friday, { messageId: wake.id });
   assert.deepEqual(read.syncBatches.map(b => [b.reason, b.items.map(i => i.messageId)]), [['read', [a.id]]]);
-  const again = await f.bridge.read(friday, { messageId: wake.id });
-  assert.deepEqual(again.syncBatches, read.syncBatches);
-  assert.deepEqual((await f.bridge.inboxRead(friday)).syncBatches, []);
+  assert.deepEqual(await f.bridge.read(friday, { messageId: wake.id }), read);
+  await f.handle(friday, wake.id);
+  const b = f.sync(); await f.send(b);
+  const later = await f.bridge.read(friday, { messageId: wake.id });
+  assert.deepEqual(ids(later.syncBatches), [[a.id]], 'a completed message collects nothing new');
+  assert.deepEqual(ids((await f.bridge.inboxRead(friday)).syncBatches), [[b.id]]);
   await assert.rejects(f.bridge.inboxRead(jarvis), /wake_sync_not_enabled/);
-  assert.equal(Object.keys(f.snapshot().jobs).length, 1);
 });
 
 test('no ACK wakes for an enabled recipient: receipts still complete, no reply message or job is created', async () => {
@@ -286,12 +384,10 @@ test('no ACK wakes for an enabled recipient: receipts still complete, no reply m
   const after = f.snapshot();
   assert.deepEqual(Object.keys(after.messages), Object.keys(before.messages));
   assert.deepEqual(after.jobs, before.jobs);
-  assert.equal(after.receipts[fromFriday.id].state, 'complete');
   const status = await f.bridge.status(friday, { messageId: fromFriday.id });
   assert.equal(status.receiptCompleted, true); assert.equal(status.ackMessageId, null);
-  // Jarvis is not enabled yet, so Friday's receipts still ACK Jarvis exactly as before.
   const fromJarvis = f.message('jarvis'); await f.send(fromJarvis);
-  assert.ok((await f.handle(friday, fromJarvis.id)).ackMessageId);
+  assert.ok((await f.handle(friday, fromJarvis.id)).ackMessageId, 'Jarvis is not enabled, so it still gets ACKs');
 });
 
 test('both recipients enabled: no ACK path is required or created in either direction', async () => {
@@ -300,11 +396,10 @@ test('both recipients enabled: no ACK path is required or created in either dire
   const m = f.message('jarvis');
   assert.equal((await f.send(m)).jobIds.length, 1, 'no return subscription needed when no ACK will be sent');
   assert.equal((await f.handle(friday, m.id)).ackMessageId, null);
-  // SYNC to the events peer still needs a subscription that a batch could wake.
   await assert.rejects(f.send(f.sync('friday')), /recipient_subscription_required/);
 });
 
-test('flag off = v1: classified messages are delivered immediately, ACKs are created, no sync state exists', async () => {
+test('flag unset = v1: every wake carries the native message ID, ACKs are created, no sync state exists', async () => {
   for (const options of [{ wakeSync: false }, { recipients: [] }]) {
     const f = await fixture(options);
     const plain = f.message(), classed = f.sync('jarvis', { subject: 'S', dueAt: iso(start + 86400000) });
@@ -314,10 +409,12 @@ test('flag off = v1: classified messages are delivered immediately, ACKs are cre
     assert.equal('syncBatches' in read, false);
     assert.ok((await f.handle(friday, plain.id)).ackMessageId);
     const s = f.snapshot();
-    assert.equal(s.syncQueues, undefined); assert.equal(Object.keys(s.jobs).length, 3);
+    assert.equal(s.syncQueues, undefined);
+    const fridayJobs = Object.values(s.jobs).filter(j => j.recipient === 'friday');
+    assert.deepEqual(fridayJobs.map(j => JSON.parse(j.body).data.messageId).sort(), [plain.id, classed.id].sort());
     for (const m of Object.values(s.messages)) assert.deepEqual(Object.keys(m).sort(), ['authorization', 'envelope', 'hash', 'jobIds', 'retainUntil', 'storedAt']);
-    f.set(Date.UTC(2026, 9, 19, 17, 1));
-    assert.deepEqual(await f.bridge.flushSync(), { boundary: Date.UTC(2026, 9, 19, 17), results: [], dispatch: [] });
+    f.set(noon + 5000);
+    assert.deepEqual(await f.bridge.flushSync(), { boundary: noon, results: [], dispatch: [] });
   }
 });
 
@@ -330,15 +427,28 @@ test('unclassified messages to an enabled recipient store exactly the v1 record 
   assert.deepEqual(on.snapshot().jobs, off.snapshot().jobs);
 });
 
-test('rollback: flipping the flag off sends new SYNC as WAKE and still flushes already-queued items', async () => {
+test('rollback: leftovers are re-sent under their own message IDs where v1 authority allows, otherwise in one batch', async () => {
   const f = await fixture();
-  const queued = f.sync(); await f.send(queued);
+  const native = f.sync(); await f.send(native);
+  const expiredAuthority = f.sync(); await f.send(expiredAuthority, who('jarvis', start + 10 * MINUTE));
   f.enabled.recipients = [];
-  const after = f.sync(); assert.equal((await f.send(after)).jobIds.length, 1);
-  const read = await f.bridge.read(friday, { messageId: after.id });
-  assert.equal('syncBatches' in read, false, 'no additive field for a rolled-back receiver');
-  f.set(Date.UTC(2026, 9, 19, 17, 0, 5));
-  assert.deepEqual((await f.bridge.flushSync()).results, [{ recipient: 'friday', outcome: 'flushed', items: 1 }]);
+  const after = f.sync(); assert.equal((await f.send(after)).jobIds.length, 1, 'new SYNC is WAKE once rolled back');
+  assert.equal('syncBatches' in await f.bridge.read(friday, { messageId: after.id }), false);
+  f.set(start + 30 * MINUTE); // any run, no need to wait for an even hour
+  const out = await f.bridge.flushSync();
+  assert.deepEqual(out.results, [{ recipient: 'friday', outcome: 'native', items: 1 },
+    { recipient: 'friday', outcome: 'flushed', reason: 'rollback', items: 1 }]);
+  const s = f.snapshot();
+  assert.deepEqual(JSON.parse(jobsFor(s, native.id)[0].body), { event: EVENT_NAME, data: { messageId: native.id } });
+  assert.ok(out.dispatch.includes(native.id));
+  const batch = batchesIn(s)[0];
+  assert.deepEqual(batch.syncBatch.itemIds, [expiredAuthority.id]);
+  assert.match(batch.envelope.text, new RegExp(expiredAuthority.id), 'unchanged receivers see the native ID in the text');
+  // An unchanged receiver reads, claims and completes it as an ordinary status message.
+  await f.ack(batch.envelope.id);
+  assert.equal(f.snapshot().receipts[expiredAuthority.id].state, 'complete');
+  // And handles the natively re-sent item exactly like any v1 message (ACK included).
+  assert.ok((await f.handle(friday, native.id)).ackMessageId);
 });
 
 test('repository wiring: no Vercel cron; the GitHub Actions hourly trigger POSTs the route outside the MCP catch-all', () => {
@@ -412,9 +522,8 @@ test('runtime: tool schemas, readiness and inbox tool follow the per-recipient f
 });
 
 const auth = { authorization: 'Bearer fixture-cron-secret-value' };
-const outside = { status: 'skipped', reason: 'outside_flush_window' };
 test('runtime cron auth: POST and GET need the exact CRON_SECRET bearer; other methods and an unset secret are refused', async () => {
-  const f = await runtimeFixture({}, Date.UTC(2026, 9, 19, 17, 5));
+  const f = await runtimeFixture({}, noon + 5 * MINUTE);
   for (const method of ['POST', 'GET']) {
     assert.equal((await f.cron({}, method)).status, 401, method);
     assert.equal((await f.cron({ authorization: 'Bearer wrong-secret-value-xx' }, method)).status, 401, method);
@@ -424,75 +533,66 @@ test('runtime cron auth: POST and GET need the exact CRON_SECRET bearer; other m
   }
   assert.equal((await f.cron(auth, 'PUT')).status, 405);
   for (const secret of [undefined, '', 'short-secret']) {
-    const unset = await runtimeFixture({ CRON_SECRET: secret }, Date.UTC(2026, 9, 19, 17, 5));
+    const unset = await runtimeFixture({ CRON_SECRET: secret }, noon + 5 * MINUTE);
     assert.equal((await unset.cron({ authorization: 'Bearer ' + secret })).status, 503, String(secret));
   }
-  // Odd Chicago hour: an authenticated 200 no-op that touches no storage.
-  const odd = await runtimeFixture({ DATABASE_URL: undefined }, Date.UTC(2026, 9, 19, 18, 0, 5));
-  const response = await odd.cron(auth);
-  assert.equal(response.status, 200); assert.deepEqual(await response.json(), outside);
+  const disabled = await runtimeFixture({ BRIDGE_DELIVERY_ENABLED: 'false' }, noon + 5 * MINUTE);
+  assert.deepEqual(await (await disabled.cron(auth)).json(), { status: 'skipped', reason: 'delivery_not_enabled' });
 });
 
-test('runtime cron: even-hour POST flushes one standard-shaped webhook; late-in-window flushes, after-window and duplicate runs do not', async () => {
+const idle = boundary => ({ status: 'ok', boundary, flushed: 0, capped: 0, redeliveredNative: 0, dispatched: 0, dispatchPending: 0 });
+test('runtime cron: odd hour is a no-op; even-hour (late) POST flushes one v1-shaped webhook; the receiver reads and acknowledges', async () => {
   const f = await runtimeFixture();
   const a = f.message({ subject: 'A' }), b = f.message({ subject: 'B' });
   for (const m of [a, b]) assert.equal((await f.call('jarvis', 'bridge_message_send', m)).structuredContent.delivery, 'batched');
   f.set(Date.UTC(2026, 9, 19, 16, 0, 5)); // 11:00 CDT
-  assert.deepEqual(await (await f.cron(auth)).json(), outside);
-  f.set(Date.UTC(2026, 9, 19, 17, 25)); // 12:25 CDT: late but inside the window
+  assert.deepEqual(await (await f.cron(auth)).json(), idle('2026-10-19T15:00:00.000Z'));
+  f.set(noon + 25 * MINUTE); // 12:25 CDT: late run
   const sendsBefore = f.sends.length;
-  const out = await (await f.cron(auth)).json();
-  assert.deepEqual(out, { status: 'ok', boundary: '2026-10-19T17:00:00.000Z', flushed: 1, capped: 0, dispatched: 1, dispatchPending: 0 });
-  f.set(Date.UTC(2026, 9, 19, 17, 29)); // duplicate run, same even hour
-  assert.deepEqual(await (await f.cron(auth)).json(), { status: 'ok', boundary: '2026-10-19T17:00:00.000Z', flushed: 0, capped: 0, dispatched: 0, dispatchPending: 0 });
+  assert.deepEqual(await (await f.cron(auth)).json(), { ...idle('2026-10-19T17:00:00.000Z'), flushed: 1, dispatched: 1 });
+  f.set(noon + 29 * MINUTE);
+  assert.deepEqual(await (await f.cron(auth, 'GET')).json(), idle('2026-10-19T17:00:00.000Z'), 'duplicate run, same even hour');
   const dispatch = f.sends.slice(sendsBefore).map(args => args[1]).find(p => p.dispatchMessageId);
   const batchId = dispatch.dispatchMessageId;
   await f.consume(dispatch);
-  const webhooks = f.posts.filter(p => p.event === EVENT_NAME);
-  assert.deepEqual(webhooks, [{ event: EVENT_NAME, data: { messageId: batchId } }], 'one webhook, v1 payload shape');
+  assert.deepEqual(f.posts.filter(p => p.event === EVENT_NAME), [{ event: EVENT_NAME, data: { messageId: batchId } }]);
+  // Flagged receiver contract: read the woken message (full syncBatches), then claim and complete it.
   const read = (await f.call('friday', 'bridge_read', { messageId: batchId })).structuredContent;
   assert.deepEqual(read.syncBatches[0].items.map(i => i.subject), ['A', 'B']);
-  assert.equal((await (await f.cron(auth, 'GET')).json()).flushed, 0, 'same boundary never flushes twice');
-  // An item queued during the window waits for the next boundary; a run after the window is a no-op.
-  await f.call('jarvis', 'bridge_message_send', f.message({ subject: 'C' }));
-  f.set(Date.UTC(2026, 9, 19, 17, 30));
-  assert.deepEqual(await (await f.cron(auth)).json(), outside);
-  assert.equal(f.posts.filter(p => p.event === EVENT_NAME).length, 1);
-  f.set(Date.UTC(2026, 9, 19, 19, 10)); // 14:10 CDT
-  assert.equal((await (await f.cron(auth)).json()).flushed, 1);
+  assert.deepEqual((await f.call('friday', 'bridge_inbox_read', {})).structuredContent.syncBatches.map(x => x.messageId), [batchId],
+    'unacknowledged batch replays');
+  const claim = (await f.call('friday', 'bridge_receipt_claim', { messageId: batchId })).structuredContent;
+  const done = (await f.call('friday', 'bridge_receipt_complete', { messageId: batchId, claimId: claim.claimId,
+    hostedEventId: null, hostedTurnId: null })).structuredContent;
+  assert.equal(done.ackMessageId, null);
+  assert.equal((await f.call('jarvis', 'bridge_status', { messageId: a.id })).structuredContent.receiptCompleted, true);
   assert.deepEqual((await f.call('friday', 'bridge_inbox_read', {})).structuredContent, { syncBatches: [] });
-  const disabled = await runtimeFixture({ BRIDGE_DELIVERY_ENABLED: 'false' }, Date.UTC(2026, 9, 19, 17, 5));
-  assert.deepEqual(await (await disabled.cron(auth)).json(), { status: 'skipped', reason: 'delivery_not_enabled' });
 });
 
-// [UTC time, expected response]: number = batches flushed, 'skip' = outside the window.
-for (const [name, enqueueAt, runs] of [
+// [UTC run time, expected batches flushed by that run].
+for (const [name, queuedAt, runs] of [
   ['fall back, Nov 1 2026', Date.UTC(2026, 10, 1, 5, 40), [ // 00:40 CDT
-    [Date.UTC(2026, 10, 1, 6, 0, 5), 'skip'], // 01:00 CDT
-    [Date.UTC(2026, 10, 1, 7, 0, 5), 'skip'], // 01:00 CST (repeated hour)
-    [Date.UTC(2026, 10, 1, 7, 20), 'skip'],
-    [Date.UTC(2026, 10, 1, 8, 12), 1], // 02:12 CST, late in window
-    [Date.UTC(2026, 10, 1, 8, 20), 0], // duplicate in the same even hour
-    [Date.UTC(2026, 10, 1, 9, 0, 5), 'skip'], // 03:00 CST
+    [Date.UTC(2026, 10, 1, 6, 0, 5), 0], // 01:00 CDT
+    [Date.UTC(2026, 10, 1, 7, 0, 5), 1], // 01:00 CST: waiting for 02:00 CST would exceed 2 elapsed hours
+    [Date.UTC(2026, 10, 1, 7, 20), 0], // duplicate
+    [Date.UTC(2026, 10, 1, 8, 0, 5), 0], // 02:00 CST, nothing pending
   ]],
   ['spring forward, Mar 8 2026', Date.UTC(2026, 2, 8, 6, 40), [ // 00:40 CST
-    [Date.UTC(2026, 2, 8, 7, 0, 5), 'skip'], // 01:00 CST
+    [Date.UTC(2026, 2, 8, 7, 0, 5), 0], // 01:00 CST
     [Date.UTC(2026, 2, 8, 8, 5), 1], // 03:05 CDT, replaces the nonexistent 02:00
     [Date.UTC(2026, 2, 8, 8, 29), 0],
-    [Date.UTC(2026, 2, 8, 8, 31), 'skip'],
-    [Date.UTC(2026, 2, 8, 9, 0, 5), 0], // 04:00 CDT, empty window
+    [Date.UTC(2026, 2, 8, 9, 0, 5), 0], // 04:00 CDT, empty
   ]],
 ]) {
-  test(`runtime cron across DST (${name}) flushes once, only in the even-hour window`, async () => {
-    const f = await runtimeFixture({}, enqueueAt);
+  test(`runtime cron across DST (${name}): one flush within 2 elapsed hours`, async () => {
+    const f = await runtimeFixture({}, queuedAt);
     assert.equal((await f.call('jarvis', 'bridge_message_send', f.message())).structuredContent.delivery, 'batched');
     for (const [at, expected] of runs) {
       f.set(at);
       const body = await (await f.cron(auth)).json();
-      if (expected === 'skip') assert.deepEqual(body, outside, iso(at));
-      else assert.equal(body.flushed, expected, iso(at));
+      assert.equal(body.status, 'ok', iso(at)); assert.equal(body.flushed, expected, iso(at));
+      if (expected) assert.ok(at - queuedAt <= WAKE_WINDOW_MS);
     }
-    assert.equal(f.posts.filter(p => p.event === EVENT_NAME).length, 0, 'webhook POSTs happen on queue dispatch, not inline');
-    assert.equal(f.sends.filter(args => args[1].dispatchMessageId).length >= 1, true);
+    assert.equal(f.sends.filter(args => args[1].dispatchMessageId).length, 2, 'the send prearm plus one batch');
   });
 }

@@ -1,7 +1,7 @@
 # Hourly trigger for the wake/sync SYNC batch flush (POST /api/cron).
-# The endpoint itself decides whether this run falls in an America/Chicago
-# even-hour window (minutes 0-29) and flushes each recipient at most once per
-# boundary; every other run is a 200 no-op. Configure in the repository:
+# The endpoint decides what is due: an America/Chicago even hour that has
+# passed (late runs still deliver), or data that would otherwise wait more than
+# 2 elapsed hours (DST). Every other run is a 200 no-op. Configure in the repository:
 #   secret   CRON_SECRET     - same value as the Vercel CRON_SECRET (16+ chars)
 #   variable BRIDGE_CRON_URL - full https URL of the deployed /api/cron route
 # Missing either one skips the run without failing.
