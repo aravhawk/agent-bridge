@@ -117,9 +117,9 @@ works), and a domain for the bridge.
    BRIDGE_PEER_BOB_WEBHOOK_SECRET=whsec_<base64>
    ```
    `vercel.json` already routes all paths to the MCP function, keeps the queue
-   consumer private, declares the queue trigger topic and the hourly SYNC
-   flush cron (set `CRON_SECRET` if you enable wake/sync). The queue topic must
-   equal `BRIDGE_QUEUE_TOPIC`; both default to the same value.
+   consumer and the SYNC flush route (`/api/cron`) out of that catch-all, and
+   declares the queue trigger topic. The queue topic must equal
+   `BRIDGE_QUEUE_TOPIC`; both default to the same value.
 6. **Check the public boundary.**
    ```sh
    python3 scripts/check_v1.py --origin https://bridge.example.com --peers alice,bob \
@@ -157,7 +157,7 @@ The full reference, including the diagnostic and canary procedures, is in
 | `BRIDGE_PEER_<ID>_RECEIVER_ID` / `_WEBHOOK_CONTRACT_VERIFIED` | for delivery | Webhook receiver attestations |
 | `BRIDGE_OAUTH_CONTRACT_VERIFIED`, `BRIDGE_SUBSCRIPTIONS_ENABLED`, `BRIDGE_RECEIVER_POLICY`, `BRIDGE_DELIVERY_ENABLED` | for delivery | Readiness gates, all closed by default |
 | `BRIDGE_WAKE_SYNC_RECIPIENTS` | no | Recipients with WAKE/SYNC batching and no ACK wakes (default off); see below |
-| `CRON_SECRET` | for SYNC flush | Vercel cron secret protecting `/api/cron` |
+| `CRON_SECRET` | for SYNC flush | 16+ character secret protecting `/api/cron`; the same value is the GitHub Actions secret `CRON_SECRET` |
 | `BRIDGE_SERVICE_NAME`, `BRIDGE_MESSAGE_PROTOCOL`, `BRIDGE_RECEIVER_ID`, `BRIDGE_QUEUE_TOPIC`, `BRIDGE_QUEUE_REGION`, `BRIDGE_REQUIRE_ISSUER_UNDER_ORIGIN`, `BRIDGE_DATABASE_HOST_SUFFIX` | no | Naming and optional hardening |
 
 **Compatibility mode.** This project began as a private deployment between two
@@ -214,8 +214,22 @@ by clearing it), that recipient gets:
   its wake payload is unchanged; `bridge_read` adds a `syncBatches` field with
   each item.
 
-The flush is a Vercel cron (`/api/cron`, hourly UTC; the handler picks the
-Chicago even hours across DST) protected by `CRON_SECRET`. Details:
+The flush is triggered hourly by the GitHub Actions workflow
+`.github/workflows/bridge-cron-flush.yml` (Vercel Hobby only allows daily
+crons). It POSTs to `/api/cron` with `Authorization: Bearer $CRON_SECRET`; the
+route flushes only in minutes 0–29 after a Chicago even hour, handles DST, and
+is a 200 no-op otherwise. To roll out, in this order:
+
+1. Set `CRON_SECRET` (16+ random characters, e.g. `openssl rand -hex 32`) in
+   Vercel and redeploy.
+2. Add the same value as the GitHub Actions repository secret `CRON_SECRET`.
+3. Add the GitHub Actions repository variable `BRIDGE_CRON_URL`, the full URL
+   of the deployed route, e.g. `https://<your-bridge-host>/api/cron`.
+4. Update the recipient's receiver to read `syncBatches`, then set
+   `BRIDGE_WAKE_SYNC_RECIPIENTS=friday` in Vercel and redeploy.
+
+Until the secret and variable exist the workflow skips without failing. Roll
+back by clearing `BRIDGE_WAKE_SYNC_RECIPIENTS`. Details:
 [configuration](docs/configuration.md#wakesync-delivery-classes-default-off).
 
 ## Limitations

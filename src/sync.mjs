@@ -12,6 +12,9 @@ export const WAKE_SYNC_FLAG = 'BRIDGE_WAKE_SYNC_RECIPIENTS';
 export const WAKE_WINDOW_MS = 2 * 3600000;
 export const SYNC_DAILY_FLUSH_CAP = 12;
 export const SYNC_TIME_ZONE = 'America/Chicago';
+// Scheduled triggers (GitHub Actions) start late; a run up to this long after
+// an even-hour boundary still flushes it. Later runs are no-ops.
+export const FLUSH_WINDOW_MS = 30 * 60000;
 const HOUR = 3600000;
 
 // Unset or empty: off. Any unknown peer ID closes the whole flag (v1 behavior)
@@ -54,17 +57,23 @@ export function nextFlushBoundary(now) {
   throw new Error('no_flush_boundary');
 }
 export const chicagoDate = ms => chicagoWall(ms).date;
+// The boundary whose lateness window contains now, or null (no-op run).
+export function flushWindowBoundary(now) {
+  const boundary = latestFlushBoundary(now);
+  return now - boundary < FLUSH_WINDOW_MS ? boundary : null;
+}
 
 // --- Classification ----------------------------------------------------------
 // The sender chooses the class; an absent class is WAKE (v1 compatibility).
 // SYNC is promoted to WAKE when its supplied effectiveAt/dueAt is <= now + 2h,
-// and, so queued data is never lost, when it would expire before the next flush.
+// and, so queued data is never lost, when it would expire before the next
+// flush window closes.
 export function classify(envelope, now) {
   if (envelope.class !== 'sync') return { class: 'wake' };
   for (const [field, reason] of [['effectiveAt', 'effective_within_2h'], ['dueAt', 'due_within_2h']]) {
     if (envelope[field] !== undefined && Date.parse(envelope[field]) <= now + WAKE_WINDOW_MS) return { class: 'wake', promoted: reason };
   }
-  if (Date.parse(envelope.expiresAt) <= nextFlushBoundary(now)) return { class: 'wake', promoted: 'expires_before_flush' };
+  if (Date.parse(envelope.expiresAt) <= nextFlushBoundary(now) + FLUSH_WINDOW_MS) return { class: 'wake', promoted: 'expires_before_flush' };
   return { class: 'sync' };
 }
 
@@ -200,11 +209,15 @@ export function batchView(state, batchId, now) {
       receivedAt: new Date(storedAt).toISOString(), expired: Date.parse(e.expiresAt) <= now })) };
 }
 
-// Scheduled flush, once per Chicago even-hour boundary per recipient. Runs
-// hourly; an odd-hour run only catches up a boundary that was missed. Empty
-// windows send nothing; at most SYNC_DAILY_FLUSH_CAP batch wakes per local day.
+// Scheduled flush, once per Chicago even-hour boundary per recipient, only
+// within FLUSH_WINDOW_MS after the boundary (odd hours and late runs are
+// no-ops; a missed window waits for the next boundary, a WAKE or an inbox
+// read). A repeated run in the same window only re-offers unpublished batches.
+// Empty windows send nothing; at most SYNC_DAILY_FLUSH_CAP batch wakes per day.
 export function flushDue(state, now, { policyIds }) {
-  const boundary = latestFlushBoundary(now), day = chicagoDate(boundary), results = [];
+  const boundary = flushWindowBoundary(now);
+  if (boundary === null) return { boundary: latestFlushBoundary(now), results: [], dispatch: [], skipped: 'outside_flush_window' };
+  const day = chicagoDate(boundary), results = [];
   for (const recipient of PEER_IDS) {
     const queue = queueOf(state, recipient);
     if (!queue || (queue.lastFlushBoundary ?? -Infinity) >= boundary) continue;

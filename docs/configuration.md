@@ -202,7 +202,8 @@ The results are server operation evidence only (`wakeVerified: false`).
 | Variable | Meaning |
 |---|---|
 | `BRIDGE_WAKE_SYNC_RECIPIENTS` | Comma-separated recipient peer IDs that get WAKE/SYNC routing, e.g. `friday`. Unset or empty: v1 behavior. Any unknown ID disables the whole flag. Read on every call, so clearing it rolls back immediately. |
-| `CRON_SECRET` | Vercel cron secret (16+ random characters). Vercel sends it as `Authorization: Bearer <secret>` to `/api/cron`; without it the flush route answers 503 and SYNC data only leaves on a WAKE or an inbox read. |
+| `CRON_SECRET` | Flush-route secret (16+ random characters), set in Vercel and, with the same value, as the GitHub Actions secret `CRON_SECRET`. Callers send `Authorization: Bearer <secret>` to `/api/cron`; without it the route answers 503 and SYNC data only leaves on a WAKE or an inbox read. |
+| `BRIDGE_CRON_URL` | GitHub Actions repository **variable** (not a Vercel setting): the full HTTPS URL of the deployed `/api/cron` route. |
 
 For an enabled recipient:
 
@@ -213,16 +214,17 @@ For an enabled recipient:
 - **Two classes.** `bridge_message_send` takes optional `class` (`wake` or
   `sync`), `subject`, `effectiveAt` and `dueAt`. A message with no class is
   WAKE, unchanged. SYNC is promoted to WAKE when `effectiveAt` or `dueAt` is at
-  or before now + 2 h, and when its `expiresAt` falls at or before the next
-  flush boundary (so queued data can never expire unseen). Only `class: sync`
+  or before now + 2 h, and when its `expiresAt` falls at or before the end of
+  the next flush window (so queued data can never expire unseen). Only `class: sync`
   may set `expiresAt` up to 12 h after `sentAt`; everything else keeps 1 h.
 - **Batching.** Pending SYNC items coalesce per recipient: delta only, and a
   later item with the same `subject` (case and spacing ignored) replaces the
   earlier pending one, as does a WAKE with that subject. The batch is delivered
   once: piggybacked on the next WAKE to that recipient, returned by the
   recipient's next `bridge_read` or `bridge_inbox_read`, or flushed as one
-  webhook at the next even America/Chicago hour (00:00, 02:00, … 22:00). Empty
-  windows send nothing; at most 12 flushes per recipient per Chicago day.
+  webhook at the next even America/Chicago hour (00:00, 02:00, … 22:00, run up
+  to 30 minutes late). Empty windows send nothing; at most 12 flushes per
+  recipient per Chicago day.
 
 A batch is stored as an ordinary v1 `status` message from the counterpart, so
 its wake is the unchanged `{"event":"bridge.message.received","data":{"messageId":…}}`
@@ -231,21 +233,51 @@ item's messageId; `bridge_read` adds a `syncBatches` array with each item's
 full data. Claiming and completing the batch records every item's receipt and
 never creates an ACK. Items stay individually readable by ID.
 
-The flush runs from a Vercel cron (`vercel.json`, `0 * * * *`, hourly UTC).
-Each run computes the latest Chicago even-hour boundary and flushes each
-recipient at most once per boundary, so odd-hour runs only catch up a missed
-boundary. On the spring-forward day the missing 02:00 is flushed at 03:00 CDT;
-on the fall-back day neither 01:00 counts. Batches are published to the queue
-after the flush commits; a failed publication is retried by the next run.
+The flush is triggered by the GitHub Actions workflow
+`.github/workflows/bridge-cron-flush.yml` (`0 * * * *`, hourly UTC, plus manual
+`workflow_dispatch`), which POSTs to `/api/cron` with the bearer secret. It is
+not a Vercel cron, because Vercel Hobby only allows daily crons. The workflow
+has no permissions, no third-party actions, a 5-minute timeout and a
+non-overlapping concurrency group. If the secret or URL is not configured it
+logs a notice and succeeds; otherwise any non-2xx response fails the run
+(curl retries 3 times with a 30-second limit per attempt).
+
+The route accepts POST and GET. It flushes only when the current time is in
+minutes 0–29 after a Chicago even-hour boundary, because scheduled Actions
+runs start late; any other run returns `200 {"status":"skipped","reason":"outside_flush_window"}`
+without touching storage. Each recipient is flushed at most once per boundary,
+so a duplicate run in the same window sends nothing new, and a window missed
+entirely waits for the next boundary (or a WAKE or inbox read). On the
+spring-forward day the missing 02:00 is flushed at 03:00 CDT; on the fall-back
+day (e.g. 1 November 2026) neither 01:00 counts and the 02:00 CST window
+flushes. Batches are published to the queue after the flush commits; a failed
+publication is re-offered by a repeated run in the same window or by the next
+boundary's run.
 Queued SYNC items stay deliverable after the sender's access token expires
 (a FYI must survive until the next boundary), but a policy change, durable
 denial, the item's own `expiresAt` or content retention still withdraws them.
 
-Rollout: set `CRON_SECRET`, update the recipient's receiver to use
-`syncBatches` (or `bridge_inbox_read` at the start of a turn), then set
-`BRIDGE_WAKE_SYNC_RECIPIENTS` to that recipient. Rollback: clear the variable.
-New SYNC messages are then delivered as WAKE, ACKs resume, and anything still
-queued is flushed at the next boundary as a standard message.
+Rollout (in this order; nothing here is set by the repository):
+
+1. Generate one random secret of 16+ characters, e.g. `openssl rand -hex 32`.
+2. In Vercel (Production environment), set `CRON_SECRET` to that value and
+   redeploy so the function sees it.
+3. In GitHub (Settings → Secrets and variables → Actions), add a repository
+   secret `CRON_SECRET` with the same value.
+4. In the same place, add a repository variable `BRIDGE_CRON_URL` with the full
+   HTTPS URL of the deployed flush route, e.g. `https://<your-bridge-host>/api/cron`.
+5. Optionally run the "Bridge SYNC flush" workflow by hand (`workflow_dispatch`).
+   Outside an even Chicago hour it should succeed with
+   `{"status":"skipped","reason":"outside_flush_window"}`; a 401 means the two
+   secrets differ, a 503 means the Vercel value is missing or shorter than 16.
+6. Update the recipient's receiver to treat `syncBatches` as inbox data (and,
+   optionally, call `bridge_inbox_read` at the start of a turn).
+7. Set `BRIDGE_WAKE_SYNC_RECIPIENTS=friday` in Vercel and redeploy.
+
+Rollback: clear `BRIDGE_WAKE_SYNC_RECIPIENTS` and redeploy. New SYNC messages
+are then delivered as WAKE, ACKs resume, and anything still queued is flushed
+at the next even-hour window as a standard message (leave the secrets and the
+workflow in place until then).
 
 ## Bounded queue recovery
 

@@ -19,7 +19,7 @@ import { VERSION, RECEIVER_ID, QUEUE_REGION } from './release.mjs';
 import { CONFIG, EVENTS_PEER, WEBHOOK_PEER, PEER_IDS, NAMES, peerCode, webhookPeerSettings } from './config.mjs';
 import { createTaskCapability, validateTaskCapabilityOptions } from './task-capability.mjs';
 import { createTaskAccess } from './task-access.mjs';
-import { wakeSyncRecipients, WAKE_SYNC_FLAG } from './sync.mjs';
+import { wakeSyncRecipients, flushWindowBoundary, WAKE_SYNC_FLAG } from './sync.mjs';
 import { timingSafeEqual } from 'node:crypto';
 
 // Canary callbacks are one-shot: every invocation is recorded as a terminal
@@ -234,22 +234,26 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
         throw new BridgeError('delivery_not_enabled', 503);
       }, { visibilityTimeoutSeconds: 60, retry: queue.retry });
     },
-    // Vercel cron (hourly UTC): flush pending SYNC batches at each America/Chicago
-    // even-hour boundary. Vercel sends `Authorization: Bearer $CRON_SECRET`;
-    // without CRON_SECRET the route stays closed. No request input is used.
+    // Hourly scheduled trigger (GitHub Actions POST, or any GET/POST caller with
+    // `Authorization: Bearer $CRON_SECRET`): flush pending SYNC batches at each
+    // America/Chicago even-hour boundary, at most 30 minutes late. Any other time
+    // is a 200 no-op without storage access. Without CRON_SECRET the route stays
+    // closed. No request input besides the bearer is used.
     cronHandler() {
       const reply = (body, status = 200) => Response.json(body, { status, headers: { 'cache-control': 'no-store' } });
       return async request => {
-        if (request.method !== 'GET') return reply({ error: 'method_not_allowed' }, 405);
+        if (!['GET', 'POST'].includes(request.method)) return reply({ error: 'method_not_allowed' }, 405);
         const secret = env.CRON_SECRET;
         if (typeof secret !== 'string' || secret.length < 16) return reply({ error: 'cron_not_configured' }, 503);
         const wanted = Buffer.from('Bearer ' + secret), actual = Buffer.from(request.headers.get('authorization') || '');
         if (actual.length !== wanted.length || !timingSafeEqual(actual, wanted)) return reply({ error: 'unauthorized' }, 401);
+        if (flushWindowBoundary(clock()) === null) return reply({ status: 'skipped', reason: 'outside_flush_window' });
         if (!readiness().deliveryEnabled) return reply({ status: 'skipped', reason: 'delivery_not_enabled' });
         configure();
         const { boundary, results, dispatch } = await bridge.flushSync();
         const published = [];
-        // Publish after commit; an unpublished batch is retried by the next run.
+        // Publish after commit; an unpublished batch is re-offered by a repeated run
+        // in the same window (the workflow's curl retries) or the next boundary's run.
         for (const id of dispatch) { try { await queue.prepareMessage(id); published.push(id); } catch { /* retried next run */ } }
         if (published.length) await bridge.markSyncDispatched(published);
         return reply({ status: 'ok', boundary: new Date(boundary).toISOString(),

@@ -9,9 +9,6 @@
     "api/index.mjs": { "maxDuration": 60 },
     "api/cron.mjs": { "maxDuration": 60 }
   },
-  "crons": [
-    { "path": "/api/cron", "schedule": "0 * * * *" }
-  ],
   "rewrites": [
     { "source": "/((?!api/queue|api/cron).*)", "destination": "/api/index" }
   ]

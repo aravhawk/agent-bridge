@@ -1,0 +1,41 @@
+# Hourly trigger for the wake/sync SYNC batch flush (POST /api/cron).
+# The endpoint itself decides whether this run falls in an America/Chicago
+# even-hour window (minutes 0-29) and flushes each recipient at most once per
+# boundary; every other run is a 200 no-op. Configure in the repository:
+#   secret   CRON_SECRET     - same value as the Vercel CRON_SECRET (16+ chars)
+#   variable BRIDGE_CRON_URL - full https URL of the deployed /api/cron route
+# Missing either one skips the run without failing.
+name: Bridge SYNC flush
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: bridge-cron-flush
+  cancel-in-progress: false
+jobs:
+  flush:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: POST cron endpoint
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          BRIDGE_CRON_URL: ${{ vars.BRIDGE_CRON_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CRON_SECRET:-}" ] || [ -z "${BRIDGE_CRON_URL:-}" ]; then
+            echo "::notice::CRON_SECRET secret or BRIDGE_CRON_URL variable is not configured; skipping."
+            exit 0
+          fi
+          case "$BRIDGE_CRON_URL" in
+            https://*) ;;
+            *) echo "::error::BRIDGE_CRON_URL must be an https:// URL."; exit 1 ;;
+          esac
+          # The header is read from stdin so the secret never appears in argv.
+          printf 'Authorization: Bearer %s\n' "$CRON_SECRET" | curl --silent --show-error --fail-with-body \
+            --proto '=https' --connect-timeout 10 --max-time 30 \
+            --retry 3 --retry-delay 5 --retry-all-errors \
+            --request POST --header @- "$BRIDGE_CRON_URL"
+          echo

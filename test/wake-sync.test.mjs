@@ -14,7 +14,7 @@ import { resourceFor } from '../src/resource.mjs';
 import { TOPIC } from '../src/queue.mjs';
 import { ISSUER } from './fixtures/provider.mjs';
 import { classify, wakeSyncRecipients, isFlushBoundary, latestFlushBoundary, nextFlushBoundary, chicagoDate,
-  chicagoWall, SYNC_DAILY_FLUSH_CAP, WAKE_WINDOW_MS } from '../src/sync.mjs';
+  chicagoWall, flushWindowBoundary, SYNC_DAILY_FLUSH_CAP, WAKE_WINDOW_MS, FLUSH_WINDOW_MS } from '../src/sync.mjs';
 
 const HOUR = 3600000, policy = 'c'.repeat(64);
 // 2026-10-19 10:30 America/Chicago (CDT, UTC-5). Next even boundary: 12:00 CDT.
@@ -67,10 +67,11 @@ test('classification: unclassified and wake are WAKE, sync is SYNC; auto-promoti
     assert.deepEqual(classify({ ...base, [field]: iso(now + WAKE_WINDOW_MS + 1) }, now), { class: 'sync' });
     assert.deepEqual(classify({ ...base, [field]: iso(now - HOUR) }, now), { class: 'wake', promoted: reason });
   }
-  // Safety net: SYNC data that would expire before the next flush is never lost.
+  // Safety net: SYNC data that would expire before the next flush window closes is never lost.
+  const closes = Date.UTC(2026, 9, 19, 17) + FLUSH_WINDOW_MS;
   assert.equal(nextFlushBoundary(now), Date.UTC(2026, 9, 19, 17));
-  assert.deepEqual(classify({ ...base, expiresAt: iso(Date.UTC(2026, 9, 19, 17)) }, now), { class: 'wake', promoted: 'expires_before_flush' });
-  assert.deepEqual(classify({ ...base, expiresAt: iso(Date.UTC(2026, 9, 19, 17) + 1) }, now), { class: 'sync' });
+  assert.deepEqual(classify({ ...base, expiresAt: iso(closes) }, now), { class: 'wake', promoted: 'expires_before_flush' });
+  assert.deepEqual(classify({ ...base, expiresAt: iso(closes + 1) }, now), { class: 'sync' });
 });
 
 test('validation: optional class fields are bounded; only sync may outlive one hour (max 12h); ACK-free v1 envelope is unchanged', () => {
@@ -154,6 +155,16 @@ test('Chicago even-hour boundaries: twelve per local day, across both DST transi
   assert.equal(isFlushBoundary(Date.UTC(2026, 9, 19, 17, 1)), false, 'only top of hour');
   assert.equal(latestFlushBoundary(Date.UTC(2026, 9, 19, 18, 59)), Date.UTC(2026, 9, 19, 17));
   assert.equal(nextFlushBoundary(Date.UTC(2026, 9, 19, 17)), Date.UTC(2026, 9, 19, 19));
+  // Lateness window: minutes 0-29 after the boundary only.
+  assert.equal(flushWindowBoundary(Date.UTC(2026, 9, 19, 17)), Date.UTC(2026, 9, 19, 17));
+  assert.equal(flushWindowBoundary(Date.UTC(2026, 9, 19, 17, 29, 59, 999)), Date.UTC(2026, 9, 19, 17));
+  assert.equal(flushWindowBoundary(Date.UTC(2026, 9, 19, 17, 30)), null);
+  assert.equal(flushWindowBoundary(Date.UTC(2026, 9, 19, 18, 5)), null, '13:05 CDT is odd');
+  assert.equal(flushWindowBoundary(Date.UTC(2026, 10, 1, 6, 5)), null, '01:05 CDT on fall-back day');
+  assert.equal(flushWindowBoundary(Date.UTC(2026, 10, 1, 7, 5)), null, '01:05 CST on fall-back day');
+  assert.equal(flushWindowBoundary(Date.UTC(2026, 10, 1, 8, 5)), Date.UTC(2026, 10, 1, 8), '02:05 CST');
+  assert.equal(flushWindowBoundary(Date.UTC(2026, 2, 8, 7, 5)), null, '01:05 CST on spring-forward day');
+  assert.equal(flushWindowBoundary(Date.UTC(2026, 2, 8, 8, 5)), Date.UTC(2026, 2, 8, 8), '03:05 CDT replaces 02:00');
 });
 
 test('scheduled flush: one webhook per even Chicago hour, odd hours and empty windows send nothing', async () => {
@@ -162,7 +173,7 @@ test('scheduled flush: one webhook per even Chicago hour, odd hours and empty wi
   const a = f.sync('jarvis', { subject: 'A' }), b = f.sync('jarvis', { subject: 'B' });
   await f.send(a, who('jarvis', start + 600000)); await f.send(b);
   f.set(Date.UTC(2026, 9, 19, 16, 0, 5)); // 11:00 CDT, odd
-  assert.deepEqual(await f.bridge.flushSync(), { boundary: Date.UTC(2026, 9, 19, 15), results: [], dispatch: [] });
+  assert.deepEqual(await f.bridge.flushSync(), { boundary: Date.UTC(2026, 9, 19, 15), results: [], dispatch: [], skipped: 'outside_flush_window' });
   f.set(Date.UTC(2026, 9, 19, 17, 0, 5)); // 12:00 CDT
   const flushed = await f.bridge.flushSync();
   assert.deepEqual(flushed.results, [{ recipient: 'friday', outcome: 'flushed', items: 2 }]);
@@ -174,6 +185,9 @@ test('scheduled flush: one webhook per even Chicago hour, odd hours and empty wi
   assert.deepEqual((await f.bridge.flushSync()).dispatch, [batchId]);
   await f.bridge.markSyncDispatched([batchId]);
   assert.deepEqual((await f.bridge.flushSync()).dispatch, []);
+  // A late run after the 12:00 window closes is a no-op, not a catch-up.
+  f.set(Date.UTC(2026, 9, 19, 17, 30));
+  assert.deepEqual((await f.bridge.flushSync()).results, []);
   f.set(Date.UTC(2026, 9, 19, 19, 0, 5)); // 14:00 CDT, nothing pending
   const empty = await f.bridge.flushSync();
   assert.deepEqual(empty.results, [{ recipient: 'friday', outcome: 'empty' }]);
@@ -302,7 +316,8 @@ test('flag off = v1: classified messages are delivered immediately, ACKs are cre
     const s = f.snapshot();
     assert.equal(s.syncQueues, undefined); assert.equal(Object.keys(s.jobs).length, 3);
     for (const m of Object.values(s.messages)) assert.deepEqual(Object.keys(m).sort(), ['authorization', 'envelope', 'hash', 'jobIds', 'retainUntil', 'storedAt']);
-    assert.deepEqual(await f.bridge.flushSync(), { boundary: latestFlushBoundary(start), results: [], dispatch: [] });
+    f.set(Date.UTC(2026, 9, 19, 17, 1));
+    assert.deepEqual(await f.bridge.flushSync(), { boundary: Date.UTC(2026, 9, 19, 17), results: [], dispatch: [] });
   }
 });
 
@@ -326,17 +341,24 @@ test('rollback: flipping the flag off sends new SYNC as WAKE and still flushes a
   assert.deepEqual((await f.bridge.flushSync()).results, [{ recipient: 'friday', outcome: 'flushed', items: 1 }]);
 });
 
-test('repository wiring: hourly UTC cron route is outside the MCP catch-all', () => {
+test('repository wiring: no Vercel cron; the GitHub Actions hourly trigger POSTs the route outside the MCP catch-all', () => {
   const config = JSON.parse(readFileSync(new URL('../vercel.json', import.meta.url)));
-  assert.deepEqual(config.crons, [{ path: '/api/cron', schedule: '0 * * * *' }]);
+  assert.equal(config.crons, undefined, 'Hobby plans reject hourly Vercel crons');
+  const workflow = readFileSync(new URL('../.github/workflows/bridge-cron-flush.yml', import.meta.url), 'utf8');
+  for (const line of ["- cron: '0 * * * *'", 'workflow_dispatch:', 'permissions: {}', 'timeout-minutes: 5',
+    'group: bridge-cron-flush', 'secrets.CRON_SECRET', 'vars.BRIDGE_CRON_URL', '--fail-with-body', '--request POST']) {
+    assert.ok(workflow.includes(line), line);
+  }
+  assert.equal(/^\s*-?\s*uses:/m.test(workflow), false, 'no third-party actions');
+  for (const name of ['BRIDGE_PUBLIC_ORIGIN', 'BRIDGE_PEERS']) assert.equal(workflow.includes(name), false, name);
   const catchAll = new RegExp('^' + config.rewrites[0].source + '$');
   assert.equal(catchAll.test('/api/cron'), false); assert.equal(catchAll.test('/api/queue'), false);
   assert.equal(catchAll.test('/bridge/friday/mcp'), true);
   assert.ok(config.functions['api/cron.mjs']);
 });
 
-async function runtimeFixture(changes = {}) {
-  let document = emptyState(), now = start, consumer;
+async function runtimeFixture(changes = {}, at = start) {
+  let document = emptyState(), now = at, consumer;
   const sends = [], posts = [];
   const { publicKey, privateKey } = await generateKeyPair('RS256');
   class Pool { on() {} async connect() { return { release() {}, async query(sql, params) {
@@ -356,13 +378,13 @@ async function runtimeFixture(changes = {}) {
       return { status: 200, body: JSON.stringify({ challenge: body.challenge }) }; } });
   const tokens = {};
   for (const role of ['jarvis', 'friday']) tokens[role] = await new SignJWT({ scope: Object.values(SCOPES[role]).join(' ') })
-    .setProtectedHeader({ alg: 'RS256' }).setIssuer(ISSUER).setSubject('fixture').setAudience(resourceFor(role)).setIssuedAt().setExpirationTime('2h').sign(privateKey);
+    .setProtectedHeader({ alg: 'RS256' }).setIssuer(ISSUER).setSubject('fixture').setAudience(resourceFor(role)).setIssuedAt().setExpirationTime('30d').sign(privateKey);
   const rpc = async (role, method, params) => {
     const response = await rt.handler(role)(new Request(resourceFor(role), { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + tokens[role] },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) })); return { status: response.status, body: await response.json() };
   };
   const call = async (role, name, args) => (await rpc(role, 'tools/call', { name, arguments: args })).body.result;
-  const cron = (headers = {}, method = 'GET') => rt.cronHandler()(new Request('https://deployment.example.test/api/cron', { method, headers }));
+  const cron = (headers = {}, method = 'POST') => rt.cronHandler()(new Request('https://deployment.example.test/api/cron', { method, headers }));
   await rpc('jarvis', 'events/subscribe', { name: EVENT_NAME, arguments: { recipient: 'jarvis' }, ttlMs: null,
     delivery: { mode: 'webhook', url: 'https://callback.example.test/events', secret: 'whsec_' + randomBytes(32).toString('base64') } });
   return { rt, env, rpc, call, cron, sends, posts, document: () => document, set: ms => { now = ms; },
@@ -389,22 +411,40 @@ test('runtime: tool schemas, readiness and inbox tool follow the per-recipient f
   assert.equal((await off.rpc('friday', 'tools/list', {})).body.result.tools.some(t => t.name === 'bridge_inbox_read'), false);
 });
 
-test('runtime cron: CRON_SECRET bearer required; even-hour flush publishes one standard-shaped webhook for the batch', async () => {
+const auth = { authorization: 'Bearer fixture-cron-secret-value' };
+const outside = { status: 'skipped', reason: 'outside_flush_window' };
+test('runtime cron auth: POST and GET need the exact CRON_SECRET bearer; other methods and an unset secret are refused', async () => {
+  const f = await runtimeFixture({}, Date.UTC(2026, 9, 19, 17, 5));
+  for (const method of ['POST', 'GET']) {
+    assert.equal((await f.cron({}, method)).status, 401, method);
+    assert.equal((await f.cron({ authorization: 'Bearer wrong-secret-value-xx' }, method)).status, 401, method);
+    assert.equal((await f.cron({ authorization: 'fixture-cron-secret-value' }, method)).status, 401, method);
+    assert.equal((await f.cron({ authorization: 'Bearer fixture-cron-secret-valuX' }, method)).status, 401, method);
+    assert.equal((await f.cron(auth, method)).status, 200, method);
+  }
+  assert.equal((await f.cron(auth, 'PUT')).status, 405);
+  for (const secret of [undefined, '', 'short-secret']) {
+    const unset = await runtimeFixture({ CRON_SECRET: secret }, Date.UTC(2026, 9, 19, 17, 5));
+    assert.equal((await unset.cron({ authorization: 'Bearer ' + secret })).status, 503, String(secret));
+  }
+  // Odd Chicago hour: an authenticated 200 no-op that touches no storage.
+  const odd = await runtimeFixture({ DATABASE_URL: undefined }, Date.UTC(2026, 9, 19, 18, 0, 5));
+  const response = await odd.cron(auth);
+  assert.equal(response.status, 200); assert.deepEqual(await response.json(), outside);
+});
+
+test('runtime cron: even-hour POST flushes one standard-shaped webhook; late-in-window flushes, after-window and duplicate runs do not', async () => {
   const f = await runtimeFixture();
-  assert.equal((await f.cron()).status, 401);
-  assert.equal((await f.cron({ authorization: 'Bearer wrong-secret-value-xx' })).status, 401);
-  assert.equal((await f.cron({ authorization: 'Bearer fixture-cron-secret-value' }, 'POST')).status, 405);
-  const unset = await runtimeFixture({ CRON_SECRET: undefined });
-  assert.equal((await unset.cron({ authorization: 'Bearer undefined' })).status, 503);
-  const auth = { authorization: 'Bearer fixture-cron-secret-value' };
   const a = f.message({ subject: 'A' }), b = f.message({ subject: 'B' });
   for (const m of [a, b]) assert.equal((await f.call('jarvis', 'bridge_message_send', m)).structuredContent.delivery, 'batched');
-  f.set(Date.UTC(2026, 9, 19, 16, 0, 5));
-  assert.equal((await (await f.cron(auth)).json()).flushed, 0);
-  f.set(Date.UTC(2026, 9, 19, 17, 0, 5));
+  f.set(Date.UTC(2026, 9, 19, 16, 0, 5)); // 11:00 CDT
+  assert.deepEqual(await (await f.cron(auth)).json(), outside);
+  f.set(Date.UTC(2026, 9, 19, 17, 25)); // 12:25 CDT: late but inside the window
   const sendsBefore = f.sends.length;
   const out = await (await f.cron(auth)).json();
   assert.deepEqual(out, { status: 'ok', boundary: '2026-10-19T17:00:00.000Z', flushed: 1, capped: 0, dispatched: 1, dispatchPending: 0 });
+  f.set(Date.UTC(2026, 9, 19, 17, 29)); // duplicate run, same even hour
+  assert.deepEqual(await (await f.cron(auth)).json(), { status: 'ok', boundary: '2026-10-19T17:00:00.000Z', flushed: 0, capped: 0, dispatched: 0, dispatchPending: 0 });
   const dispatch = f.sends.slice(sendsBefore).map(args => args[1]).find(p => p.dispatchMessageId);
   const batchId = dispatch.dispatchMessageId;
   await f.consume(dispatch);
@@ -412,8 +452,47 @@ test('runtime cron: CRON_SECRET bearer required; even-hour flush publishes one s
   assert.deepEqual(webhooks, [{ event: EVENT_NAME, data: { messageId: batchId } }], 'one webhook, v1 payload shape');
   const read = (await f.call('friday', 'bridge_read', { messageId: batchId })).structuredContent;
   assert.deepEqual(read.syncBatches[0].items.map(i => i.subject), ['A', 'B']);
-  assert.equal((await (await f.cron(auth)).json()).flushed, 0, 'same boundary never flushes twice');
+  assert.equal((await (await f.cron(auth, 'GET')).json()).flushed, 0, 'same boundary never flushes twice');
+  // An item queued during the window waits for the next boundary; a run after the window is a no-op.
+  await f.call('jarvis', 'bridge_message_send', f.message({ subject: 'C' }));
+  f.set(Date.UTC(2026, 9, 19, 17, 30));
+  assert.deepEqual(await (await f.cron(auth)).json(), outside);
+  assert.equal(f.posts.filter(p => p.event === EVENT_NAME).length, 1);
+  f.set(Date.UTC(2026, 9, 19, 19, 10)); // 14:10 CDT
+  assert.equal((await (await f.cron(auth)).json()).flushed, 1);
   assert.deepEqual((await f.call('friday', 'bridge_inbox_read', {})).structuredContent, { syncBatches: [] });
-  const disabled = await runtimeFixture({ BRIDGE_DELIVERY_ENABLED: 'false' });
+  const disabled = await runtimeFixture({ BRIDGE_DELIVERY_ENABLED: 'false' }, Date.UTC(2026, 9, 19, 17, 5));
   assert.deepEqual(await (await disabled.cron(auth)).json(), { status: 'skipped', reason: 'delivery_not_enabled' });
 });
+
+// [UTC time, expected response]: number = batches flushed, 'skip' = outside the window.
+for (const [name, enqueueAt, runs] of [
+  ['fall back, Nov 1 2026', Date.UTC(2026, 10, 1, 5, 40), [ // 00:40 CDT
+    [Date.UTC(2026, 10, 1, 6, 0, 5), 'skip'], // 01:00 CDT
+    [Date.UTC(2026, 10, 1, 7, 0, 5), 'skip'], // 01:00 CST (repeated hour)
+    [Date.UTC(2026, 10, 1, 7, 20), 'skip'],
+    [Date.UTC(2026, 10, 1, 8, 12), 1], // 02:12 CST, late in window
+    [Date.UTC(2026, 10, 1, 8, 20), 0], // duplicate in the same even hour
+    [Date.UTC(2026, 10, 1, 9, 0, 5), 'skip'], // 03:00 CST
+  ]],
+  ['spring forward, Mar 8 2026', Date.UTC(2026, 2, 8, 6, 40), [ // 00:40 CST
+    [Date.UTC(2026, 2, 8, 7, 0, 5), 'skip'], // 01:00 CST
+    [Date.UTC(2026, 2, 8, 8, 5), 1], // 03:05 CDT, replaces the nonexistent 02:00
+    [Date.UTC(2026, 2, 8, 8, 29), 0],
+    [Date.UTC(2026, 2, 8, 8, 31), 'skip'],
+    [Date.UTC(2026, 2, 8, 9, 0, 5), 0], // 04:00 CDT, empty window
+  ]],
+]) {
+  test(`runtime cron across DST (${name}) flushes once, only in the even-hour window`, async () => {
+    const f = await runtimeFixture({}, enqueueAt);
+    assert.equal((await f.call('jarvis', 'bridge_message_send', f.message())).structuredContent.delivery, 'batched');
+    for (const [at, expected] of runs) {
+      f.set(at);
+      const body = await (await f.cron(auth)).json();
+      if (expected === 'skip') assert.deepEqual(body, outside, iso(at));
+      else assert.equal(body.flushed, expected, iso(at));
+    }
+    assert.equal(f.posts.filter(p => p.event === EVENT_NAME).length, 0, 'webhook POSTs happen on queue dispatch, not inline');
+    assert.equal(f.sends.filter(args => args[1].dispatchMessageId).length >= 1, true);
+  });
+}
