@@ -260,18 +260,23 @@ export function presentBatch(state, batchId, now) {
       receivedAt: new Date(storedAt).toISOString(), expired: Date.parse(e.expiresAt) <= now,
       late: !!b.lateItemIds?.includes(e.id) })) };
 }
-// Acknowledge a presented batch: its receipt plus every item's receipt. Never
-// called for a batch whose items were not presented in a read result.
+// Acknowledge a presented batch held by evidence.claimId: its receipt plus
+// every item's receipt. The batch receipt must already be complete (direct
+// completion, same transaction) or be a hold of that same claim; a receipt
+// owned by any other claim, for the batch or an item, is never overwritten.
 export function ackBatch(state, batchId, principal, now, evidence) {
-  const batch = state.messages[batchId], b = batch?.syncBatch;
+  const batch = state.messages[batchId], b = batch?.syncBatch, held = state.receipts[batchId];
   if (!b?.presentedAt || b.ackedAt) return false;
+  if (held?.state !== 'complete' && !(held?.state === 'claimed' && held.claimId === evidence.claimId)) return false;
   b.ackedAt = now;
   const receipt = { state: 'complete', owner: principal.principalKey, completedAt: now, ackMessageId: null,
     hostedEventId: evidence.hostedEventId, hostedTurnId: evidence.hostedTurnId,
     evidenceStatus: 'reported_requires_independent_host_confirmation', ackSuppressed: true };
-  if (state.receipts[batchId]?.state !== 'complete') state.receipts[batchId] = { ...receipt, ...(evidence.via ? { viaMessage: evidence.via } : {}) };
+  if (held.state !== 'complete') state.receipts[batchId] = { ...receipt, claimId: evidence.claimId, viaMessage: evidence.via };
   for (const id of b.itemIds) {
-    if (state.messages[id] && state.receipts[id]?.state !== 'complete') state.receipts[id] = { ...receipt, viaBatch: batchId };
+    const own = state.receipts[id];
+    if (!state.messages[id] || own?.state === 'complete' || (own?.leaseUntil > now && own.claimId !== evidence.claimId)) continue;
+    state.receipts[id] = { ...receipt, viaBatch: batchId };
   }
   return true;
 }

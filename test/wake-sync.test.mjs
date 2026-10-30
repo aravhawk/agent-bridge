@@ -48,9 +48,18 @@ async function fixture({ recipients = ['friday'], at = start, wakeSync = true } 
     return bridge.complete(as, { messageId: id, claimId: claim.claimId, hostedEventId: null, hostedTurnId: null,
       ...(syncBatchIds ? { syncBatchIds } : {}) });
   };
-  // A flagged receiver: read (full items), then claim/complete the batch receipt.
-  const ack = async (id, as = principal('friday')) => { await bridge.read(as, { messageId: id }); return handle(as, id); };
-  return { store, bridge, clock, enabled, message, sync, send, handle, ack, principal, snapshot: () => store.snapshot(),
+  // The documented flagged-receiver flow for any woken message or batch: read,
+  // claim, (handle), complete naming the batches from this read that this
+  // claim may handle: the batch itself on a direct completion, plus attached
+  // batches the claim holds.
+  const receive = async (id, as = principal('friday')) => {
+    const read = await bridge.read(as, { messageId: id });
+    const claim = await bridge.claim(as, { messageId: id });
+    const syncBatchIds = (read.syncBatches || []).map(b => b.messageId)
+      .filter(batch => batch === id || claim.syncBatchIds?.includes(batch));
+    return bridge.complete(as, { messageId: id, claimId: claim.claimId, hostedEventId: null, hostedTurnId: null, syncBatchIds });
+  };
+  return { store, bridge, clock, enabled, message, sync, send, handle, receive, principal, snapshot: () => store.snapshot(),
     set: ms => { now = ms; }, advance: ms => { now += ms; } };
 }
 const jobsFor = (s, id) => Object.values(s.jobs).filter(job => job.messageId === id);
@@ -124,7 +133,7 @@ test('coalescing: pending SYNC dedupes by subject (latest wins); after acknowled
   assert.deepEqual(first.syncBatches[0].items.map(i => i.text), ['v2', 'other', 'no subject']);
   assert.equal((await f.bridge.status(jarvis, { messageId: v1.id })).sync.state, 'superseded');
   assert.equal((await f.bridge.status(jarvis, { messageId: v1.id })).sync.supersededBy, v2.id);
-  await f.handle(friday, first.syncBatches[0].messageId);
+  await f.handle(friday, first.syncBatches[0].messageId, [first.syncBatches[0].messageId]);
   assert.deepEqual((await f.bridge.inboxRead(friday)).syncBatches, []);
   const v3 = f.sync('jarvis', { subject: 'Deploy status', text: 'v3' }); await f.send(v3);
   assert.deepEqual(ids((await f.bridge.inboxRead(friday)).syncBatches), [[v3.id]]);
@@ -141,12 +150,12 @@ test('inbox read survives a lost response: unacknowledged batches replay until t
   const b = f.sync(); await f.send(b);
   const both = await f.bridge.inboxRead(friday);
   assert.deepEqual(ids(both.syncBatches), [[a.id], [b.id]]);
-  const done = await f.handle(friday, lost.syncBatches[0].messageId);
+  const done = await f.handle(friday, lost.syncBatches[0].messageId, [lost.syncBatches[0].messageId]);
   assert.equal(done.ackMessageId, null);
   assert.equal(f.snapshot().receipts[a.id].state, 'complete');
   assert.equal(f.snapshot().receipts[b.id], undefined, 'only the acknowledged batch is handled');
   assert.deepEqual(ids((await f.bridge.inboxRead(friday)).syncBatches), [[b.id]]);
-  await f.handle(friday, both.syncBatches[1].messageId);
+  await f.handle(friday, both.syncBatches[1].messageId, [both.syncBatches[1].messageId]);
   assert.deepEqual((await f.bridge.inboxRead(friday)).syncBatches, []);
 });
 
@@ -158,7 +167,7 @@ test('concurrent inbox readers neither double-cut nor lose items', async () => {
   for (const r of reads) assert.deepEqual(r, reads[0]);
   assert.equal(batchesIn(f.snapshot()).length, 1);
   assert.deepEqual(ids(reads[0].syncBatches).flat().sort(), sent.sort());
-  await Promise.all([f.handle(friday, reads[0].syncBatches[0].messageId).catch(() => null),
+  await Promise.all([f.handle(friday, reads[0].syncBatches[0].messageId, [reads[0].syncBatches[0].messageId]).catch(() => null),
     f.bridge.inboxRead(friday), f.send(f.sync('jarvis', { subject: 'late' }))]);
   const after = await f.bridge.inboxRead(friday);
   assert.equal(after.syncBatches.length, 1); assert.equal(after.syncBatches[0].items[0].subject, 'late');
@@ -276,7 +285,7 @@ for (const [name, y, m, d, flushes] of [['spring forward', 2026, 2, 8, 12], ['no
         const out = await f.bridge.flushSync();
         count += out.results.filter(r => r.outcome === 'flushed').length;
         await f.bridge.markSyncDispatched(out.dispatch);
-        for (const id of out.dispatch) await f.ack(id); // the woken receiver reads and acknowledges
+        for (const id of out.dispatch) await f.receive(id); // the woken receiver reads, claims and completes
       }
     }
     const items = Object.values(f.snapshot().messages).filter(x => x.sync && x.sync.state === 'delivered');
@@ -396,10 +405,143 @@ test('race: a batch shown to reader B during reader A\'s claim is not acknowledg
   // X stays deliverable and is acknowledged by its own claim.
   const replay = await f.bridge.inboxRead(friday);
   assert.deepEqual(replay.syncBatches.map(b => b.messageId), [batchX]);
-  const doneX = await f.handle(friday, batchX);
+  const doneX = await f.handle(friday, batchX, [batchX]);
+  assert.deepEqual(doneX.syncBatchesAcked, [batchX]);
   assert.equal(doneX.completed, true);
   assert.equal(f.snapshot().receipts[x.id].state, 'complete');
   assert.deepEqual((await f.bridge.inboxRead(friday)).syncBatches, []);
+});
+
+test('direct batch: read B, claim B, complete B with syncBatchIds [B] acknowledges B exactly once', async () => {
+  const f = await fixture();
+  const a = f.sync(); await f.send(a);
+  f.set(noon + 5000);
+  const batchId = (await f.bridge.flushSync()).dispatch[0];
+  await f.bridge.markSyncDispatched([batchId]);
+  const read = await f.bridge.read(friday, { messageId: batchId });
+  assert.deepEqual(read.syncBatches.map(b => b.messageId), [batchId], 'a direct read returns the batch itself');
+  const claim = await f.bridge.claim(friday, { messageId: batchId });
+  assert.equal(claim.syncBatchIds, undefined, 'nothing attached to hold');
+  const complete = () => f.bridge.complete(friday, { messageId: batchId, claimId: claim.claimId, hostedEventId: null,
+    hostedTurnId: null, syncBatchIds: read.syncBatches.map(b => b.messageId) });
+  const done = await complete();
+  assert.deepEqual(done.syncBatchesAcked, [batchId]);
+  const ackedAt = f.snapshot().messages[batchId].syncBatch.ackedAt, receipt = f.snapshot().receipts[a.id];
+  assert.equal(receipt.state, 'complete'); assert.equal(receipt.viaBatch, batchId);
+  const again = await complete();
+  assert.equal(again.duplicate, true); assert.equal(again.syncBatchesAcked, undefined);
+  assert.equal(f.snapshot().messages[batchId].syncBatch.ackedAt, ackedAt);
+  assert.deepEqual(f.snapshot().receipts[a.id], receipt, 'acknowledged once');
+  assert.deepEqual((await f.bridge.inboxRead(friday)).syncBatches, []);
+  // The documented helper flow gives the same result for a fresh batch.
+  await f.send(f.sync());
+  f.set(noon + 2 * HOUR + 5000);
+  const next = (await f.bridge.flushSync()).dispatch[0];
+  assert.notEqual(next, batchId);
+  assert.deepEqual((await f.receive(next)).syncBatchesAcked, [next]);
+});
+
+// A WAKE W with batch B attached and presented: one reader holds W, another
+// gets B from bridge_inbox_read. B has one claim record shared by both paths.
+async function heldBatchFixture() {
+  const f = await fixture();
+  const a = f.sync('jarvis', { subject: 'A' }), x = f.sync('jarvis', { subject: 'X' });
+  await f.send(a); await f.send(x);
+  const wake = f.message(); await f.send(wake);
+  const read = await f.bridge.read(friday, { messageId: wake.id });
+  const batch = read.syncBatches[0].messageId;
+  assert.deepEqual((await f.bridge.inboxRead(friday)).syncBatches.map(b => b.messageId), [batch]);
+  const complete = (id, claimId, syncBatchIds) => f.bridge.complete(friday, { messageId: id, claimId, hostedEventId: null,
+    hostedTurnId: null, ...(syncBatchIds ? { syncBatchIds } : {}) });
+  return { f, a, x, wake, batch, complete };
+}
+
+test('shared batch fence (a): handling B via its WAKE and handling B directly are mutually exclusive', async () => {
+  // W first: W's claim holds B, so the direct claim of B is refused.
+  {
+    const { f, wake, batch, complete } = await heldBatchFixture();
+    const claimW = await f.bridge.claim(friday, { messageId: wake.id });
+    assert.deepEqual([claimW.syncBatchIds, claimW.syncBatchesHeldElsewhere], [[batch], []]);
+    await assert.rejects(f.bridge.claim(friday, { messageId: batch }), /receipt_busy/);
+    assert.deepEqual((await complete(wake.id, claimW.claimId, [batch])).syncBatchesAcked, [batch]);
+    assert.equal((await f.bridge.claim(friday, { messageId: batch })).duplicate, true, 'already handled via W');
+  }
+  // B first: the direct claim holds B, so W's claim excludes it and W cannot acknowledge it.
+  {
+    const { f, wake, batch, complete } = await heldBatchFixture();
+    const claimB = await f.bridge.claim(friday, { messageId: batch });
+    const claimW = await f.bridge.claim(friday, { messageId: wake.id });
+    assert.deepEqual([claimW.syncBatchIds, claimW.syncBatchesHeldElsewhere], [[], [batch]]);
+    await assert.rejects(complete(wake.id, claimW.claimId, [batch]), /sync_batch_not_held/);
+    assert.equal(f.snapshot().receipts[wake.id].state, 'claimed', 'the rejected completion changed nothing');
+    assert.deepEqual((await complete(batch, claimB.claimId, [batch])).syncBatchesAcked, [batch]);
+  }
+  // Simultaneous: exactly one path gets handling permission for B.
+  for (let round = 0; round < 4; round++) {
+    const { f, wake, batch } = await heldBatchFixture();
+    const order = [() => f.bridge.claim(friday, { messageId: wake.id }), () => f.bridge.claim(friday, { messageId: batch })];
+    if (round % 2) order.reverse();
+    const settled = await Promise.allSettled(order.map(run => run()));
+    const [viaW, direct] = round % 2 ? [settled[1], settled[0]] : settled;
+    assert.equal(viaW.status, 'fulfilled', 'W itself is always claimable');
+    const viaWHolds = viaW.value.syncBatchIds.includes(batch), directHolds = direct.status === 'fulfilled';
+    assert.equal(viaWHolds !== directHolds, true, `exactly one holder (round ${round})`);
+    if (!directHolds) assert.match(direct.reason.code, /receipt_busy/);
+    else assert.deepEqual(viaW.value.syncBatchesHeldElsewhere, [batch]);
+  }
+});
+
+test('shared batch fence (b): two simultaneous direct claims of a batch cannot both succeed', async () => {
+  const { f, batch } = await heldBatchFixture();
+  const settled = await Promise.allSettled(Array.from({ length: 5 }, () => f.bridge.claim(friday, { messageId: batch })));
+  assert.equal(settled.filter(r => r.status === 'fulfilled').length, 1);
+  for (const r of settled.filter(r => r.status === 'rejected')) assert.equal(r.reason.code, 'receipt_busy');
+});
+
+test('shared batch fence (c): a completion never overwrites a receipt owned by another claim', async () => {
+  // W's completion against B held directly: B's receipt stays the direct claim's.
+  {
+    const { f, wake, batch, complete } = await heldBatchFixture();
+    const claimB = await f.bridge.claim(friday, { messageId: batch });
+    const heldB = f.snapshot().receipts[batch];
+    const claimW = await f.bridge.claim(friday, { messageId: wake.id });
+    await assert.rejects(complete(wake.id, claimW.claimId, [batch]), /sync_batch_not_held/);
+    await complete(wake.id, claimW.claimId);
+    assert.deepEqual(f.snapshot().receipts[batch], heldB);
+    await complete(batch, claimB.claimId, [batch]);
+    const doneB = f.snapshot().receipts[batch];
+    assert.equal(doneB.claimId, claimB.claimId); assert.equal(doneB.viaMessage, undefined);
+    // ...and vice versa: B's completion left W's own receipt as W's claim completed it.
+    assert.equal(f.snapshot().receipts[wake.id].claimId, claimW.claimId);
+    assert.equal(f.snapshot().receipts[wake.id].state, 'complete');
+  }
+  // An item claimed on its own keeps that claim when its batch is acknowledged via W.
+  {
+    const { f, a, x, wake, batch, complete } = await heldBatchFixture();
+    const claimX = await f.bridge.claim(friday, { messageId: x.id });
+    const claimW = await f.bridge.claim(friday, { messageId: wake.id });
+    await complete(wake.id, claimW.claimId, [batch]);
+    assert.equal(f.snapshot().receipts[a.id].state, 'complete');
+    assert.deepEqual(f.snapshot().receipts[x.id], { state: 'claimed', owner: friday.principalKey, claimId: claimX.claimId,
+      leaseUntil: Date.parse(claimX.leaseUntil) });
+  }
+  // A completion that does not name a held batch releases it for a direct claim at once.
+  {
+    const { f, wake, batch, complete } = await heldBatchFixture();
+    const claimW = await f.bridge.claim(friday, { messageId: wake.id });
+    await complete(wake.id, claimW.claimId);
+    assert.equal(f.snapshot().receipts[batch], undefined);
+    assert.ok((await f.bridge.claim(friday, { messageId: batch })).claimId);
+  }
+  // An expired W claim stops holding B; W then cannot complete or acknowledge anything.
+  {
+    const { f, wake, batch, complete } = await heldBatchFixture();
+    const claimW = await f.bridge.claim(friday, { messageId: wake.id });
+    f.advance(60000);
+    const claimB = await f.bridge.claim(friday, { messageId: batch });
+    await assert.rejects(complete(wake.id, claimW.claimId, [batch]), /stale_receipt_claim/);
+    assert.equal(f.snapshot().receipts[batch].claimId, claimB.claimId);
+  }
 });
 
 test('bridge_read drains pending SYNC into a batch attached to an open message only', async () => {
@@ -486,8 +628,10 @@ test('rollback: leftovers are re-sent under their own message IDs where v1 autho
   const batch = batchesIn(s)[0];
   assert.deepEqual(batch.syncBatch.itemIds, [expiredAuthority.id]);
   assert.match(batch.envelope.text, new RegExp(expiredAuthority.id), 'unchanged receivers see the native ID in the text');
-  // An unchanged receiver reads, claims and completes it as an ordinary status message.
-  await f.ack(batch.envelope.id);
+  // An unchanged receiver reads, claims and completes it as an ordinary status
+  // message, without syncBatchIds; a direct completion still acknowledges itself.
+  await f.bridge.read(friday, { messageId: batch.envelope.id });
+  assert.deepEqual((await f.handle(friday, batch.envelope.id)).syncBatchesAcked, [batch.envelope.id]);
   assert.equal(f.snapshot().receipts[expiredAuthority.id].state, 'complete');
   // And handles the natively re-sent item exactly like any v1 message (ACK included).
   assert.ok((await f.handle(friday, native.id)).ackMessageId);
@@ -610,8 +754,8 @@ test('runtime cron: odd hour is a no-op; even-hour (late) POST flushes one v1-sh
     'unacknowledged batch replays');
   const claim = (await f.call('friday', 'bridge_receipt_claim', { messageId: batchId })).structuredContent;
   const done = (await f.call('friday', 'bridge_receipt_complete', { messageId: batchId, claimId: claim.claimId,
-    hostedEventId: null, hostedTurnId: null })).structuredContent;
-  assert.equal(done.ackMessageId, null);
+    hostedEventId: null, hostedTurnId: null, syncBatchIds: read.syncBatches.map(x => x.messageId) })).structuredContent;
+  assert.equal(done.ackMessageId, null); assert.deepEqual(done.syncBatchesAcked, [batchId]);
   assert.equal((await f.call('jarvis', 'bridge_status', { messageId: a.id })).structuredContent.receiptCompleted, true);
   assert.deepEqual((await f.call('friday', 'bridge_inbox_read', {})).structuredContent, { syncBatches: [] });
 });

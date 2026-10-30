@@ -73,6 +73,27 @@ function insert(state, envelope, hash, now, authorization, jobOptions, routing) 
     ...(batch ? { piggybackedSyncItems: batch.syncBatch.itemIds.length } : {}) };
 }
 
+// Shared batch fence. A batch's own receipt is its only claim record, whether
+// it is handled directly (claiming the batch) or with the message it was
+// presented with (claiming that message). Claiming a message therefore also
+// claims, with the same claimId and lease, each attached batch that was
+// presented, is unacknowledged and is not held by another live claim; a batch
+// held elsewhere is reported and excluded, and a direct claim of a batch held
+// this way fails with receipt_busy. Messages without attached batches return
+// nothing new.
+function claimAttachedBatches(state, message, principal, claimId, leaseUntil, now) {
+  if (!message.syncBatchIds?.length) return {};
+  const held = [], heldElsewhere = [];
+  for (const id of message.syncBatchIds) {
+    const b = state.messages[id]?.syncBatch, receipt = state.receipts[id];
+    if (!b?.presentedAt || b.ackedAt || b.reclaimedAt || receipt?.state === 'complete') continue;
+    if (receipt?.leaseUntil > now) { heldElsewhere.push(id); continue; }
+    state.receipts[id] = { state: 'claimed', owner: principal.principalKey, claimId, leaseUntil, viaMessage: message.envelope.id };
+    held.push(id);
+  }
+  return { syncBatchIds: held, syncBatchesHeldElsewhere: heldElsewhere };
+}
+
 // Additive status for wake/sync messages only; v1 messages report nothing new.
 function syncStatus(message) {
   const s = message.sync, b = message.syncBatch;
@@ -257,10 +278,11 @@ export class Bridge {
       requireAckPath(state, message.envelope, message.authorization, this.messagePolicyIds, now, this.canary?.subscriptionId,
         this.ackSuppressed(message));
       if (old?.leaseUntil > now) fail('receipt_busy', 409);
-      const claimId = randomUUID();
+      const claimId = randomUUID(), leaseUntil = now + 60000;
       state.receipts[params.messageId] = { state: 'claimed', owner: principal.principalKey,
-        claimId, leaseUntil: now + 60000 };
-      return { claimId, leaseUntil: new Date(now + 60000).toISOString(), completed: false };
+        claimId, leaseUntil };
+      const batches = claimAttachedBatches(state, message, principal, claimId, leaseUntil, now);
+      return { claimId, leaseUntil: new Date(leaseUntil).toISOString(), completed: false, ...batches };
     });
   }
   async complete(principal, params) {
@@ -300,11 +322,15 @@ export class Bridge {
       if (receipt.claimId !== params.claimId || receipt.leaseUntil <= now) fail('stale_receipt_claim', 409);
       // A batch is handled only after its full items were returned by a read.
       if (message.syncBatch && !message.syncBatch.presentedAt) fail('sync_batch_not_presented', 409);
-      // Acknowledgement is bound to the completing receiver's own view, not to
-      // whatever another reader was shown: every named batch must have been
-      // presented with this message, and unnamed batches stay outstanding.
-      if (ackIds.some(id => !(message.syncBatchIds || []).includes(id) || !state.messages[id]?.syncBatch?.presentedAt)) {
-        fail('sync_batch_not_presented', 409);
+      // Acknowledgement is bound to the completing receiver's own view and its
+      // own claim: a batch's own ID on a direct completion, or an attached batch
+      // that was presented with this message and is held by this very claim.
+      // Unnamed batches stay outstanding; another claim's batch is never taken.
+      const ownBatch = message.syncBatch ? params.messageId : null;
+      for (const id of ackIds) {
+        if (id === ownBatch) continue;
+        if (!(message.syncBatchIds || []).includes(id) || !state.messages[id]?.syncBatch?.presentedAt) fail('sync_batch_not_presented', 409);
+        if (state.receipts[id]?.state !== 'claimed' || state.receipts[id].claimId !== params.claimId) fail('sync_batch_not_held', 409);
       }
       const ackSuppressed = original.kind !== 'ack' && this.ackSuppressed(message);
       requireAckPath(state, original, message.authorization, this.messagePolicyIds, now, this.canary?.subscriptionId, ackSuppressed);
@@ -328,10 +354,15 @@ export class Bridge {
         ackMessageId, hostedEventId: params.hostedEventId, hostedTurnId: params.hostedTurnId,
         evidenceStatus: 'reported_requires_independent_host_confirmation', ...(ackSuppressed ? { ackSuppressed: true } : {}) };
       // Completing a batch acknowledges it and every item it presented.
-      // Completing a message also acknowledges exactly the named batches.
-      const evidence = { hostedEventId: params.hostedEventId, hostedTurnId: params.hostedTurnId };
-      if (message.syncBatch) ackBatch(state, params.messageId, principal, now, evidence);
-      const syncBatchesAcked = ackIds.filter(id => ackBatch(state, id, principal, now, { ...evidence, via: params.messageId }));
+      // Completing a message also acknowledges exactly the named batches it
+      // holds, then releases its other holds so they can be claimed directly.
+      const evidence = { hostedEventId: params.hostedEventId, hostedTurnId: params.hostedTurnId, claimId: params.claimId };
+      const syncBatchesAcked = [];
+      if (ownBatch && ackBatch(state, ownBatch, principal, now, evidence)) syncBatchesAcked.push(ownBatch);
+      for (const id of ackIds) if (id !== ownBatch && ackBatch(state, id, principal, now, { ...evidence, via: params.messageId })) syncBatchesAcked.push(id);
+      for (const id of message.syncBatchIds || []) {
+        if (state.receipts[id]?.state === 'claimed' && state.receipts[id].claimId === params.claimId) delete state.receipts[id];
+      }
       return { completed: true, duplicate: false, ackMessageId, jobIds,
         evidenceStatus: 'reported_requires_independent_host_confirmation', ...(ackSuppressed ? { ackSuppressed: true } : {}),
         ...(syncBatchesAcked.length ? { syncBatchesAcked } : {}) };

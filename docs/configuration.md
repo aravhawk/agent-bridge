@@ -231,16 +231,24 @@ For an enabled recipient:
   acknowledged, and `bridge_inbox_read` returns every outstanding batch on
   every call, so a lost response or a crash loses nothing and concurrent reads
   return the same batches (reads serialize on the store lock and never cut
-  twice). A batch is acknowledged either by claiming and completing its own
-  `messageId`, or by completing the message it was presented with while naming
-  it in `syncBatchIds`. Acknowledgement is bound to the IDs the completing
-  receiver names from its own read, so a batch shown to a different reader of
-  the same message (for example during the first reader's claim) is never
-  acknowledged on its behalf; unnamed batches stay outstanding. Completion is
-  refused with `sync_batch_not_presented` for a named batch that was not
-  presented with that message, or for a batch whose full items were never
-  returned by a read (`bridge_read` of the batch or its WAKE, or
-  `bridge_inbox_read`). Only an acknowledged batch marks its items handled.
+  twice). Each batch has one claim record shared by both ways of handling it,
+  so only one claim at a time may hold it: claiming a message also holds its
+  presented, unacknowledged attached batches unless another live claim holds
+  them (the claim result lists `syncBatchIds` and `syncBatchesHeldElsewhere`),
+  and a direct claim of a batch held that way fails with `receipt_busy`, and
+  vice versa. A batch is acknowledged either directly, by claiming and
+  completing its own `messageId` (its own ID may be named in `syncBatchIds`
+  and is implied if omitted), or with the message it was attached to, by
+  naming it in that message's `syncBatchIds` while that message's claim holds
+  it. Acknowledgement is bound to the IDs the completing receiver names from
+  its own read and to its own claim, so a batch shown to a different reader,
+  or held by another claim, is never acknowledged on its behalf, and no
+  completion overwrites a receipt another claim holds. Completion is refused
+  with `sync_batch_not_presented` for a named batch that was not presented
+  with that message (or a batch whose full items were never returned by a
+  read), and with `sync_batch_not_held` for a named batch the claim does not
+  hold. Unnamed held batches are released at completion and stay outstanding.
+  Only an acknowledged batch marks its items handled.
   A batch still unacknowledged after 12 hours is retired and its unhandled
   items are queued again.
 - **Nothing is silently dropped.** Items whose own `expiresAt` passes while

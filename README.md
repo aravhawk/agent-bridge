@@ -214,11 +214,13 @@ by clearing it), that recipient gets:
   12 batch wakes per day (13 on the 25-hour fall-back day), none for an empty
   window. A batch is an ordinary `status` message, so its wake payload is
   unchanged; `bridge_read` adds a `syncBatches` field with each item.
-- **Nothing lost.** A batch is replayed by `bridge_inbox_read` until the
-  recipient acknowledges it after its items were presented: by claiming and
-  completing the batch, or by completing the WAKE it came with while naming the
-  batch in `syncBatchIds` (only batches from that receiver's own read are
-  acknowledged). Expired items are still delivered, flagged late. Receivers
+- **Nothing lost, nothing handled twice.** A batch is replayed by
+  `bridge_inbox_read` until the recipient acknowledges it after its items were
+  presented: directly, by claiming and completing the batch (naming its own ID
+  in `syncBatchIds`), or by completing the WAKE it came with while naming the
+  batch in `syncBatchIds`. Both paths share one claim per batch, so only one
+  claim at a time can handle it, and only batches from that receiver's own
+  read and held by its own claim are acknowledged. Expired items are still delivered, flagged late. Receivers
   read, claim, handle, then complete; see the
   [receiver contract](docs/inbox-policy.md#flagged-receiver-contract).
 

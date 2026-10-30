@@ -12,12 +12,12 @@ const tool = (name, description, inputSchema, readOnly = false) => ({ name, desc
 const completeSchema = object({ messageId: idSchema, claimId: idSchema, hostedEventId: { type: ['string', 'null'], maxLength: 160 },
   hostedTurnId: { type: ['string', 'null'], maxLength: 160 } });
 completeSchema.properties.syncBatchIds = { type: 'array', items: idSchema, maxItems: 32, uniqueItems: true,
-  description: 'messageIds from syncBatches in your read of this message that you handled. Omit to acknowledge none.' };
+  description: 'Batch messageIds you handled: this batch itself (direct completion; also implied) and attached batches your read returned and your claim holds. Omit to acknowledge no attached batch.' };
 const tools = [
   tool('bridge_health', 'Check authenticated bridge configuration without reading messages, storing state or sending events.', object({}), true),
   tool('bridge_read', 'Read the stored message identified by the native received event. Never use to poll.', object({ messageId: idSchema }), true),
-  tool('bridge_receipt_claim', 'Claim this received message for one hosted turn, with a short recovery lease.', object({ messageId: idSchema })),
-  tool('bridge_receipt_complete', 'Complete the claimed receipt and atomically enqueue one ACK for a source message. ACKs are terminal. Supplied host IDs require independent verification. Optional syncBatchIds acknowledges the SYNC batches your own read returned with this message (and that you handled); unnamed batches stay outstanding.',
+  tool('bridge_receipt_claim', 'Claim this received message for one hosted turn, with a short recovery lease. If SYNC batches were presented with it, the claim also holds those not held by another claim (syncBatchIds) and reports the others (syncBatchesHeldElsewhere); handle only held batches.', object({ messageId: idSchema })),
+  tool('bridge_receipt_complete', 'Complete the claimed receipt and atomically enqueue one ACK for a source message. ACKs are terminal. Supplied host IDs require independent verification. Optional syncBatchIds acknowledges SYNC batches you handled: the batch ID itself when completing a batch directly, and attached batches your read returned and your claim holds. Unnamed batches stay outstanding.',
     completeSchema),
   tool('bridge_status', 'Inspect one known message during an explicit diagnostic. HTTP receipt alone never verifies wake.', object({ messageId: idSchema }), true),
 ];
