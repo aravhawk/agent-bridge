@@ -9,10 +9,30 @@ on:
 permissions:
   contents: read
 jobs:
-  analyze:
-    name: Analyze (${{ matrix.language }})
+  # Code scanning on private repositories requires GitHub Advanced Security, so
+  # analysis is skipped (not failed) while private and runs once public. The
+  # visibility is looked up because schedule payloads carry no repository.
+  visibility:
+    name: Repository visibility
     runs-on: ubuntu-latest
     permissions:
+      contents: read
+    outputs:
+      public: ${{ steps.check.outputs.public }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          visibility=$(gh api "repos/$GITHUB_REPOSITORY" --jq .visibility)
+          echo "public=$([ "$visibility" = public ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    needs: visibility
+    if: ${{ needs.visibility.outputs.public == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
       contents: read
       security-events: write
     strategy:
