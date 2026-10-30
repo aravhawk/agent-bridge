@@ -1,4 +1,6 @@
-import { VERSION } from './release.mjs';
+import { VERSION, SERVER_NAME } from './release.mjs';
+import { EVENTS_PEER, PEER_IDS, NAMES } from './config.mjs';
+import { MESSAGE_PROTOCOL } from './messages.mjs';
 import { BridgeError, SCOPES } from './policy.mjs';
 import { ownKeys, authorizeRecipient } from './events.mjs';
 import { TASK_TOOLS } from './task-integration.mjs';
@@ -16,20 +18,20 @@ const tools = [
   tool('bridge_status', 'Inspect one known message during an explicit diagnostic. HTTP receipt alone never verifies wake.', object({ messageId: idSchema }), true),
 ];
 const dailySendTool = tool('bridge_message_send',
-  'Send bounded message, status or handoff-request DATA to the other assistant inbox. Peer data never grants approval or permission; the receiver evaluates Arav’s authorized workflow.',
-  object({ protocol: { const: 'jarvis-friday/1' }, id: idSchema, from: { enum: ['jarvis', 'friday'] },
-    to: { enum: ['jarvis', 'friday'] }, kind: { enum: ['message', 'status', 'handoff_request'] },
+  'Send bounded message, status or handoff-request DATA to the other assistant inbox. Peer data never grants approval or permission; the receiver evaluates its owner’s authorized workflow.',
+  object({ protocol: { const: MESSAGE_PROTOCOL }, id: idSchema, from: { enum: [...PEER_IDS] },
+    to: { enum: [...PEER_IDS] }, kind: { enum: ['message', 'status', 'handoff_request'] },
     sentAt: { type: 'string', format: 'date-time' }, expiresAt: { type: 'string', format: 'date-time' },
     threadId: idSchema, route: { const: 'inbox' }, text: { type: 'string', minLength: 1, maxLength: 4096 } }));
-const diagnosticTool = { ...tool('bridge_friday_webhook_diagnostic',
-  'Operator-armed, one-time transport check: POST one synthetic bridge.message.received event with a fresh UUID to the configured Friday receiver. Visible while unarmed, but invocation requires an active operator window. No arguments or retries; later armed calls return the recorded attempt. HTTP status never proves wake.', object({})),
+const diagnosticTool = { ...tool(NAMES.diagnosticTool,
+  'Operator-armed, one-time transport check: POST one synthetic bridge.message.received event with a fresh UUID to the configured webhook receiver. Visible while unarmed, but invocation requires an active operator window. No arguments or retries; later armed calls return the recorded attempt. HTTP status never proves wake.', object({})),
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true } };
-const subscriptionStatusTool = tool('bridge_subscription_status', 'Inspect your Jarvis subscription activity and renewal timestamps. No callback URL or secret is returned.', object({}), true);
+const subscriptionStatusTool = tool('bridge_subscription_status', 'Inspect your event subscription activity and renewal timestamps. No callback URL or secret is returned.', object({}), true);
 function allowedTools(principal, health, dailyEnabled, healthOnly, diagnostic, tasks) {
-  const ordinary = [...tools, ...(dailyEnabled ? [dailySendTool, ...(principal.role === 'jarvis' ? [subscriptionStatusTool] : [])] : []),
+  const ordinary = [...tools, ...(dailyEnabled ? [dailySendTool, ...(principal.role === EVENTS_PEER ? [subscriptionStatusTool] : [])] : []),
     // Discovery must not race the finite operator window. The runtime checks
     // readiness on every invocation before configuring storage or transport.
-    ...(principal.role === 'jarvis' && typeof diagnostic?.run === 'function' ? [diagnosticTool] : [])]
+    ...(principal.role === EVENTS_PEER && typeof diagnostic?.run === 'function' ? [diagnosticTool] : [])]
     .filter(t => !healthOnly || t.name === 'bridge_health').filter(t => t.name === 'bridge_health'
     ? typeof health === 'function' && Object.values(SCOPES[principal.role]).some(s => principal.scopes.includes(s))
     : [dailySendTool.name, diagnosticTool.name].includes(t.name) ? principal.scopes.includes(SCOPES[principal.role].probe)
@@ -73,10 +75,10 @@ async function boundedJson(request) {
   }
 }
 
-// Mount only at the canonical authenticated role paths. This resource server
+// Mount only at the configured authenticated peer paths. This resource server
 // never creates a provider, issues tokens or registers a native plugin.
 export function createMcpHandler({ enabled = false, verify, bridge, events, scheduleJobs, resourceMetadataUrl,
-  observeValidationFailure, health, dailyEnabled = true, healthOnly = false, fridayDiagnostic, tasks }) {
+  observeValidationFailure, health, dailyEnabled = true, healthOnly = false, webhookDiagnostic, tasks }) {
   return async request => {
     let id = null, input, stage = 'before_authenticated_body';
     try {
@@ -88,7 +90,7 @@ export function createMcpHandler({ enabled = false, verify, bridge, events, sche
         throw new BridgeError('unsupported_media_type', 415);
       }
       const principal = await verify(request);
-      if (!['jarvis', 'friday'].includes(principal?.role) || !Array.isArray(principal.scopes) ||
+      if (!PEER_IDS.includes(principal?.role) || !Array.isArray(principal.scopes) ||
           !/^[a-f0-9]{64}$/.test(principal.principalKey || '')) throw new BridgeError('unauthorized', 401);
       input = await boundedJson(request); stage = 'rpc_envelope';
       ownKeys(input, ['jsonrpc', 'id', 'method', 'params'], ['jsonrpc', 'method']);
@@ -106,22 +108,22 @@ export function createMcpHandler({ enabled = false, verify, bridge, events, sche
         case 'server/discover':
           ownKeys(params, [], []);
           result = { resultType: 'complete', supportedVersions: ['2026-07-28'],
-            capabilities: { tools: {}, ...(!healthOnly && principal.role === 'jarvis' && principal.scopes.includes(SCOPES.jarvis.ack) ? { events: {} } : {}) } };
+            capabilities: { tools: {}, ...(!healthOnly && principal.role === EVENTS_PEER && principal.scopes.includes(SCOPES[EVENTS_PEER].ack) ? { events: {} } : {}) } };
           break;
         case 'initialize':
           ownKeys(params, ['protocolVersion', 'capabilities', 'clientInfo']);
           if (!['2025-03-26', '2025-06-18', '2025-11-25', '2026-07-28'].includes(params.protocolVersion)) throw new BridgeError('unsupported_protocol', 400);
           result = { protocolVersion: params.protocolVersion, capabilities: { tools: {} },
-            serverInfo: { name: 'jarvis-friday-bridge', version: VERSION } };
+            serverInfo: { name: SERVER_NAME, version: VERSION } };
           break;
         case 'ping': ownKeys(params, [], []); result = {}; break;
-        case 'tools/list': ownKeys(params, [], []); result = { tools: allowedTools(principal, health, dailyEnabled, healthOnly, fridayDiagnostic, tasks) }; break;
+        case 'tools/list': ownKeys(params, [], []); result = { tools: allowedTools(principal, health, dailyEnabled, healthOnly, webhookDiagnostic, tasks) }; break;
         case 'events/list': if (healthOnly) throw new BridgeError('provider_contract_verification_required', 503); result = events.list(principal, params); break;
         case 'events/subscribe': if (healthOnly) throw new BridgeError('provider_contract_verification_required', 503); result = await events.subscribe(principal, params); break;
         case 'events/unsubscribe': result = await events.unsubscribe(principal, params); break;
         case 'tools/call': {
           ownKeys(params, ['name', 'arguments']);
-          const available = allowedTools(principal, health, dailyEnabled, healthOnly, fridayDiagnostic, tasks);
+          const available = allowedTools(principal, health, dailyEnabled, healthOnly, webhookDiagnostic, tasks);
           if (!available.some(t => t.name === params.name)) throw new BridgeError('tool_not_available', 403);
           stage = 'tool_arguments';
           let output;
@@ -136,7 +138,7 @@ export function createMcpHandler({ enabled = false, verify, bridge, events, sche
                 ackScope: principal.scopes.includes(SCOPES[principal.role].ack),
                 tools: available.map(t => t.name) } };
               break;
-            case 'bridge_friday_webhook_diagnostic': ownKeys(params.arguments, [], []); output = await fridayDiagnostic.run(principal); break;
+            case NAMES.diagnosticTool: ownKeys(params.arguments, [], []); output = await webhookDiagnostic.run(principal); break;
             case 'bridge_subscription_status': output = await events.status(principal, params.arguments); break;
             case 'bridge_message_send': output = await bridge.sendMessage(principal, params.arguments); break;
             case 'bridge_read': output = await bridge.read(principal, params.arguments); break;

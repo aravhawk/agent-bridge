@@ -1,5 +1,6 @@
 import { BridgeError, SCOPES } from './policy.mjs';
 import { RECEIVER_ID } from './release.mjs';
+import { EVENTS_PEER, WEBHOOK_PEER, NAMES } from './config.mjs';
 
 export const OBSERVATION_LIMIT = 8;
 export const OBSERVATION_TTL_MS = 24 * 3600000;
@@ -56,12 +57,12 @@ export async function observeRenewal({ store, principal, id, facts, response, er
     });
   } catch { /* Cannot replace a successful result or the original error. */ }
 }
-function fridayReader(principal) {
-  return principal?.role === 'friday' && hash(principal.principalKey) && principal.scopes?.includes(SCOPES.friday.ack);
+function webhookReader(principal) {
+  return principal?.role === WEBHOOK_PEER && hash(principal.principalKey) && principal.scopes?.includes(SCOPES[WEBHOOK_PEER].ack);
 }
 export function diagnosticReadCandidate(state, principal, messageId, now) {
-  const marker = state.fridayWebhookDiagnostic;
-  return fridayReader(principal) && uuid(messageId) && marker?.messageId === messageId &&
+  const marker = state[NAMES.diagnosticState];
+  return webhookReader(principal) && uuid(messageId) && marker?.messageId === messageId &&
     marker.receiverId === RECEIVER_ID && time(marker.attemptedAt) && time(marker.armedUntil) && time(now) &&
     marker.attemptedAt <= now && now < Math.min(marker.armedUntil, marker.attemptedAt + DIAGNOSTIC_READ_WINDOW_MS);
 }
@@ -78,31 +79,31 @@ export async function observeDiagnosticRead({ store, principal, messageId, error
   } catch { /* A failed observation never repeats or changes the read. */ }
 }
 export function diagnosticReadStatus(state, principal, messageId, now) {
-  const marker = state.fridayWebhookDiagnostic;
+  const marker = state[NAMES.diagnosticState];
   if (!uuid(messageId) || marker?.messageId !== messageId || marker.receiverId !== RECEIVER_ID || !hash(principal?.principalKey)) return;
-  const operator = principal.role === 'jarvis' && principal.scopes?.includes(SCOPES.jarvis.ack) && marker.owner === principal.principalKey;
-  if (!operator && !fridayReader(principal)) return;
+  const operator = principal.role === EVENTS_PEER && principal.scopes?.includes(SCOPES[EVENTS_PEER].ack) && marker.owner === principal.principalKey;
+  if (!operator && !webhookReader(principal)) return;
   const journal = state.diagnosticReadObservations;
   const recent = records(journal?.messageId === messageId ? journal.records : [], now, 'read');
   if (journal?.messageId === messageId) state.diagnosticReadObservations = { messageId, records: recent };
   const own = recent.filter(r => operator || r.owner === principal.principalKey);
-  // An ownerless legacy marker grants no new operator access. Friday only sees
+  // An ownerless legacy marker grants no new operator access. The webhook peer only sees
   // its own already-observed calls; unknown callers cannot probe marker existence.
   if (!operator && !own.length) return;
   return { messageId, messageStored: false, readObservations: own.map(({ owner, ...r }) => view(r)),
     evidenceStatus: 'server_read_result_only_not_native_wake', wakeVerified: false };
 }
 // Stored-message canary reads live in its own durable reservation, never the
-// spent diagnostic marker: Friday reading the source, the reserving Jarvis
-// owner reading the server-created ACK. Capture ends 30 minutes after UNTIL.
+// spent diagnostic marker: the webhook peer reading the source, the reserving
+// events-peer owner reading the server-created ACK. Capture ends 30 minutes after UNTIL.
 function canaryReadField(state, principal, messageId, now) {
-  const r = state.fridayCanary;
+  const r = state[NAMES.canaryState];
   if (!r || !uuid(messageId) || !hash(principal?.principalKey) || !time(now) || !time(r.reservedAt) ||
       !time(r.until) || now < r.reservedAt || now >= r.until + DIAGNOSTIC_READ_WINDOW_MS) return;
-  const role = messageId === r.messageId ? 'friday' : r.ackMessageId && messageId === r.ackMessageId ? 'jarvis' : null;
+  const role = messageId === r.messageId ? WEBHOOK_PEER : r.ackMessageId && messageId === r.ackMessageId ? EVENTS_PEER : null;
   if (!role || principal.role !== role || !principal.scopes?.includes(SCOPES[role].ack) ||
-      (role === 'jarvis' && principal.principalKey !== r.owner)) return;
-  return role === 'friday' ? 'sourceReads' : 'ackReads';
+      (role === EVENTS_PEER && principal.principalKey !== r.owner)) return;
+  return role === WEBHOOK_PEER ? 'sourceReads' : 'ackReads';
 }
 export const canaryReadCandidate = (state, principal, messageId, now) => !!canaryReadField(state, principal, messageId, now);
 export async function observeCanaryRead({ store, principal, messageId, error, failed = false, clock }) {
@@ -110,13 +111,13 @@ export async function observeCanaryRead({ store, principal, messageId, error, fa
     await store.transaction(state => {
       const now = clock(), field = canaryReadField(state, principal, messageId, now);
       if (!field) throw skipObservation;
-      state.fridayCanary[field] = [...records(state.fridayCanary[field], now, 'read'),
+      state[NAMES.canaryState][field] = [...records(state[NAMES.canaryState][field], now, 'read'),
         { at: now, ...result(error, failed), owner: principal.principalKey }].slice(-OBSERVATION_LIMIT);
     });
   } catch { /* A failed observation never repeats or changes the read. */ }
 }
 export function canaryReadStatus(state, messageId, now) {
-  const r = state.fridayCanary;
+  const r = state[NAMES.canaryState];
   const field = !r || !uuid(messageId) ? null : messageId === r.messageId ? 'sourceReads'
     : r.ackMessageId && messageId === r.ackMessageId ? 'ackReads' : null;
   if (!field) return;

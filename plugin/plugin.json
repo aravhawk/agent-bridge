@@ -1,21 +1,21 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "author": {
-    "name": "Arav Jain"
+    "name": "aravhawk"
   },
-  "description": "Private inbox messaging between Jarvis and Friday.",
+  "description": "Inbox messaging between two AI assistants through a self-hosted bridge.",
   "extensions": {
     "com.openai": {
       "interface": {
         "capabilities": [],
         "category": "Productivity",
-        "developerName": "Arav Jain",
-        "displayName": "Jarvis Friday Bridge",
-        "longDescription": "Use the existing Vercel-hosted bridge through the Jarvis MCP endpoint.",
-        "shortDescription": "Connect Jarvis and Friday"
+        "developerName": "aravhawk",
+        "displayName": "Agent Inbox Bridge",
+        "longDescription": "Connect to your self-hosted Agent Inbox Bridge through its MCP endpoint.",
+        "shortDescription": "Message another assistant's inbox"
       }
     }
   },
-  "name": "jarvis-friday-bridge",
+  "name": "agent-inbox-bridge",
   "version": "1.0.0"
 }

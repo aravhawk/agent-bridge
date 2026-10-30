@@ -1,12 +1,13 @@
 import { dailyMessage, messageScope } from './messages.mjs';
 import { BridgeError, SCOPES, VERIFIED_AUTHORIZATION } from './policy.mjs';
 import { resourceFor } from './resource.mjs';
+import { EVENTS_PEER, PEER_IDS, counterpart } from './config.mjs';
 
 const hash = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
-export function testEnvelopeAllowed(envelope, probeId, sender = 'jarvis') {
+export function testEnvelopeAllowed(envelope, probeId, sender = EVENTS_PEER) {
   if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(probeId || '') ||
-      !['jarvis', 'friday'].includes(sender)) return false;
-  const recipient = sender === 'jarvis' ? 'friday' : 'jarvis';
+      !PEER_IDS.includes(sender)) return false;
+  const recipient = counterpart(sender);
   return !!envelope && ((envelope.kind === 'probe' && envelope.id === probeId &&
       envelope.from === sender && envelope.to === recipient) ||
     (envelope.kind === 'ack' && envelope.correlationId === probeId &&
@@ -26,7 +27,7 @@ export function verifiedMessageAuthorization(principal, envelope, now, deliveryU
 }
 export function messageAccessAllowed(state, message, policyIds, now) {
   const a = message?.authorization, e = message?.envelope;
-  return !!a && ['jarvis', 'friday'].includes(e?.from) && (dailyMessage(e) ? ['message', 'status', 'handoff_request', 'ack'].includes(e.kind) : ['probe', 'ack'].includes(e?.kind)) &&
+  return !!a && PEER_IDS.includes(e?.from) && (dailyMessage(e) ? ['message', 'status', 'handoff_request', 'ack'].includes(e.kind) : ['probe', 'ack'].includes(e?.kind)) &&
     a.role === e.from && hash(a.owner) && hash(policyIds?.[e.from]) && a.policyId === policyIds[e.from] &&
     a.resource === resourceFor(e.from) && a.scope === messageScope(e.from, e.kind) &&
     Number.isSafeInteger(message.storedAt) && Number.isSafeInteger(a.tokenExpiresAt) && Number.isSafeInteger(a.expiresAt) &&
@@ -36,10 +37,10 @@ export function verifiedLease(principal, policyId, now) {
   const authorization = principal?.[VERIFIED_AUTHORIZATION];
   if (!hash(policyId) || authorization?.policyId !== policyId ||
       !Number.isSafeInteger(authorization.expiresAt) || authorization.expiresAt <= now ||
-      principal?.role !== 'jarvis' || !hash(principal.principalKey) ||
-      !principal.scopes?.includes(SCOPES.jarvis.ack)) throw new BridgeError('authorization_lease_required', 403);
-  return { owner: principal.principalKey, recipient: 'jarvis', resource: resourceFor('jarvis'),
-    scope: SCOPES.jarvis.ack, policyId, tokenExpiresAt: authorization.expiresAt };
+      principal?.role !== EVENTS_PEER || !hash(principal.principalKey) ||
+      !principal.scopes?.includes(SCOPES[EVENTS_PEER].ack)) throw new BridgeError('authorization_lease_required', 403);
+  return { owner: principal.principalKey, recipient: EVENTS_PEER, resource: resourceFor(EVENTS_PEER),
+    scope: SCOPES[EVENTS_PEER].ack, policyId, tokenExpiresAt: authorization.expiresAt };
 }
 export function resourceDenied(state, owner) {
   if (state.resourceDenials !== undefined && (!state.resourceDenials || typeof state.resourceDenials !== 'object' || Array.isArray(state.resourceDenials))) return true;
@@ -49,9 +50,9 @@ export function validLeaseMetadata(subscription, policyId) {
   const a = subscription?.authorization;
   return !!a && hash(policyId) && a.policyId === policyId && hash(subscription.owner) &&
     /^sub_[a-f0-9]{64}$/.test(subscription.id || '') && subscription.name === 'bridge.message.received' &&
-    subscription.arguments?.recipient === 'jarvis' && Object.keys(subscription.arguments).length === 1 &&
-    a.owner === subscription.owner && a.recipient === 'jarvis' && subscription.recipient === 'jarvis' &&
-    a.resource === resourceFor('jarvis') && a.scope === SCOPES.jarvis.ack &&
+    subscription.arguments?.recipient === EVENTS_PEER && Object.keys(subscription.arguments).length === 1 &&
+    a.owner === subscription.owner && a.recipient === EVENTS_PEER && subscription.recipient === EVENTS_PEER &&
+    a.resource === resourceFor(EVENTS_PEER) && a.scope === SCOPES[EVENTS_PEER].ack &&
     Number.isSafeInteger(a.tokenExpiresAt) && Number.isSafeInteger(subscription.expiresAt) &&
     subscription.expiresAt <= a.tokenExpiresAt;
 }
@@ -66,9 +67,9 @@ export async function denyResourceAccess(store, owner, now = Date.now()) {
   if (!hash(owner)) throw new BridgeError('invalid_resource_owner', 400);
   await store.transaction(state => {
     state.resourceDenials ||= {};
-    state.resourceDenials[owner] = { resource: resourceFor('jarvis'), recipient: 'jarvis', status: 'denied', deniedAt: now };
+    state.resourceDenials[owner] = { resource: resourceFor(EVENTS_PEER), recipient: EVENTS_PEER, status: 'denied', deniedAt: now };
     for (const sub of Object.values(state.subscriptions)) {
-      if (sub.owner === owner && sub.recipient === 'jarvis') { sub.active = false; sub.status = 'denied'; }
+      if (sub.owner === owner && sub.recipient === EVENTS_PEER) { sub.active = false; sub.status = 'denied'; }
     }
   });
 }

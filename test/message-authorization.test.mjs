@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { Bridge } from '../src/bridge.mjs';
 import { MemoryStore } from '../src/store.mjs';
 import { DeliveryWorker } from '../src/worker.mjs';
-import { createFridaySender } from '../src/friday-sender.mjs';
+import { createWebhookSender } from '../src/webhook-sender.mjs';
 import { VERIFIED_AUTHORIZATION } from '../src/policy.mjs';
 
 const policyIds = { jarvis: 'c'.repeat(64), friday: 'd'.repeat(64) };
@@ -23,7 +23,7 @@ function fixture() {
   const deny = () => store.transaction(s => { s.resourceDenials = { [sender.principalKey]: { status: 'denied' } }; });
   const worker = ({ duringTransport, ...options } = {}) => new DeliveryWorker({ store, clock, enabled: true,
     messagePolicyIds: policyIds, accessAllowed: async () => true,
-    fridaySender: createFridaySender({ enabled: true, contractVerified: true,
+    webhookSender: createWebhookSender({ enabled: true, contractVerified: true,
       endpoint: 'https://receiver.example.test/hook', secret: 'FIXTURE_NOT_A_REAL_KEY',
       transport: async () => { calls++; await duringTransport?.(); return { status: 202 }; } }), ...options });
   return { store, clock, principal, sender, receiver, bridge, input, makeBridge, deny, worker,

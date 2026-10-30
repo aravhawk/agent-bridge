@@ -214,12 +214,11 @@ Execution still requires the assistant workflow's independent authority. The
 bridge does not create host run controls, guarantee on-time execution or recover
 external side effects merely because a coordination mutex expired.
 
-Friday is **Grok Bot**, as identified by Arav. `src/friday-sender.mjs` is a
-provider-neutral HTTPS/Bearer adapter with a fixed event body. No configured
-endpoint or secret was read. Historical Cursor callback documentation does not
-establish Friday's actual receiver. Supported evidence for actual ChatGPT/Grok
-payload-to-context mapping, run start/completion and duplicate-launch handling
-remains necessary; bridge code cannot guarantee either host's scheduler.
+`src/webhook-sender.mjs` is a provider-neutral HTTPS adapter (Standard Webhooks
+signatures or a legacy bearer key) with a fixed event body. Supported evidence
+for each actual host's payload-to-context mapping, run start/completion and
+duplicate-launch handling remains necessary; bridge code cannot guarantee either
+host's scheduler.
 
 ## Local verification
 

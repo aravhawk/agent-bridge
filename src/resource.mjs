@@ -1,22 +1,25 @@
 import { isIP } from 'node:net';
 import { SCOPES } from './policy.mjs';
-import { CANONICAL_ORIGIN, SERVICE_NAME, VERSION } from './release.mjs';
+import { PUBLIC_ORIGIN, SERVICE_NAME, VERSION } from './release.mjs';
+import { CONFIG, PEER_IDS } from './config.mjs';
 
-export const ORIGIN = CANONICAL_ORIGIN;
+export const ORIGIN = PUBLIC_ORIGIN;
 export const resourceFor = role => `${ORIGIN}/bridge/${role}/mcp`;
 export const metadataFor = role => `${ORIGIN}/.well-known/oauth-protected-resource/bridge/${role}/mcp`;
-const roles = ['friday', 'jarvis'];
+const roles = PEER_IDS;
 const json = (body, status = 200, headers = {}) => Response.json(body, { status, headers: {
   'cache-control': 'no-store', 'x-content-type-options': 'nosniff', ...headers,
 } });
 // Required operator configuration obtained from the actual approved provider.
 // No guessed issuer, development fallback, request-selected key URL or issuer.
-export function providerConfiguration(value) {
+// The issuer must be a bare HTTPS origin serving /.well-known/jwks.json. With
+// BRIDGE_REQUIRE_ISSUER_UNDER_ORIGIN it must also be a subdomain of the origin.
+export function providerConfiguration(value, { requireUnderOrigin = CONFIG.requireIssuerUnderOrigin } = {}) {
   try {
     if (typeof value !== 'string' || value.trim() !== value) return null;
     const u = new URL(value);
     if (value !== u.origin || u.protocol !== 'https:' || u.username || u.password || u.search || u.hash ||
-        u.pathname !== '/' || u.port || !u.hostname.endsWith('.' + new URL(ORIGIN).hostname) || isIP(u.hostname) ||
+        u.pathname !== '/' || u.port || (requireUnderOrigin && !u.hostname.endsWith('.' + new URL(ORIGIN).hostname)) || isIP(u.hostname) ||
         /(?:^|\.)(?:localhost|local|internal)$/.test(u.hostname)) return null;
     return Object.freeze({ issuer: u.origin, jwks: u.origin + '/.well-known/jwks.json' });
   } catch { return null; }

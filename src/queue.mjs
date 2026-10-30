@@ -1,4 +1,4 @@
-import { QUEUE_TOPIC } from './release.mjs';
+import { QUEUE_TOPIC, QUEUE_REGION } from './release.mjs';
 import { dailyMessage, retainMessages, CONTENT_RETENTION_MS } from './messages.mjs';
 import { BridgeError } from './policy.mjs';
 import { digest } from './events.mjs';
@@ -13,7 +13,7 @@ const recoveryBudgetMs = 3600000, handoffAt = 18;
 export function createQueueAdapter({ client, store, worker, enabled = false, maintenanceEnabled = false, clock = Date.now }) {
   const gate = () => { if (!enabled) throw new BridgeError('queue_not_enabled', 503); };
   async function publish(payload, key, delaySeconds = 1) {
-    await client.send(TOPIC, payload, { region: 'iad1', delaySeconds,
+    await client.send(TOPIC, payload, { region: QUEUE_REGION, delaySeconds,
       retentionSeconds: Math.min(604800, Math.max(3600, delaySeconds + 3600)), idempotencyKey: key });
   }
   async function handoff(message, workKey, metadata) {
@@ -29,7 +29,7 @@ export function createQueueAdapter({ client, store, worker, enabled = false, mai
     // retry hook. Ambiguous publishes reuse the same key. Every descendant
     // retains the absolute deadline, including across delayed commits/restarts.
     await client.send(TOPIC, { [workKey]: message[workKey], recoveryUntil: until },
-      { region: 'iad1', delaySeconds: 60, retentionSeconds: remaining,
+      { region: QUEUE_REGION, delaySeconds: 60, retentionSeconds: remaining,
         idempotencyKey: 'recovery:' + digest(JSON.stringify([metadata.messageId, until])) });
     return true;
   }
@@ -55,13 +55,13 @@ export function createQueueAdapter({ client, store, worker, enabled = false, mai
         const now = clock();
         // DB identity and fencing own idempotence. The epoch allows explicit
         // backend reconciliation to recover a previously exhausted queue item.
-        await client.send(TOPIC, { jobId: id }, { region: 'iad1', retentionSeconds: 3600,
+        await client.send(TOPIC, { jobId: id }, { region: QUEUE_REGION, retentionSeconds: 3600,
           delaySeconds: Math.max(0, Math.ceil((due - now) / 1000)),
           idempotencyKey: `${id}:${job.attempts}:${job.leaseId || 'pending'}:${Math.floor(now / 600000)}` });
       }
     },
     async consume(message, metadata) {
-      if (metadata.topicName !== TOPIC || metadata.region !== 'iad1') return;
+      if (metadata.topicName !== TOPIC || metadata.region !== QUEUE_REGION) return;
       const key = message && Object.keys(message).length === 1 ? Object.keys(message)[0] : null;
       if (key === 'cleanupMessageId' && maintenanceEnabled && uuid.test(message[key])) {
         const next = await store.transaction(state => {

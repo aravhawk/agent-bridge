@@ -9,7 +9,7 @@ import { validateMessage, MESSAGE_PROTOCOL, retainMessages, CONTENT_RETENTION_MS
 import { createProtector } from '../src/webhook.mjs';
 import { NativeEvents } from '../src/events.mjs';
 import { DeliveryWorker } from '../src/worker.mjs';
-import { createFridaySender } from '../src/friday-sender.mjs';
+import { createWebhookSender } from '../src/webhook-sender.mjs';
 import { createRuntime } from '../src/runtime.mjs';
 import { resourceFor } from '../src/resource.mjs';
 import { ISSUER } from './fixtures/provider.mjs';
@@ -32,7 +32,7 @@ function fixture(snapshot) {
     delivery: { mode: 'webhook', url: 'https://callback.example.test/events', secret: 'whsec_' + randomBytes(32).toString('base64') } };
   const message = (from = 'jarvis', extra = {}) => ({ protocol: MESSAGE_PROTOCOL, id: randomUUID(), from,
     to: from === 'jarvis' ? 'friday' : 'jarvis', kind: 'message', sentAt: new Date(now).toISOString(),
-    expiresAt: new Date(now + 3600000).toISOString(), threadId: randomUUID(), route: 'inbox', text: 'Please review this request under Arav’s existing workflow.', ...extra });
+    expiresAt: new Date(now + 3600000).toISOString(), threadId: randomUUID(), route: 'inbox', text: 'Please review this request under the owner’s existing workflow.', ...extra });
   return { store, bridge, events, protector, clock, subscription, message, advance: n => { now += n; } };
 }
 const complete = (bridge, recipient, messageId, claimId) => bridge.complete(recipient,
@@ -76,7 +76,7 @@ test('recipient isolation, source expiry and durable denial apply to daily reads
   let posts = 0;
   const worker = new DeliveryWorker({ store: f.store, clock: f.clock, enabled: true,
     messagePolicyIds: { jarvis: policy, friday: policy }, accessAllowed: async () => true,
-    fridaySender: async () => { posts++; return { status: 200 }; } });
+    webhookSender: async () => { posts++; return { status: 200 }; } });
   await worker.run(sent.jobIds[0]); assert.equal(posts, 0);
   const next = f.message(); await f.bridge.sendMessage(jarvis, next);
   await f.store.transaction(s => { s.resourceDenials = { [jarvis.principalKey]: { status: 'denied' } }; });
@@ -128,9 +128,9 @@ test('daily live-capacity backpressure preserves pending messages and reserves r
 
 test('daily transport retries transient failures at most five times with one stable event/body', async () => {
   const f = await readyFixture(), m = f.message(); const sent = await f.bridge.sendMessage(jarvis, m), bodies = [];
-  const fridaySender = createFridaySender({ enabled: true, contractVerified: true, endpoint: 'https://receiver.example.test/event',
+  const fridaySender = createWebhookSender({ enabled: true, contractVerified: true, endpoint: 'https://receiver.example.test/event',
     secret: 'FIXTURE_ONLY', transport: async (_url, req) => { bodies.push(req.body); return { status: 503 }; } });
-  const worker = new DeliveryWorker({ store: f.store, clock: f.clock, enabled: true, fridaySender,
+  const worker = new DeliveryWorker({ store: f.store, clock: f.clock, enabled: true, webhookSender: fridaySender,
     messagePolicyIds: { jarvis: policy, friday: policy }, accessAllowed: async () => true });
   for (let i = 0; i < 8; i++) { await worker.run(sent.jobIds[0]); f.advance(60000); }
   assert.equal(bodies.length, 5); assert.equal(new Set(bodies).size, 1);

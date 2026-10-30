@@ -1,13 +1,14 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { BridgeError } from './policy.mjs';
 import { TaskRetention, checkNewTaskId, checkTaskClock, retiredTask } from './task-retention.mjs';
+import { PEER_IDS } from './config.mjs';
 
 // Task DATA kernel. The default production runtime does not construct it;
 // explicit trusted assembly is required. No execution adapter, timer or sender.
 // The injected callback admits DATA access only. Claims are coordination
 // mutexes and results are reports, never permission/proof of external work.
 const terminal = phase => ['succeeded', 'failed', 'cancelled', 'expired'].includes(phase);
-const roles = ['jarvis', 'friday'];
+const roles = PEER_IDS;
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const id = value => typeof value === 'string' && uuid.test(value);
 const caps = { tasks: 100, bytes: 1048576, taskBytes: 16384, replay: 32 };

@@ -1,18 +1,21 @@
 import { createHash } from 'node:crypto';
 import { jwtVerify } from 'jose';
+import { CONFIG, PEER_IDS } from './config.mjs';
 
-// Resource-server verification only. Clerk owns OAuth, PKCE, consent, issuance
-// and refresh. No authorization server, signing key or token issuer exists here.
+// Resource-server verification only. The OAuth provider owns PKCE, consent,
+// issuance and refresh. No authorization server, signing key or token issuer exists here.
 export class BridgeError extends Error {
   constructor(code, status) { super(code); this.code = code; this.status = status; }
 }
 const reject = (code, status = 400) => { throw new BridgeError(code, status); };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const ROLES = ['jarvis', 'friday'];
-export const SCOPES = Object.freeze({
-  friday: { probe: 'bridge:send:jarvis', ack: 'bridge:ack:friday' },
-  jarvis: { probe: 'bridge:send:friday', ack: 'bridge:ack:jarvis' },
-});
+const ROLES = PEER_IDS;
+// Per peer: probe = bridge:send:<counterpart>, ack = bridge:ack:<self>.
+export const SCOPES = CONFIG.scopes;
+// Fixed wire markers of the synthetic probe envelope (kind probe/ack). They are
+// constants, not deployment identity, so stored probes stay verifiable.
+export const SYNTHETIC_TEST_ID = 'RN-JARVIS-FRIDAY-SYNTHETIC';
+export const SYNTHETIC_MARKER = 'RN-SYNTHETIC-NO-ACTIONS';
 export const VERIFIED_AUTHORIZATION = Symbol('verified bridge authorization');
 // Internal adapter evidence; JSON requests and HTTP bodies cannot supply it.
 export const DELIVERY_TRANSPORT_OUTCOME = Symbol('delivery transport outcome');
@@ -21,8 +24,8 @@ export function authorizationPolicyId({ issuer, audience, subject, subjectHash, 
   return createHash('sha256').update(JSON.stringify([issuer, audience, pin, role, scopeClaim, algorithms])).digest('hex');
 }
 
-// JWT audience and scope-claim settings must be confirmed against Clerk's actual
-// issued test token via safe SDK output before enabling a live route. Values in
+// JWT audience and scope-claim settings must be confirmed against the provider's
+// actual issued test token via safe SDK output before enabling a live route. Values in
 // the caller's request cannot choose issuer, key source, audience or role.
 export function createAccessVerifier({ issuer, audience, subject, subjectHash, role, keyResolver,
   scopeClaim = 'scope', algorithms = ['RS256'], currentDate, observeTiming }) {
@@ -84,7 +87,7 @@ export function createContractObserver({ issuer, audience, role, keyResolver, em
       try {
         const { payload } = await jwtVerify(header.slice(7), keyResolver, { issuer, audience,
           algorithms: ['RS256'], requiredClaims: ['exp', 'iat', 'sub'], clockTolerance: 5 });
-        if (typeof payload.sub === 'string' && ['friday', 'jarvis'].includes(role)) {
+        if (typeof payload.sub === 'string' && ROLES.includes(role)) {
           const claims = ['scope', 'scp', 'scopes'].map(name => {
             const value = payload[name];
             const validArray = Array.isArray(value) && value.every(x => typeof x === 'string');
@@ -111,9 +114,9 @@ export function validateEnvelope(input, principal, now = Date.now()) {
       !ROLES.includes(principal.role) || !Array.isArray(principal.scopes)) reject('invalid_envelope');
   const keys = ['id', 'testId', 'from', 'to', 'kind', 'sentAt', 'correlationId', 'marker'];
   if (Object.keys(input).some(k => !keys.includes(k)) || !UUID.test(input.id || '') ||
-      input.testId !== 'RN-JARVIS-FRIDAY-SYNTHETIC' || input.from !== principal.role ||
+      input.testId !== SYNTHETIC_TEST_ID || input.from !== principal.role ||
       !ROLES.includes(input.to) || input.to === input.from ||
-      !['probe', 'ack'].includes(input.kind) || input.marker !== 'RN-SYNTHETIC-NO-ACTIONS') {
+      !['probe', 'ack'].includes(input.kind) || input.marker !== SYNTHETIC_MARKER) {
     reject('invalid_envelope');
   }
   const time = Date.parse(input.sentAt);

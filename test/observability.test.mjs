@@ -6,7 +6,7 @@ import { NativeEvents, EVENT_NAME } from '../src/events.mjs';
 import { Bridge } from '../src/bridge.mjs';
 import { BridgeError, SCOPES, VERIFIED_AUTHORIZATION } from '../src/policy.mjs';
 import { createProtector } from '../src/webhook.mjs';
-import { createFridayDiagnostic } from '../src/friday-diagnostic.mjs';
+import { createWebhookDiagnostic } from '../src/webhook-diagnostic.mjs';
 import { denyResourceAccess } from '../src/access.mjs';
 import { OBSERVATION_LIMIT, OBSERVATION_TTL_MS, DIAGNOSTIC_READ_WINDOW_MS } from '../src/observability.mjs';
 
@@ -29,7 +29,7 @@ function fixture() {
     secret: 'PRIVATE_RECEIVER_KEY', from: new Date(now).toISOString(), until: new Date(now + 3600000).toISOString(),
     transport: async (_url, request) => { posts.push(request); return { status: 200, body: 'PRIVATE_RESPONSE_BODY' }; } };
   return { store, clock, principal, jarvis, friday, events, params, bridge, posts, diagnosticOptions,
-    advance: ms => { now += ms; }, diagnostic: createFridayDiagnostic(diagnosticOptions),
+    advance: ms => { now += ms; }, diagnostic: createWebhookDiagnostic(diagnosticOptions),
     status: async (who = jarvis) => (await events.status(who)).subscriptions[0] };
 }
 
@@ -180,7 +180,7 @@ test('legacy ownerless marker is never backfilled or reset and gives no new Jarv
   // The read-status transaction rolls back on not-found; the projection still
   // never returns stale records. An owning operator can persist lazy pruning.
   assert.deepEqual(f.store.snapshot().fridayWebhookDiagnostic, marker);
-  assert.equal((await createFridayDiagnostic({ ...f.diagnosticOptions,
+  assert.equal((await createWebhookDiagnostic({ ...f.diagnosticOptions,
     from: new Date(f.clock()).toISOString(), until: new Date(f.clock() + 60000).toISOString() })(f.jarvis)).duplicate, true);
   assert.equal(f.posts.length, 1);
 });

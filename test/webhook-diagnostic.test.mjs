@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { generateKeyPair, SignJWT } from 'jose';
 import { createRuntime } from '../src/runtime.mjs';
-import { diagnosticWindowOpen, DIAGNOSTIC_MAX_WINDOW_MS } from '../src/friday-diagnostic.mjs';
+import { diagnosticWindowOpen, DIAGNOSTIC_MAX_WINDOW_MS } from '../src/webhook-diagnostic.mjs';
 import { emptyState } from '../src/store.mjs';
 import { resourceFor } from '../src/resource.mjs';
 import { SCOPES, BridgeError } from '../src/policy.mjs';

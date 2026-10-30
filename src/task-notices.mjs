@@ -1,4 +1,6 @@
 import { BridgeError } from './policy.mjs';
+import { counterpart } from './config.mjs';
+import { MESSAGE_PROTOCOL } from './messages.mjs';
 
 // Isolated transaction helper: no sender, queue, principal derivation or scope
 // mapping. stageNotice must synchronously use the existing v1 admission path.
@@ -62,7 +64,7 @@ export class TaskNoticeTransactions {
         fail('task_notice_id_conflict');
       const until = staged.now + this.linkRetentionMs;
       if (!Number.isSafeInteger(until)) fail('task_notice_configuration_required', 503);
-      const recipient = staged.role === 'jarvis' ? 'friday' : 'jarvis';
+      const recipient = counterpart(staged.role);
       const context = Object.freeze({ messageId: notice.messageId, taskId: command.taskId,
         revision: staged.result.revision, from: staged.role, to: recipient, createdAt: staged.now });
       const callbackResult = this.stageNotice(state, principal, context);
@@ -72,7 +74,7 @@ export class TaskNoticeTransactions {
         fail('task_notice_stage_invalid', 503);
       }
       const envelope = state.messages[notice.messageId]?.envelope;
-      if (envelope?.protocol !== 'jarvis-friday/1' || envelope.id !== notice.messageId ||
+      if (envelope?.protocol !== MESSAGE_PROTOCOL || envelope.id !== notice.messageId ||
           envelope.kind !== 'status' || envelope.from !== staged.role || envelope.to !== recipient ||
           envelope.route !== 'inbox' || envelope.threadId !== command.taskId)
         fail('task_notice_stage_invalid', 503);

@@ -1,24 +1,30 @@
-# Active bridge architecture
+# Bridge architecture
 
 This service is a resource server and a bounded durable outbox, not an OAuth
-client or assistant runtime. Clerk issues and refreshes tokens; each native
-host owns its task, connection and subscription refresh. The server must handle
-valid refresh requests correctly without assuming a particular host schedule.
-Normal delivery and the one-shot diagnostic remain disabled in production.
+client or assistant runtime. The OAuth provider (Clerk in the reference setup)
+issues and refreshes tokens; each native host owns its task, connection and
+subscription refresh. The server must handle valid refresh requests correctly
+without assuming a particular host schedule. Normal delivery and the one-shot
+diagnostic stay disabled until an operator attests each readiness gate.
+
+Two peers are configured with `BRIDGE_PEERS`: the **events peer** receives
+signed MCP event callbacks it subscribed to; the **webhook peer** receives a
+server-configured webhook (Standard Webhooks signed, or a legacy bearer key).
+Each peer sends only to the other. See [configuration](configuration.md).
 
 ## Boundaries and state transitions
 
 | Boundary | Owns | Must not claim |
 |---|---|---|
-| Canonical resource router + JWT verifier | Fixed role/audience/issuer/subject/scopes; hard request expiry | That foreground health proves background refresh |
+| Resource router + JWT verifier | Fixed role/audience/issuer/subject/scopes; hard request expiry | That foreground health proves background refresh |
 | MCP adapter | Discovery, method/argument handling, sanitized tool results | That HTTP200 means the tool succeeded |
 | Subscription state | Canonical identity, callback proof, finite TTL and authorization ceiling | That OAuth itself requires the local lease policy |
 | Message/receipt transactions | Stored content, deterministic jobs, claim fencing and atomic completion/ACK | Exactly-once hosted external actions |
 | Queue adapter + worker | Native dispatch, bounded retries, current admission and durable result fencing | Infinite recovery or native wake from HTTP acceptance |
-| Fixed Friday adapter | Exact configured destination and wire shape | Verified receiver context from a saved credential |
+| Webhook peer adapter | Exact configured destination, signing mode and wire shape | Verified receiver context from a saved credential |
 
 The single Postgres row serializes message/outbox/receipt mutations for this
-bounded personal workload. Callback secrets are encrypted with subscription-ID
+bounded single-owner workload. Callback secrets are encrypted with subscription-ID
 AAD. There is no in-memory production fallback. A normalized multi-table schema
 or new orchestration service is not needed to fix the reproduced lifecycle
 defects; either would require a separate migration and validation effort.
