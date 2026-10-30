@@ -53,8 +53,8 @@ through an authenticated MCP call.
   `bridge:ack:<self>`. A peer can send only to its counterpart and can read,
   claim and acknowledge only messages addressed to itself.
 - **Data, not instructions.** Text is at most 4 KiB, expires within one hour
-  and is validated against a fixed envelope. There are no free-form routes,
-  task selectors, URLs or tool choices. Reads return
+  (up to 12 hours for opt-in SYNC data) and is validated against a fixed
+  envelope. There are no free-form routes, task selectors, URLs or tool choices. Reads return
   `authority: "peer_data_requires_user_workflow"`.
 - **Closed by default.** Subscriptions, delivery and receiver policy are
   separate operator gates. Each one stays off until you attest it, and
@@ -117,7 +117,8 @@ works), and a domain for the bridge.
    BRIDGE_PEER_BOB_WEBHOOK_SECRET=whsec_<base64>
    ```
    `vercel.json` already routes all paths to the MCP function, keeps the queue
-   consumer private, and declares the queue trigger topic. That topic must
+   consumer private, declares the queue trigger topic and the hourly SYNC
+   flush cron (set `CRON_SECRET` if you enable wake/sync). The queue topic must
    equal `BRIDGE_QUEUE_TOPIC`; both default to the same value.
 6. **Check the public boundary.**
    ```sh
@@ -155,6 +156,8 @@ The full reference, including the diagnostic and canary procedures, is in
 | `BRIDGE_PEER_<ID>_WEBHOOK_URL` / `_WEBHOOK_SECRET` / `_WEBHOOK_AUTH` | for delivery | Webhook peer endpoint and `standard-webhooks` (default) or `bearer` signing |
 | `BRIDGE_PEER_<ID>_RECEIVER_ID` / `_WEBHOOK_CONTRACT_VERIFIED` | for delivery | Webhook receiver attestations |
 | `BRIDGE_OAUTH_CONTRACT_VERIFIED`, `BRIDGE_SUBSCRIPTIONS_ENABLED`, `BRIDGE_RECEIVER_POLICY`, `BRIDGE_DELIVERY_ENABLED` | for delivery | Readiness gates, all closed by default |
+| `BRIDGE_WAKE_SYNC_RECIPIENTS` | no | Recipients with WAKE/SYNC batching and no ACK wakes (default off); see below |
+| `CRON_SECRET` | for SYNC flush | Vercel cron secret protecting `/api/cron` |
 | `BRIDGE_SERVICE_NAME`, `BRIDGE_MESSAGE_PROTOCOL`, `BRIDGE_RECEIVER_ID`, `BRIDGE_QUEUE_TOPIC`, `BRIDGE_QUEUE_REGION`, `BRIDGE_REQUIRE_ISSUER_UNDER_ORIGIN`, `BRIDGE_DATABASE_HOST_SUFFIX` | no | Naming and optional hardening |
 
 **Compatibility mode.** This project began as a private deployment between two
@@ -174,6 +177,7 @@ keep working with no change. New deployments should always set
 | `bridge_read` | recipient | Read a stored message by the ID from its wake-up event |
 | `bridge_receipt_claim` / `bridge_receipt_complete` | recipient | Claim with a 60 s lease, then complete and atomically create the ACK |
 | `bridge_status` | both | Delivery and receipt evidence for one known message |
+| `bridge_inbox_read` | wake/sync recipient | Start-of-turn read of pending SYNC data as one delta batch |
 | `bridge_subscription_status` | events peer | Own subscriptions and renewal observations (no secrets) |
 | `bridge_webhook_diagnostic` | events peer (send scope) | One-time, operator-armed transport check of the webhook peer |
 
@@ -183,6 +187,36 @@ The events peer can also call `events/list`, `events/subscribe` and
 its tools are offered only once the OAuth contract is verified and delivery is
 enabled, and otherwise the bridge serves the v1 tools above unchanged. See
 [docs/task-kernel.md](docs/task-kernel.md).
+
+## Wake and sync delivery (optional)
+
+Every wake costs the recipient a turn. With
+`BRIDGE_WAKE_SYNC_RECIPIENTS=<peer>` (default off, per recipient, rolled back
+by clearing it), that recipient gets:
+
+- **No ACK wakes.** Receipts are still recorded and visible in `bridge_status`,
+  but they no longer create an ACK message or webhook for that recipient.
+- **WAKE vs SYNC.** `bridge_message_send` accepts optional fields:
+
+  | Field | Meaning |
+  |---|---|
+  | `class` | `wake` (default; needs action, a decision, a blocker, urgent, an awaited reply, or effect within 2 h) or `sync` (routine FYI: status, logged decisions, owner changes, later reminders) |
+  | `subject` | Topic key (≤ 200 chars). A newer pending item with the same subject replaces the older one |
+  | `effectiveAt` / `dueAt` | ISO 8601 times. Either at or before now + 2 h promotes `sync` to `wake` |
+  | `expiresAt` | Up to 12 h for `sync` (1 h otherwise). A `sync` item that would expire before the next flush is sent as `wake` |
+
+  Messages without `class` behave exactly as before.
+- **One batch, not one wake per item.** Pending SYNC items are coalesced (delta
+  only, deduplicated by subject) and delivered once: with the next WAKE, on the
+  recipient's next `bridge_read`/`bridge_inbox_read`, or as a single webhook at
+  the next even hour in America/Chicago (00:00, 02:00, … 22:00), at most 12 per
+  day, never for an empty window. A batch is an ordinary `status` message, so
+  its wake payload is unchanged; `bridge_read` adds a `syncBatches` field with
+  each item.
+
+The flush is a Vercel cron (`/api/cron`, hourly UTC; the handler picks the
+Chicago even hours across DST) protected by `CRON_SECRET`. Details:
+[configuration](docs/configuration.md#wakesync-delivery-classes-default-off).
 
 ## Limitations
 

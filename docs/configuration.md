@@ -97,7 +97,9 @@ Every gate defaults to closed. A flag is an operator attestation, not evidence.
 
 `bridge_health` reports each gate under `readiness`. Delivery flags never
 change the tool catalog: the events peer sees seven tools (eight with the send
-scope after attestation, including the diagnostic), the webhook peer six.
+scope after attestation, including the diagnostic), the webhook peer six. The
+one exception is `BRIDGE_WAKE_SYNC_RECIPIENTS` (below): an enabled recipient
+also sees `bridge_inbox_read`, and `readiness.wakeSync` appears once it is set.
 
 ## Webhook peer
 
@@ -194,6 +196,56 @@ To run it:
 5. Inspect `bridge_status` for both messages, then clear the values.
 
 The results are server operation evidence only (`wakeVerified: false`).
+
+## Wake/sync delivery classes (default off)
+
+| Variable | Meaning |
+|---|---|
+| `BRIDGE_WAKE_SYNC_RECIPIENTS` | Comma-separated recipient peer IDs that get WAKE/SYNC routing, e.g. `friday`. Unset or empty: v1 behavior. Any unknown ID disables the whole flag. Read on every call, so clearing it rolls back immediately. |
+| `CRON_SECRET` | Vercel cron secret (16+ random characters). Vercel sends it as `Authorization: Bearer <secret>` to `/api/cron`; without it the flush route answers 503 and SYNC data only leaves on a WAKE or an inbox read. |
+
+For an enabled recipient:
+
+- **No ACK wakes.** Completing a receipt still records it exactly as before
+  (`bridge_status` shows `receiptCompleted`), but no ACK message or webhook is
+  created for that recipient. The events peer then also needs no return
+  subscription for its own sends. The completion result says `ackSuppressed: true`.
+- **Two classes.** `bridge_message_send` takes optional `class` (`wake` or
+  `sync`), `subject`, `effectiveAt` and `dueAt`. A message with no class is
+  WAKE, unchanged. SYNC is promoted to WAKE when `effectiveAt` or `dueAt` is at
+  or before now + 2 h, and when its `expiresAt` falls at or before the next
+  flush boundary (so queued data can never expire unseen). Only `class: sync`
+  may set `expiresAt` up to 12 h after `sentAt`; everything else keeps 1 h.
+- **Batching.** Pending SYNC items coalesce per recipient: delta only, and a
+  later item with the same `subject` (case and spacing ignored) replaces the
+  earlier pending one, as does a WAKE with that subject. The batch is delivered
+  once: piggybacked on the next WAKE to that recipient, returned by the
+  recipient's next `bridge_read` or `bridge_inbox_read`, or flushed as one
+  webhook at the next even America/Chicago hour (00:00, 02:00, … 22:00). Empty
+  windows send nothing; at most 12 flushes per recipient per Chicago day.
+
+A batch is stored as an ordinary v1 `status` message from the counterpart, so
+its wake is the unchanged `{"event":"bridge.message.received","data":{"messageId":…}}`
+(or the events-peer callback). Its text is a bounded digest that names every
+item's messageId; `bridge_read` adds a `syncBatches` array with each item's
+full data. Claiming and completing the batch records every item's receipt and
+never creates an ACK. Items stay individually readable by ID.
+
+The flush runs from a Vercel cron (`vercel.json`, `0 * * * *`, hourly UTC).
+Each run computes the latest Chicago even-hour boundary and flushes each
+recipient at most once per boundary, so odd-hour runs only catch up a missed
+boundary. On the spring-forward day the missing 02:00 is flushed at 03:00 CDT;
+on the fall-back day neither 01:00 counts. Batches are published to the queue
+after the flush commits; a failed publication is retried by the next run.
+Queued SYNC items stay deliverable after the sender's access token expires
+(a FYI must survive until the next boundary), but a policy change, durable
+denial, the item's own `expiresAt` or content retention still withdraws them.
+
+Rollout: set `CRON_SECRET`, update the recipient's receiver to use
+`syncBatches` (or `bridge_inbox_read` at the start of a turn), then set
+`BRIDGE_WAKE_SYNC_RECIPIENTS` to that recipient. Rollback: clear the variable.
+New SYNC messages are then delivered as WAKE, ACKs resume, and anything still
+queued is flushed at the next boundary as a standard message.
 
 ## Bounded queue recovery
 
