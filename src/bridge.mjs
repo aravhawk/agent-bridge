@@ -264,7 +264,13 @@ export class Bridge {
     });
   }
   async complete(principal, params) {
-    ownKeys(params, ['messageId', 'claimId', 'hostedEventId', 'hostedTurnId']);
+    ownKeys(params, ['messageId', 'claimId', 'hostedEventId', 'hostedTurnId', 'syncBatchIds'],
+      ['messageId', 'claimId', 'hostedEventId', 'hostedTurnId']);
+    // Optional: the batch IDs this receiver saw with the message (from its own
+    // read) and has handled. Only these are acknowledged; omitted means none.
+    const ackIds = params.syncBatchIds ?? [];
+    if (!Array.isArray(ackIds) || ackIds.length > 32 || new Set(ackIds).size !== ackIds.length ||
+        ackIds.some(id => typeof id !== 'string' || !uuid.test(id))) fail('invalid_params');
     for (const field of ['hostedEventId', 'hostedTurnId']) {
       if (params[field] !== null && (typeof params[field] !== 'string' || !/^[A-Za-z0-9_.:-]{1,160}$/.test(params[field]))) {
         fail('invalid_receipt_evidence');
@@ -294,6 +300,12 @@ export class Bridge {
       if (receipt.claimId !== params.claimId || receipt.leaseUntil <= now) fail('stale_receipt_claim', 409);
       // A batch is handled only after its full items were returned by a read.
       if (message.syncBatch && !message.syncBatch.presentedAt) fail('sync_batch_not_presented', 409);
+      // Acknowledgement is bound to the completing receiver's own view, not to
+      // whatever another reader was shown: every named batch must have been
+      // presented with this message, and unnamed batches stay outstanding.
+      if (ackIds.some(id => !(message.syncBatchIds || []).includes(id) || !state.messages[id]?.syncBatch?.presentedAt)) {
+        fail('sync_batch_not_presented', 409);
+      }
       const ackSuppressed = original.kind !== 'ack' && this.ackSuppressed(message);
       requireAckPath(state, original, message.authorization, this.messagePolicyIds, now, this.canary?.subscriptionId, ackSuppressed);
       let ackMessageId = null; let jobIds = [];
@@ -316,11 +328,10 @@ export class Bridge {
         ackMessageId, hostedEventId: params.hostedEventId, hostedTurnId: params.hostedTurnId,
         evidenceStatus: 'reported_requires_independent_host_confirmation', ...(ackSuppressed ? { ackSuppressed: true } : {}) };
       // Completing a batch acknowledges it and every item it presented.
-      // Completing a message also acknowledges the batches presented with it.
+      // Completing a message also acknowledges exactly the named batches.
       const evidence = { hostedEventId: params.hostedEventId, hostedTurnId: params.hostedTurnId };
       if (message.syncBatch) ackBatch(state, params.messageId, principal, now, evidence);
-      const syncBatchesAcked = (message.syncBatchIds || [])
-        .filter(id => ackBatch(state, id, principal, now, { ...evidence, via: params.messageId }));
+      const syncBatchesAcked = ackIds.filter(id => ackBatch(state, id, principal, now, { ...evidence, via: params.messageId }));
       return { completed: true, duplicate: false, ackMessageId, jobIds,
         evidenceStatus: 'reported_requires_independent_host_confirmation', ...(ackSuppressed ? { ackSuppressed: true } : {}),
         ...(syncBatchesAcked.length ? { syncBatchesAcked } : {}) };

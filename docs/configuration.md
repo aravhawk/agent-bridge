@@ -232,10 +232,15 @@ For an enabled recipient:
   every call, so a lost response or a crash loses nothing and concurrent reads
   return the same batches (reads serialize on the store lock and never cut
   twice). A batch is acknowledged either by claiming and completing its own
-  `messageId`, or by completing the message it was presented with. Completion
-  is refused with `sync_batch_not_presented` until the batch's full items were
+  `messageId`, or by completing the message it was presented with while naming
+  it in `syncBatchIds`. Acknowledgement is bound to the IDs the completing
+  receiver names from its own read, so a batch shown to a different reader of
+  the same message (for example during the first reader's claim) is never
+  acknowledged on its behalf; unnamed batches stay outstanding. Completion is
+  refused with `sync_batch_not_presented` for a named batch that was not
+  presented with that message, or for a batch whose full items were never
   returned by a read (`bridge_read` of the batch or its WAKE, or
-  `bridge_inbox_read`), and only an acknowledged batch marks its items handled.
+  `bridge_inbox_read`). Only an acknowledged batch marks its items handled.
   A batch still unacknowledged after 12 hours is retired and its unhandled
   items are queued again.
 - **Nothing is silently dropped.** Items whose own `expiresAt` passes while
@@ -259,9 +264,12 @@ The flush is triggered by the GitHub Actions workflow
 `workflow_dispatch`), which POSTs to `/api/cron` with the bearer secret. It is
 not a Vercel cron, because Vercel Hobby only allows daily crons. The workflow
 has no permissions, no third-party actions, a 5-minute timeout and a
-non-overlapping concurrency group. If the secret or URL is not configured it
-logs a notice and succeeds; otherwise any non-2xx response fails the run
-(curl retries 3 times with a 30-second limit per attempt).
+non-overlapping concurrency group. If the `CRON_SECRET` secret or the
+`BRIDGE_CRON_URL` variable is missing or empty, the run fails with an error
+(nothing is sent), so configure both before the workflow reaches the default
+branch, or disable the workflow. Any non-2xx response also fails the run (curl
+retries 3 times with a 30-second limit per attempt; redirects are not
+followed and count as failures).
 
 The route accepts POST and GET. Every run checks each enabled recipient with
 pending SYNC data and flushes one batch when:
@@ -301,6 +309,8 @@ Rollout (in this order; nothing here is set by the repository):
    secret `CRON_SECRET` with the same value.
 4. In the same place, add a repository variable `BRIDGE_CRON_URL` with the full
    HTTPS URL of the deployed flush route, e.g. `https://<your-bridge-host>/api/cron`.
+   Do steps 1–4 before the workflow is merged to the default branch: until both
+   exist, every scheduled run fails with an error.
 5. Optionally run the "Bridge SYNC flush" workflow by hand (`workflow_dispatch`).
    With nothing queued it should succeed with `"status":"ok"` and
    `"flushed":0`; a 401 means the two secrets differ, a 503 means the Vercel
@@ -309,13 +319,28 @@ Rollout (in this order; nothing here is set by the repository):
    [flagged receiver contract](inbox-policy.md#flagged-receiver-contract).
 7. Set `BRIDGE_WAKE_SYNC_RECIPIENTS=friday` in Vercel and redeploy.
 
-Rollback: clear `BRIDGE_WAKE_SYNC_RECIPIENTS` and redeploy. New SYNC messages
-are then delivered as WAKE and ACKs resume. On the next hourly run, anything
-still queued is re-sent under its own message ID where its original v1
-authority is still valid (an unchanged receiver handles it like any message,
-ACK included); the rest goes out once as a standard `status` batch whose text
-lists each item's message ID. Leave the secrets and the workflow in place until
-that run has happened.
+Rollback (drain first, then switch; in this order):
+
+1. Ask senders to stop sending `class: sync` to the recipient. Unclassified
+   and `wake` messages are delivered immediately as before.
+2. **Drain while the flag and the flagged receiver are still in place.** Have
+   the recipient call `bridge_inbox_read` and, for every returned batch,
+   claim it, handle its items and complete it, repeating until a call returns
+   `"syncBatches": []`. Each call cuts any pending SYNC data into a batch and
+   replays every unacknowledged one, so an empty result means nothing is
+   queued or outstanding. (Running the workflow by hand first flushes anything
+   already due as a webhook.)
+3. Clear `BRIDGE_WAKE_SYNC_RECIPIENTS` and redeploy. New SYNC messages are then
+   delivered as WAKE and ACKs resume.
+4. Only now switch the recipient back to an old-format or legacy-only
+   receiver.
+
+Safety net for anything queued after the drain: on the next hourly run it is
+re-sent under its own message ID where its original v1 authority is still
+valid (an unchanged receiver handles it like any message, ACK included); the
+rest goes out once as a standard `status` batch whose text lists each item's
+message ID. Keep the secrets, the variable and the workflow in place until
+that run has happened (an unconfigured workflow fails loudly).
 
 ## Bounded queue recovery
 

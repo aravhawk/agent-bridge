@@ -43,9 +43,10 @@ async function fixture({ recipients = ['friday'], at = start, wakeSync = true } 
   const sync = (from = 'jarvis', extra = {}) => message(from, { class: 'sync', expiresAt: iso(now + 6 * HOUR), ...extra });
   const principal = role => who(role, at + 7 * 86400000);
   const send = (m, as = principal(m.from)) => bridge.sendMessage(as, m);
-  const handle = async (as, id) => {
+  const handle = async (as, id, syncBatchIds) => {
     const claim = await bridge.claim(as, { messageId: id });
-    return bridge.complete(as, { messageId: id, claimId: claim.claimId, hostedEventId: null, hostedTurnId: null });
+    return bridge.complete(as, { messageId: id, claimId: claim.claimId, hostedEventId: null, hostedTurnId: null,
+      ...(syncBatchIds ? { syncBatchIds } : {}) });
   };
   // A flagged receiver: read (full items), then claim/complete the batch receipt.
   const ack = async (id, as = principal('friday')) => { await bridge.read(as, { messageId: id }); return handle(as, id); };
@@ -329,7 +330,7 @@ test('undeliverable SYNC data is held past content retention instead of being pu
   assert.equal((await f.bridge.status(friday, { messageId: m.id })).sync.state, 'pending');
 });
 
-test('piggyback on WAKE: completing the read WAKE acknowledges the batch presented with it', async () => {
+test('piggyback on WAKE: completing the read WAKE with its batch IDs acknowledges exactly those batches', async () => {
   const f = await fixture();
   const a = f.sync('jarvis', { subject: 'A' }), stale = f.sync('jarvis', { subject: 'Budget' });
   await f.send(a); await f.send(stale);
@@ -341,7 +342,7 @@ test('piggyback on WAKE: completing the read WAKE acknowledges the batch present
   const read = await f.bridge.read(friday, { messageId: wake.id });
   assert.deepEqual(ids(read.syncBatches), [[a.id]]);
   assert.deepEqual((await f.bridge.read(friday, { messageId: wake.id })).syncBatches, read.syncBatches, 're-read is stable');
-  const done = await f.handle(friday, wake.id);
+  const done = await f.handle(friday, wake.id, read.syncBatches.map(b => b.messageId));
   assert.deepEqual(done.syncBatchesAcked, [read.syncBatches[0].messageId]);
   assert.equal(f.snapshot().receipts[a.id].state, 'complete');
   assert.equal(f.snapshot().receipts[read.syncBatches[0].messageId].viaMessage, wake.id);
@@ -350,14 +351,55 @@ test('piggyback on WAKE: completing the read WAKE acknowledges the batch present
   assert.deepEqual((await f.bridge.flushSync()).results, [], 'nothing is flushed again');
 });
 
-test('a WAKE completed without being read does not acknowledge its batch; the inbox read replays it', async () => {
+test('completing a WAKE acknowledges no batch it does not name, and rejects names it was never shown', async () => {
   const f = await fixture();
   const a = f.sync(); await f.send(a);
   const wake = f.message(); await f.send(wake);
-  const done = await f.handle(friday, wake.id);
+  const attached = f.snapshot().messages[wake.id].syncBatchIds[0];
+  // Never read: the attached batch was never presented, so naming it is refused and nothing changes.
+  const claim = await f.bridge.claim(friday, { messageId: wake.id });
+  for (const syncBatchIds of [[attached], [randomUUID()]]) {
+    await assert.rejects(f.bridge.complete(friday, { messageId: wake.id, claimId: claim.claimId, hostedEventId: null,
+      hostedTurnId: null, syncBatchIds }), /sync_batch_not_presented/);
+  }
+  await assert.rejects(f.bridge.complete(friday, { messageId: wake.id, claimId: claim.claimId, hostedEventId: null,
+    hostedTurnId: null, syncBatchIds: 'all' }), /invalid_params/);
+  assert.equal(f.snapshot().receipts[wake.id].state, 'claimed');
+  // Completing without naming batches (an unchanged receiver) acknowledges none.
+  const done = await f.bridge.complete(friday, { messageId: wake.id, claimId: claim.claimId, hostedEventId: null, hostedTurnId: null });
   assert.equal(done.syncBatchesAcked, undefined);
   assert.equal(f.snapshot().receipts[a.id], undefined);
   assert.deepEqual(ids((await f.bridge.inboxRead(friday)).syncBatches), [[a.id]]);
+});
+
+test('race: a batch shown to reader B during reader A\'s claim is not acknowledged by A\'s completion', async () => {
+  const f = await fixture();
+  const p = f.sync('jarvis', { subject: 'P' }); await f.send(p);
+  const wake = f.message(); await f.send(wake); // P rides the WAKE
+  // Reader A reads W, then claims it (the fence) and starts handling.
+  const readA = await f.bridge.read(friday, { messageId: wake.id });
+  assert.deepEqual(ids(readA.syncBatches), [[p.id]]);
+  const claimA = await f.bridge.claim(friday, { messageId: wake.id });
+  // New SYNC data X arrives; reader B reads W during A's claim and is shown X, then loses the response.
+  const x = f.sync('jarvis', { subject: 'X' }); await f.send(x);
+  const readB = await f.bridge.read(friday, { messageId: wake.id });
+  assert.deepEqual(ids(readB.syncBatches), [[p.id], [x.id]]);
+  const batchX = readB.syncBatches[1].messageId;
+  // A completes with exactly what A saw.
+  const doneA = await f.bridge.complete(friday, { messageId: wake.id, claimId: claimA.claimId, hostedEventId: null,
+    hostedTurnId: null, syncBatchIds: readA.syncBatches.map(b => b.messageId) });
+  assert.deepEqual(doneA.syncBatchesAcked, [readA.syncBatches[0].messageId]);
+  assert.equal(f.snapshot().receipts[p.id].state, 'complete');
+  assert.equal(f.snapshot().receipts[x.id], undefined, 'X was never handled by A');
+  assert.equal(f.snapshot().receipts[batchX], undefined);
+  assert.equal((await f.bridge.status(jarvis, { messageId: batchX })).syncBatch.acknowledged, false);
+  // X stays deliverable and is acknowledged by its own claim.
+  const replay = await f.bridge.inboxRead(friday);
+  assert.deepEqual(replay.syncBatches.map(b => b.messageId), [batchX]);
+  const doneX = await f.handle(friday, batchX);
+  assert.equal(doneX.completed, true);
+  assert.equal(f.snapshot().receipts[x.id].state, 'complete');
+  assert.deepEqual((await f.bridge.inboxRead(friday)).syncBatches, []);
 });
 
 test('bridge_read drains pending SYNC into a batch attached to an open message only', async () => {
@@ -367,7 +409,7 @@ test('bridge_read drains pending SYNC into a batch attached to an open message o
   const read = await f.bridge.read(friday, { messageId: wake.id });
   assert.deepEqual(read.syncBatches.map(b => [b.reason, b.items.map(i => i.messageId)]), [['read', [a.id]]]);
   assert.deepEqual(await f.bridge.read(friday, { messageId: wake.id }), read);
-  await f.handle(friday, wake.id);
+  await f.handle(friday, wake.id, read.syncBatches.map(b => b.messageId));
   const b = f.sync(); await f.send(b);
   const later = await f.bridge.read(friday, { messageId: wake.id });
   assert.deepEqual(ids(later.syncBatches), [[a.id]], 'a completed message collects nothing new');
@@ -456,10 +498,12 @@ test('repository wiring: no Vercel cron; the GitHub Actions hourly trigger POSTs
   assert.equal(config.crons, undefined, 'Hobby plans reject hourly Vercel crons');
   const workflow = readFileSync(new URL('../.github/workflows/bridge-cron-flush.yml', import.meta.url), 'utf8');
   for (const line of ["- cron: '0 * * * *'", 'workflow_dispatch:', 'permissions: {}', 'timeout-minutes: 5',
-    'group: bridge-cron-flush', 'secrets.CRON_SECRET', 'vars.BRIDGE_CRON_URL', '--fail-with-body', '--request POST']) {
+    'group: bridge-cron-flush', 'secrets.CRON_SECRET', 'vars.BRIDGE_CRON_URL', '--fail-with-body', '--request POST',
+    'echo "::error::Bridge SYNC flush is not configured', 'exit 1']) {
     assert.ok(workflow.includes(line), line);
   }
   assert.equal(/^\s*-?\s*uses:/m.test(workflow), false, 'no third-party actions');
+  assert.equal(/exit 0/.test(workflow), false, 'a missing secret or URL never passes silently');
   for (const name of ['BRIDGE_PUBLIC_ORIGIN', 'BRIDGE_PEERS']) assert.equal(workflow.includes(name), false, name);
   const catchAll = new RegExp('^' + config.rewrites[0].source + '$');
   assert.equal(catchAll.test('/api/cron'), false); assert.equal(catchAll.test('/api/queue'), false);
@@ -514,6 +558,9 @@ test('runtime: tool schemas, readiness and inbox tool follow the per-recipient f
     assert.ok(schema.properties[field], field); assert.equal(schema.required.includes(field), false);
   }
   assert.deepEqual(schema.properties.class.enum, ['wake', 'sync']);
+  const complete = fridayTools.find(t => t.name === 'bridge_receipt_complete').inputSchema;
+  assert.equal(complete.properties.syncBatchIds.type, 'array'); assert.equal(complete.required.includes('syncBatchIds'), false);
+  assert.deepEqual(complete.required, ['messageId', 'claimId', 'hostedEventId', 'hostedTurnId']);
   const health = await f.call('friday', 'bridge_health', {});
   assert.deepEqual(health.structuredContent.readiness.wakeSync, { valid: true, recipients: ['friday'], flushScheduleConfigured: true });
   const off = await runtimeFixture({ BRIDGE_WAKE_SYNC_RECIPIENTS: undefined });

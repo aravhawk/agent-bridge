@@ -9,12 +9,16 @@ const idSchema = { type: 'string', format: 'uuid' };
 const object = properties => ({ type: 'object', properties, required: Object.keys(properties), additionalProperties: false });
 const tool = (name, description, inputSchema, readOnly = false) => ({ name, description, inputSchema,
   annotations: { readOnlyHint: readOnly, destructiveHint: false, idempotentHint: true, openWorldHint: false } });
+const completeSchema = object({ messageId: idSchema, claimId: idSchema, hostedEventId: { type: ['string', 'null'], maxLength: 160 },
+  hostedTurnId: { type: ['string', 'null'], maxLength: 160 } });
+completeSchema.properties.syncBatchIds = { type: 'array', items: idSchema, maxItems: 32, uniqueItems: true,
+  description: 'messageIds from syncBatches in your read of this message that you handled. Omit to acknowledge none.' };
 const tools = [
   tool('bridge_health', 'Check authenticated bridge configuration without reading messages, storing state or sending events.', object({}), true),
   tool('bridge_read', 'Read the stored message identified by the native received event. Never use to poll.', object({ messageId: idSchema }), true),
   tool('bridge_receipt_claim', 'Claim this received message for one hosted turn, with a short recovery lease.', object({ messageId: idSchema })),
-  tool('bridge_receipt_complete', 'Complete the claimed receipt and atomically enqueue one ACK for a source message. ACKs are terminal. Supplied host IDs require independent verification.',
-    object({ messageId: idSchema, claimId: idSchema, hostedEventId: { type: ['string', 'null'], maxLength: 160 }, hostedTurnId: { type: ['string', 'null'], maxLength: 160 } })),
+  tool('bridge_receipt_complete', 'Complete the claimed receipt and atomically enqueue one ACK for a source message. ACKs are terminal. Supplied host IDs require independent verification. Optional syncBatchIds acknowledges the SYNC batches your own read returned with this message (and that you handled); unnamed batches stay outstanding.',
+    completeSchema),
   tool('bridge_status', 'Inspect one known message during an explicit diagnostic. HTTP receipt alone never verifies wake.', object({ messageId: idSchema }), true),
 ];
 const sendSchema = object({ protocol: { const: MESSAGE_PROTOCOL }, id: idSchema, from: { enum: [...PEER_IDS] },
@@ -180,7 +184,7 @@ export function createMcpHandler({ enabled = false, verify, bridge, events, sche
         // Allowlisted key SHAPES only: no arbitrary key names, parameter values,
         // identity, authorization headers or other request contents can escape.
         const names = ['jsonrpc', 'id', 'method', 'params', 'name', 'arguments', '_meta', 'progressToken',
-          'messageId', 'claimId', 'hostedEventId', 'hostedTurnId', 'recipient', 'cursor', 'ttlMs'];
+          'messageId', 'claimId', 'hostedEventId', 'hostedTurnId', 'syncBatchIds', 'recipient', 'cursor', 'ttlMs'];
         const shape = value => value && typeof value === 'object' && !Array.isArray(value)
           ? Object.keys(value).slice(0, 16).map(k => names.includes(k) ? k : '[other]') : ['[not_object]'];
         const params = input.params;

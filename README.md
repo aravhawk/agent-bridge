@@ -215,10 +215,12 @@ by clearing it), that recipient gets:
   window. A batch is an ordinary `status` message, so its wake payload is
   unchanged; `bridge_read` adds a `syncBatches` field with each item.
 - **Nothing lost.** A batch is replayed by `bridge_inbox_read` until the
-  recipient acknowledges it (claim and complete it, or complete the WAKE it
-  came with) after its items were presented; expired items are still
-  delivered, flagged late. The receiver contract is in
-  [inbox policy](docs/inbox-policy.md#flagged-receiver-contract).
+  recipient acknowledges it after its items were presented: by claiming and
+  completing the batch, or by completing the WAKE it came with while naming the
+  batch in `syncBatchIds` (only batches from that receiver's own read are
+  acknowledged). Expired items are still delivered, flagged late. Receivers
+  read, claim, handle, then complete; see the
+  [receiver contract](docs/inbox-policy.md#flagged-receiver-contract).
 
 The flush is triggered hourly by the GitHub Actions workflow
 `.github/workflows/bridge-cron-flush.yml` (Vercel Hobby only allows daily
@@ -236,9 +238,14 @@ roll out, in this order:
    [flagged receiver contract](docs/inbox-policy.md#flagged-receiver-contract),
    then set `BRIDGE_WAKE_SYNC_RECIPIENTS=friday` in Vercel and redeploy.
 
-Until the secret and variable exist the workflow skips without failing. Roll
-back by clearing `BRIDGE_WAKE_SYNC_RECIPIENTS`. Details:
-[configuration](docs/configuration.md#wakesync-delivery-classes-default-off).
+Until the secret and the variable exist (non-empty) every workflow run fails
+with an error, so configure them before this workflow reaches the default
+branch; non-2xx responses also fail the run. To roll back, first drain: with
+the flag still set, have the recipient call `bridge_inbox_read` and claim,
+handle and complete every batch until it returns no batches; then clear
+`BRIDGE_WAKE_SYNC_RECIPIENTS`, redeploy, and only then switch back to a legacy
+receiver. Details:
+[configuration](docs/configuration.md#rollout-and-rollback).
 
 ## Limitations
 
