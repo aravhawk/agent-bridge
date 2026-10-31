@@ -945,10 +945,16 @@ test('repository wiring: no Vercel cron; the GitHub Actions hourly trigger POSTs
 async function runtimeFixture(changes = {}, at = start) {
   let document = emptyState(), now = at, consumer;
   const sends = [], posts = [];
+  // Fault injection: faults.send(args) / faults.update() returning true makes
+  // that queue publish or that storage commit fail (the commit is not applied).
+  const faults = { send: null, update: null };
   const { publicKey, privateKey } = await generateKeyPair('RS256');
   class Pool { on() {} async connect() { return { release() {}, async query(sql, params) {
     if (sql.startsWith('SELECT document')) return { rows: [{ document: structuredClone(document) }] };
-    if (sql.startsWith('UPDATE bridge_runtime_v1')) document = JSON.parse(params[0]);
+    if (sql.startsWith('UPDATE bridge_runtime_v1')) {
+      if (faults.update?.()) throw Error('FIXTURE_STORAGE_FAULT');
+      document = JSON.parse(params[0]);
+    }
     return { rows: [] };
   } }; } }
   const env = { BRIDGE_OAUTH_ISSUER: ISSUER, BRIDGE_OAUTH_CONTRACT_VERIFIED: 'true', BRIDGE_ALLOWED_SUBJECT: 'fixture', BRIDGE_DELIVERY_ENABLED: 'true',
@@ -958,7 +964,8 @@ async function runtimeFixture(changes = {}, at = start) {
     FRIDAY_RECEIVER_ID: 'jarvis-friday-bridge-inbox', FRIDAY_WEBHOOK_URL: 'https://receiver.example.test/event', FRIDAY_WEBHOOK_KEY: 'FIXTURE_ONLY',
     BRIDGE_WAKE_SYNC_RECIPIENTS: 'friday', CRON_SECRET: 'fixture-cron-secret-value', ...changes };
   const rt = createRuntime({ env, Pool, keyResolver: publicKey, clock: () => now,
-    queueClient: { async send(...args) { sends.push(args); }, handleCallback(fn) { consumer = fn; return fn; } },
+    queueClient: { async send(...args) { if (faults.send?.(args)) throw Error('FIXTURE_QUEUE_FAULT'); sends.push(args); },
+      handleCallback(fn) { consumer = fn; return fn; } },
     transportFactory: () => async (_url, req) => { const body = JSON.parse(req.body); posts.push(body);
       return { status: 200, body: JSON.stringify({ challenge: body.challenge }) }; } });
   const tokens = {};
@@ -972,7 +979,7 @@ async function runtimeFixture(changes = {}, at = start) {
   const cron = (headers = {}, method = 'POST') => rt.cronHandler()(new Request('https://deployment.example.test/api/cron', { method, headers }));
   await rpc('jarvis', 'events/subscribe', { name: EVENT_NAME, arguments: { recipient: 'jarvis' }, ttlMs: null,
     delivery: { mode: 'webhook', url: 'https://callback.example.test/events', secret: 'whsec_' + randomBytes(32).toString('base64') } });
-  return { rt, env, rpc, call, cron, sends, posts, document: () => document, set: ms => { now = ms; },
+  return { rt, env, rpc, call, cron, sends, posts, faults, document: () => document, set: ms => { now = ms; },
     async consume(payload) { rt.queueHandler(); return consumer(payload, { topicName: TOPIC, region: 'iad1', deliveryCount: 1 }); },
     message: (extra = {}) => ({ protocol: MESSAGE_PROTOCOL, id: randomUUID(), from: 'jarvis', to: 'friday', kind: 'status', sentAt: iso(now),
       expiresAt: iso(now + 6 * HOUR), threadId: randomUUID(), route: 'inbox', text: 'Fixture runtime status', class: 'sync', ...extra }) };
@@ -1092,4 +1099,96 @@ test('runtime: an item claim redirect reaches the receiver as tool-error fields 
   assert.deepEqual(done.syncBatchesAcked, [batch]);
   assert.equal((await f.call('friday', 'bridge_receipt_claim', { messageId: x.id })).structuredContent.duplicate, true,
     'a handled item reports its completed receipt');
+});
+
+// --- Flush trigger: unpublished dispatch must be a retryable failure ---------
+const dispatchIds = f => f.sends.map(args => args[1].dispatchMessageId).filter(Boolean);
+const batchIdsOf = f => Object.values(f.document().messages).filter(m => m.syncBatch).map(m => m.envelope.id);
+test('runtime cron: a queue outage after the flush commits is HTTP 503 until the same batch is published', async () => {
+  const f = await runtimeFixture();
+  const x = f.message({ subject: 'X' });
+  assert.equal((await f.call('jarvis', 'bridge_message_send', x)).structuredContent.delivery, 'batched');
+  f.set(noon + 5000);
+  f.faults.send = () => true; // queue down after admission
+  const failed = await f.cron(auth);
+  assert.equal(failed.status, 503, 'retryable: the workflow curl retries and the run fails if it persists');
+  assert.deepEqual(await failed.json(), { status: 'dispatch_pending', boundary: iso(noon), flushed: 1, capped: 0,
+    redeliveredNative: 0, dispatched: 0, dispatchPending: 1 });
+  const [batch] = batchIdsOf(f);
+  assert.deepEqual(f.document().syncQueues.friday.undispatched, [batch], 'committed batch kept for publication');
+  assert.equal(f.document().syncQueues.friday.flushCount, 1);
+  // Still down on the curl retry: same batch, no re-cut, no extra cap slot.
+  assert.equal((await f.cron(auth)).status, 503);
+  // Queue recovers: the retry publishes the same batch once.
+  f.faults.send = null;
+  const ok = await f.cron(auth);
+  assert.equal(ok.status, 200);
+  assert.deepEqual(await ok.json(), { status: 'ok', boundary: iso(noon), flushed: 0, capped: 0, redeliveredNative: 0,
+    dispatched: 1, dispatchPending: 0 });
+  assert.deepEqual(batchIdsOf(f), [batch]); assert.equal(f.document().syncQueues.friday.flushCount, 1);
+  assert.deepEqual(f.document().syncQueues.friday.undispatched, []);
+  const payload = f.sends.map(args => args[1]).find(p => p.dispatchMessageId === batch);
+  await f.consume(payload);
+  assert.deepEqual(f.posts.filter(p => p.event === EVENT_NAME), [{ event: EVENT_NAME, data: { messageId: batch } }]);
+  assert.equal((await f.cron(auth)).status, 200, 'nothing left to publish');
+});
+
+test('runtime cron: partial publication marks what was published and is still a retryable 503', async () => {
+  const f = await runtimeFixture({ BRIDGE_WAKE_SYNC_RECIPIENTS: 'friday,jarvis' });
+  await f.call('jarvis', 'bridge_message_send', f.message({ subject: 'to friday' }));
+  await f.call('friday', 'bridge_message_send', f.message({ from: 'friday', to: 'jarvis', subject: 'to jarvis' }));
+  f.set(noon + 5000);
+  const toFriday = args => { const id = args[1].dispatchMessageId || args[1].cleanupMessageId; return f.document().messages[id]?.envelope.to === 'friday'; };
+  f.faults.send = toFriday;
+  const partial = await f.cron(auth);
+  assert.equal(partial.status, 503);
+  assert.deepEqual(await partial.json(), { status: 'dispatch_pending', boundary: iso(noon), flushed: 2, capped: 0,
+    redeliveredNative: 0, dispatched: 1, dispatchPending: 1 });
+  const queues = f.document().syncQueues;
+  assert.equal(queues.jarvis.undispatched.length, 0, 'the published batch is marked');
+  assert.equal(queues.friday.undispatched.length, 1, 'the unpublished batch is kept');
+  f.faults.send = null;
+  const ok = await f.cron(auth);
+  assert.equal(ok.status, 200); assert.deepEqual(await ok.json(), { ...idle(iso(noon)), dispatched: 1 });
+  assert.equal(batchIdsOf(f).length, 2, 'no re-cut');
+  assert.deepEqual([queues.friday.flushCount, queues.jarvis.flushCount], [1, 1]);
+  assert.deepEqual([f.document().syncQueues.friday.flushCount, f.document().syncQueues.jarvis.flushCount], [1, 1]);
+  assert.equal(new Set(dispatchIds(f)).size, dispatchIds(f).length, 'each batch published once');
+});
+
+test('runtime cron: a failed dispatch bookkeeping write is a 503; the retry republishes harmlessly and wakes once', async () => {
+  const f = await runtimeFixture();
+  await f.call('jarvis', 'bridge_message_send', f.message({ subject: 'X' }));
+  f.set(noon + 5000);
+  let updates = 0;
+  f.faults.update = () => ++updates === 2; // 1st commit = flush, 2nd = marking it published
+  const unconfirmed = await f.cron(auth);
+  assert.equal(unconfirmed.status, 503);
+  assert.deepEqual(await unconfirmed.json(), { status: 'dispatch_unconfirmed', boundary: iso(noon), flushed: 1, capped: 0,
+    redeliveredNative: 0, dispatched: 1, dispatchPending: 1 });
+  const [batch] = batchIdsOf(f);
+  assert.deepEqual(f.document().syncQueues.friday.undispatched, [batch], 'not lost: still offered for publication');
+  f.faults.update = null;
+  assert.equal((await f.cron(auth)).status, 200);
+  assert.deepEqual(dispatchIds(f).filter(id => id === batch).length, 2, 'published again (idempotent dispatch)');
+  for (const payload of f.sends.map(args => args[1]).filter(p => p.dispatchMessageId === batch)) await f.consume(payload);
+  assert.equal(f.posts.filter(p => p.event === EVENT_NAME).length, 1, 'the receiver is woken once');
+  assert.deepEqual(batchIdsOf(f), [batch]);
+});
+
+test('runtime cron: a failed flush commit is a 503 that loses and duplicates nothing', async () => {
+  const f = await runtimeFixture();
+  const x = f.message({ subject: 'X' });
+  await f.call('jarvis', 'bridge_message_send', x);
+  f.set(noon + 5000);
+  const sendsBefore = f.sends.length;
+  f.faults.update = () => true;
+  const failed = await f.cron(auth);
+  assert.equal(failed.status, 503); assert.deepEqual(await failed.json(), { error: 'flush_unavailable' });
+  assert.deepEqual(batchIdsOf(f), []); assert.equal(f.document().messages[x.id].sync.state, 'pending');
+  assert.equal(f.sends.length, sendsBefore, 'nothing published for an uncommitted flush');
+  f.faults.update = null;
+  const ok = await f.cron(auth);
+  assert.equal(ok.status, 200); assert.equal((await ok.json()).flushed, 1);
+  assert.equal(batchIdsOf(f).length, 1);
 });

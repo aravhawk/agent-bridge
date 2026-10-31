@@ -234,7 +234,9 @@ The flush is triggered hourly by the GitHub Actions workflow
 `.github/workflows/bridge-cron-flush.yml` (Vercel Hobby only allows daily
 crons). It POSTs to `/api/cron` with `Authorization: Bearer $CRON_SECRET`; each
 run flushes only what is due (a Chicago even hour has passed, or waiting
-another hour would exceed the 2-hour maximum) and is a 200 no-op otherwise. To
+another hour would exceed the 2-hour maximum) and is a 200 no-op otherwise; a
+flush or publication it cannot complete is a 503, so the workflow retries and
+then fails visibly rather than reporting success. To
 roll out, in this order:
 
 1. Set `CRON_SECRET` (16+ random characters, e.g. `openssl rand -hex 32`) in

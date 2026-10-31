@@ -237,8 +237,10 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
     // Hourly scheduled trigger (GitHub Actions POST, or any GET/POST caller with
     // `Authorization: Bearer $CRON_SECRET`). Each run flushes a recipient only
     // when due (see flushDue: America/Chicago even hour, the 2h elapsed maximum,
-    // or expiry); otherwise it is a 200 no-op. Without CRON_SECRET the route
-    // stays closed. No request input besides the bearer is used.
+    // or expiry); otherwise it is a 200 no-op. A flush that cannot commit, or
+    // a committed batch that cannot be published or recorded as published, is
+    // a 503 so the caller retries. Without CRON_SECRET the route stays closed.
+    // No request input besides the bearer is used.
     cronHandler() {
       const reply = (body, status = 200) => Response.json(body, { status, headers: { 'cache-control': 'no-store' } });
       return async request => {
@@ -249,16 +251,30 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
         if (actual.length !== wanted.length || !timingSafeEqual(actual, wanted)) return reply({ error: 'unauthorized' }, 401);
         if (!readiness().deliveryEnabled) return reply({ status: 'skipped', reason: 'delivery_not_enabled' });
         configure();
-        const { boundary, results, dispatch } = await bridge.flushSync();
+        let flush;
+        // An uncommitted flush changed nothing: retryable, nothing to publish.
+        try { flush = await bridge.flushSync(); } catch { return reply({ error: 'flush_unavailable' }, 503); }
+        const { boundary, results, dispatch } = flush;
         const published = [];
-        // Publish after commit; anything unpublished is re-offered by the next run
-        // (including the workflow's curl retries of this one).
-        for (const id of dispatch) { try { await queue.prepareMessage(id); published.push(id); } catch { /* retried next run */ } }
-        if (published.length) await bridge.markSyncDispatched(published);
-        return reply({ status: 'ok', boundary: new Date(boundary).toISOString(),
+        // Publish after commit. Committed batch IDs stay in the queue's
+        // undispatched list until a publication is recorded, so a retry of
+        // this request re-offers exactly those IDs: no re-cut and no extra
+        // daily-cap slot. Republishing one already published is harmless
+        // (dispatch runs each job's idempotent worker; an accepted job is not
+        // sent again).
+        for (const id of dispatch) { try { await queue.prepareMessage(id); published.push(id); } catch { /* reported below */ } }
+        let recorded = 0, unconfirmed = false;
+        if (published.length) {
+          try { await bridge.markSyncDispatched(published); recorded = published.length; } catch { unconfirmed = true; }
+        }
+        const dispatchPending = dispatch.length - recorded;
+        // Anything still unpublished (or not recorded as published) is a
+        // retryable 503, so the trigger's retries and failure reporting apply.
+        return reply({ status: !dispatchPending ? 'ok' : unconfirmed ? 'dispatch_unconfirmed' : 'dispatch_pending',
+          boundary: new Date(boundary).toISOString(),
           flushed: results.filter(r => r.outcome === 'flushed').length, capped: results.filter(r => r.outcome === 'daily_cap').length,
           redeliveredNative: results.filter(r => r.outcome === 'native').reduce((n, r) => n + r.items, 0),
-          dispatched: published.length, dispatchPending: dispatch.length - published.length });
+          dispatched: published.length, dispatchPending }, dispatchPending ? 503 : 200);
       };
     },
     async close() { await pool?.end(); },

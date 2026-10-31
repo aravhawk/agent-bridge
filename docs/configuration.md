@@ -327,7 +327,25 @@ fall-back day, which can need one more to keep every item within 2 hours
 when runs are on time. A
 capped recipient's items stay pending (held, delivered with the next WAKE,
 inbox read or the next day's first run). Batches are published to the queue
-after the flush commits; anything unpublished is re-offered by the next run.
+after the flush commits, and a run reports `200` only when everything due is
+published and recorded as published. Otherwise it answers `503`, so the
+workflow's curl retries and, if the outage persists, the run fails visibly:
+
+- `{"error":"flush_unavailable"}`: the flush could not be committed; nothing
+  changed and nothing was published.
+- `"status":"dispatch_pending"`: some committed batches (or native rollback
+  re-sends) could not be published; `dispatched` counts those that were,
+  `dispatchPending` those still waiting.
+- `"status":"dispatch_unconfirmed"`: publication happened but could not be
+  recorded; those IDs are offered again.
+
+Committed batches are never lost or re-cut: a retry, or the next run,
+publishes exactly the IDs still waiting, without using another daily-cap
+slot. Publishing an already-published batch again is harmless, because
+dispatch runs each job's idempotent worker and an accepted job is not sent
+again. A persistent queue outage still delays delivery until the queue
+recovers, which is part of the scheduling blocker (see
+[owner rollout blockers](#owner-rollout-blockers-unresolved)).
 Queued SYNC items stay deliverable after the sender's access token expires
 (a FYI must survive until it is flushed), but a policy change or durable
 denial still withdraws them.
