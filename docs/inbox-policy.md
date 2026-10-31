@@ -80,7 +80,8 @@ separately by the owner's independently authorized workflow (rule 4 below),
 exactly as for any inbox message.
 
 **One fence per batch.** A SYNC batch reaches you either *attached* to another
-message (a WAKE, or a message whose read collected pending data) or *directly*
+message (a WAKE, a message whose read collected pending data, or a later flush
+batch that took over a batch whose WAKE could not deliver it) or *directly*
 (its own webhook, or `bridge_inbox_read`). Both paths share the batch's single
 claim record, so only one claim at a time may handle a batch: claiming a
 message also claims its attached batches unless another live claim already

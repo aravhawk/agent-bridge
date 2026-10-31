@@ -107,7 +107,8 @@ function syncStatus(message) {
     deliveredAt: new Date(s.deliveredAt).toISOString() } : {}), ...(s.batchId ? { batchMessageId: s.batchId } : {}),
     ...(s.redeliveries ? { redeliveries: s.redeliveries } : {}), ...(s.supersededBy ? { supersededBy: s.supersededBy } : {}) } } : {}),
     ...(b ? { syncBatch: { reason: b.reason, ...(b.trigger ? { trigger: b.trigger } : {}), itemCount: b.itemIds.length,
-      presented: !!b.presentedAt, acknowledged: !!b.ackedAt, reclaimed: !!b.reclaimedAt } } : {}),
+      presented: !!b.presentedAt, acknowledged: !!b.ackedAt, reclaimed: !!b.reclaimedAt,
+      ...(b.rehomedTo ? { rehomedTo: b.rehomedTo } : {}) } } : {}),
     ...(message.syncBatchIds ? { piggybackedBatchIds: [...message.syncBatchIds] } : {}) };
 }
 

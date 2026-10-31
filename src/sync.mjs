@@ -388,8 +388,28 @@ export function ackBatch(state, batchId, principal, now, evidence) {
   return true;
 }
 
+// Stranded piggyback batches: carried by another message (no delivery jobs of
+// their own), never presented, not acknowledged, reclaimed or re-homed, and
+// whose carrier can no longer get them read: the carrier's v1 authority lapsed
+// or it was withdrawn, all its delivery jobs are dead, it was completed without
+// the batch being presented, it is gone, or it has gone unread for the 2-hour
+// wait. Such a batch keeps its identity and its single shared claim record;
+// flushDue only gives it a new carrier. A carrier read in time keeps it.
+function strandedBatches(state, recipient, policyIds, now) {
+  return batches(state, recipient).filter(batch => {
+    const b = batch.syncBatch;
+    if (batch.jobIds.length || b.presentedAt || b.ackedAt || b.reclaimedAt || b.rehomedTo) return false;
+    const carrier = Object.values(state.messages).find(m => m !== batch && m.syncBatchIds?.includes(batch.envelope.id));
+    if (!carrier || now - b.createdAt >= WAKE_WINDOW_MS) return true;
+    const dead = carrier.jobIds.length > 0 && carrier.jobIds.every(id => !state.jobs[id] || state.jobs[id].state === 'dead');
+    return dead || state.receipts[carrier.envelope.id]?.state === 'complete' ||
+      !messageAccessAllowed(state, carrier, policyIds, now);
+  });
+}
+const strandedItems = (state, stranded) => stranded.flatMap(batch => batch.syncBatch.itemIds.map(id => state.messages[id]).filter(Boolean));
+
 // Hourly flush (any hour; the trigger runs at :00 UTC). Per recipient with
-// pending items, flush one batch when:
+// pending items or stranded piggyback batches, flush one batch when:
 //   scheduled - an America/Chicago even-hour boundary has passed since the last
 //               flush with items queued before it (late runs still deliver);
 //   max_wait  - waiting for the next hourly run would push the oldest pending
@@ -398,7 +418,10 @@ export function ackBatch(state, batchId, principal, now, evidence) {
 // Otherwise the run is a no-op; empty queues send nothing. At most
 // dailyFlushCap(day) batch wakes per recipient per Chicago day. A recipient no
 // longer enabled (rollback) gets its leftovers re-sent under their own message
-// IDs where their v1 authority still allows, otherwise in one batch.
+// IDs where their v1 authority still allows, otherwise in one batch. Stranded
+// piggyback batches count as due data: they ride the flush batch (attached,
+// as with a WAKE), or, with nothing else due, the oldest one is delivered on
+// its own; either way one wake and one daily-cap slot.
 export function flushDue(state, now, { policyIds, recipients = [] }) {
   const boundary = latestFlushBoundary(now), nextRun = Math.floor(now / HOUR) * HOUR + HOUR;
   const day = chicagoDate(now), results = [];
@@ -406,7 +429,8 @@ export function flushDue(state, now, { policyIds, recipients = [] }) {
     const queue = queueOf(state, recipient);
     if (!queue) continue;
     let live = livePending(state, recipient, policyIds, now);
-    if (!live.length) continue;
+    const stranded = strandedBatches(state, recipient, policyIds, now);
+    if (!live.length && !stranded.length) continue;
     let reason;
     if (!recipients.includes(recipient)) {
       const native = [];
@@ -421,25 +445,39 @@ export function flushDue(state, now, { policyIds, recipients = [] }) {
       }
       if (native.length) { (queue.undispatched ||= []).push(...native); results.push({ recipient, outcome: 'native', items: native.length }); }
       live = live.filter(item => !native.includes(item.envelope.id));
-      if (!live.length) continue;
+      if (!live.length && !stranded.length) continue;
       reason = 'rollback';
     } else {
-      const oldest = Math.min(...live.map(m => m.sync.queuedAt));
+      const due = [...live, ...strandedItems(state, stranded)];
+      const oldest = Math.min(...due.map(m => m.sync?.queuedAt ?? m.storedAt));
       reason = boundary > (queue.lastFlushBoundary ?? -Infinity) && oldest < boundary ? 'scheduled'
         : nextRun > oldest + WAKE_WINDOW_MS ? 'max_wait'
-          : live.some(m => Date.parse(m.envelope.expiresAt) <= nextRun + SCHEDULER_SLACK_MS) ? 'expiring' : null;
+          : due.some(m => Date.parse(m.envelope.expiresAt) <= nextRun + SCHEDULER_SLACK_MS) ? 'expiring' : null;
       if (!reason) continue;
       if (queue.flushDay !== day) { queue.flushDay = day; queue.flushCount = 0; }
       if (queue.flushCount >= dailyFlushCap(day)) { results.push({ recipient, outcome: 'daily_cap' }); continue; }
     }
-    const batch = cutBatch(state, recipient, now, { reason: 'flush', policyIds, deliver: true });
+    let batch = live.length ? cutBatch(state, recipient, now, { reason: 'flush', policyIds, deliver: true }) : null;
+    let carried = stranded;
+    if (!live.length) {
+      // Nothing new: the oldest stranded batch is delivered on its own and
+      // carries any others.
+      const jobIds = appendDeliveryJobs(state, stranded[0].envelope, now);
+      if (jobIds.length) { batch = stranded[0]; batch.jobIds = jobIds; carried = stranded.slice(1); }
+    }
     // No active destination: keep items pending (held past retention) and retry next run.
     if (!batch) { results.push({ recipient, outcome: 'no_destination' }); continue; }
+    for (const other of carried) {
+      (batch.syncBatchIds ||= []).push(other.envelope.id);
+      Object.assign(other.syncBatch, { rehomedTo: batch.envelope.id, rehomedAt: now });
+    }
+    if (batch === stranded[0]) Object.assign(batch.syncBatch, { rehomedTo: batch.envelope.id, rehomedAt: now });
     batch.syncBatch.trigger = reason;
     queue.lastFlushBoundary = boundary;
     if (reason !== 'rollback') queue.flushCount++;
     (queue.undispatched ||= []).push(batch.envelope.id);
-    results.push({ recipient, outcome: 'flushed', reason, items: batch.syncBatch.itemIds.length });
+    results.push({ recipient, outcome: 'flushed', reason, items: live.length ? batch.syncBatch.itemIds.length : 0,
+      ...(stranded.length ? { rehomedBatches: stranded.length } : {}) });
   }
   const dispatch = PEER_IDS.flatMap(recipient => {
     const queue = queueOf(state, recipient);

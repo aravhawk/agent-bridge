@@ -254,6 +254,19 @@ For an enabled recipient:
   Only an acknowledged batch marks its items handled.
   A batch still unacknowledged after 12 hours is retired and its unhandled
   items are queued again.
+- **Carrier fallback.** A batch piggybacked on a WAKE has no delivery of its
+  own. If that carrier can no longer get it read before the batch is
+  presented (the carrier's authority lapsed or was withdrawn, all its delivery
+  jobs died, it was completed without the batch, or it stayed unread for the
+  2-hour wait), the batch counts as due data for the flush: at the next due
+  run it rides the flush batch as an attached batch, or, with nothing else
+  due, is delivered on its own. It keeps its ID and its single claim record
+  (the old carrier and the new one share that fence), costs the same one wake
+  and one daily-cap slot as any flush, and is re-homed only once, so repeated
+  or concurrent runs re-offer the same publication. A batch already read
+  through its carrier, or held by that carrier's claim, is never re-homed.
+  Capped or destination-less runs leave it waiting; with the flag off it is
+  delivered on the next run. `bridge_status` on the batch shows `rehomedTo`.
 - **Nothing is silently dropped.** Items whose own `expiresAt` passes while
   queued or re-queued are still delivered, flagged `expired` and `late`.
   Pending items, items in unacknowledged batches and items re-sent natively

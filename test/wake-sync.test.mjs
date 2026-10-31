@@ -1238,3 +1238,204 @@ test('runtime cron: a lost COMMIT response while recording publication is a 503 
   for (const payload of f.sends.map(args => args[1]).filter(p => p.dispatchMessageId === batch)) await f.consume(payload);
   assert.equal(f.posts.filter(p => p.event === EVENT_NAME).length, 1);
 });
+
+// --- Unread piggyback batches whose carrier cannot deliver them -------------
+test('carrier loss (repro): an unread piggyback batch whose WAKE cannot be delivered goes out at the next due flush', async () => {
+  const f = await fixture();
+  const x = f.sync('jarvis', { subject: 'carrier-loss' }); await f.send(x);
+  const w = f.message(); await f.send(w, who('jarvis', start + 30000));
+  const batch = f.snapshot().messages[w.id].syncBatchIds[0];
+  assert.deepEqual(f.snapshot().messages[batch].jobIds, []);
+  f.advance(60000);
+  await assert.rejects(f.bridge.claim(friday, { messageId: w.id }), /message_authorization_inactive/);
+  f.set(noon + 5000);
+  const out = await f.bridge.flushSync();
+  assert.ok(out.dispatch.includes(batch), 'the same batch is dispatched on its own');
+  assert.deepEqual(out.results, [{ recipient: 'friday', outcome: 'flushed', reason: 'scheduled', items: 0, rehomedBatches: 1 }]);
+  assert.equal(f.snapshot().messages[batch].jobIds.length, 1);
+  assert.deepEqual(JSON.parse(jobsFor(f.snapshot(), batch)[0].body), { event: EVENT_NAME, data: { messageId: batch } });
+  // The receiver handles it directly, like any batch.
+  assert.deepEqual((await f.receive(batch)).syncBatchesAcked, [batch]);
+  assert.equal(f.snapshot().receipts[x.id].viaBatch, batch);
+  assert.equal(f.snapshot().syncQueues.friday.flushCount, 1);
+});
+
+// Carrier W (sent 11:30 CDT, valid until 12:30) whose webhook jobs all died,
+// with an unread batch B on it. The next due flush is 12:00.
+async function deadCarrier(extra = {}) {
+  const f = await fixture(extra);
+  f.set(start + HOUR);
+  const x = f.sync('jarvis', { subject: 'X' }); await f.send(x);
+  const w = f.message(); await f.send(w);
+  const batch = f.snapshot().messages[w.id].syncBatchIds[0];
+  await f.store.transaction(s => { for (const id of s.messages[w.id].jobIds) s.jobs[id].state = 'dead'; });
+  return { f, x, w, batch };
+}
+
+test('carrier loss: with new data due, the flush batch carries the stranded batch (one wake, batch identity kept)', async () => {
+  const { f, x, batch } = await deadCarrier();
+  const y = f.sync('jarvis', { subject: 'Y' }); await f.send(y);
+  f.set(noon + 5000);
+  const out = await f.bridge.flushSync();
+  assert.deepEqual(out.results, [{ recipient: 'friday', outcome: 'flushed', reason: 'scheduled', items: 1, rehomedBatches: 1 }]);
+  assert.equal(out.dispatch.length, 1, 'one webhook');
+  const carrier = out.dispatch[0];
+  assert.notEqual(carrier, batch); assert.deepEqual(f.snapshot().messages[batch].jobIds, [], 'B keeps no jobs of its own');
+  const read = await f.bridge.read(friday, { messageId: carrier });
+  assert.deepEqual(ids(read.syncBatches), [[y.id], [x.id]]);
+  const claim = await f.bridge.claim(friday, { messageId: carrier });
+  assert.deepEqual(claim.syncBatchIds, [batch], 'the shared fence holds B for this claim');
+  const done = await f.bridge.complete(friday, { messageId: carrier, claimId: claim.claimId, hostedEventId: null,
+    hostedTurnId: null, syncBatchIds: [carrier, batch] });
+  assert.deepEqual(done.syncBatchesAcked.sort(), [carrier, batch].sort());
+  for (const id of [x.id, y.id]) assert.equal(f.snapshot().receipts[id].state, 'complete');
+  assert.equal(f.snapshot().syncQueues.friday.flushCount, 1);
+});
+
+test('carrier loss: the original carrier and the new one share the batch fence', async () => {
+  const { f, w, batch } = await deadCarrier();
+  f.set(noon + 5000);
+  await f.bridge.flushSync();
+  // W is still readable; reading it presents B, and W's claim takes B first.
+  const readW = await f.bridge.read(friday, { messageId: w.id });
+  assert.deepEqual(readW.syncBatches.map(b => b.messageId), [batch]);
+  const claimW = await f.bridge.claim(friday, { messageId: w.id });
+  assert.deepEqual(claimW.syncBatchIds, [batch]);
+  await assert.rejects(f.bridge.claim(friday, { messageId: batch }), /receipt_busy/);
+  await f.bridge.complete(friday, { messageId: w.id, claimId: claimW.claimId, hostedEventId: null, hostedTurnId: null, syncBatchIds: [batch] });
+  assert.equal((await f.bridge.claim(friday, { messageId: batch })).duplicate, true, 'acknowledged once');
+});
+
+test('carrier loss: a delivered but unread carrier keeps its batch while valid; once it lapses the batch goes out', async () => {
+  const f = await fixture();
+  f.set(start + 30 * MINUTE);
+  const x = f.sync(); await f.send(x);              // 11:00 CDT
+  f.set(start + HOUR);
+  const w = f.message(); await f.send(w);           // 11:30, valid until 12:30
+  const batch = f.snapshot().messages[w.id].syncBatchIds[0];
+  await f.store.transaction(s => { for (const id of s.messages[w.id].jobIds) s.jobs[id].state = 'accepted'; });
+  f.set(noon + 5000); // the woken receiver may still read W: no extra wake
+  assert.deepEqual(await f.bridge.flushSync(), { boundary: noon, results: [], dispatch: [] });
+  f.set(noon + HOUR + 5000); // 13:00: W lapsed unread, B goes out on its own
+  const out = await f.bridge.flushSync();
+  assert.deepEqual(out.dispatch, [batch]);
+  assert.equal(out.results[0].rehomedBatches, 1);
+  // A WAKE lives at most 1 h, so in practice its lapse strands the batch first;
+  // the 2-hour unread rule covers longer-lived carriers.
+});
+
+test('carrier loss: a carrier read in time keeps its batch piggybacked (no extra wake)', async () => {
+  const f = await fixture();
+  const x = f.sync(); await f.send(x);
+  const w = f.message(); await f.send(w, who('jarvis', start + 30000));
+  await f.bridge.read(friday, { messageId: w.id }); // presented before the carrier lapsed
+  f.set(noon + 5000);
+  assert.deepEqual(await f.bridge.flushSync(), { boundary: noon, results: [], dispatch: [] });
+  f.set(noon + 3 * HOUR + 5000);
+  assert.deepEqual((await f.bridge.flushSync()).dispatch, []);
+});
+
+test('carrier loss: daily cap and missing destination keep the stranded batch waiting, then deliver it once', async () => {
+  const { f, batch } = await deadCarrier();
+  await f.store.transaction(s => { Object.assign(s.syncQueues.friday, { flushDay: '2026-10-19', flushCount: SYNC_DAILY_FLUSH_CAP }); });
+  f.set(noon + 5000);
+  assert.deepEqual((await f.bridge.flushSync()).results, [{ recipient: 'friday', outcome: 'daily_cap' }]);
+  assert.deepEqual(f.snapshot().messages[batch].jobIds, []);
+  // The cap lifts (as on the next Chicago day) before the batch's 12 h replay lifetime ends.
+  await f.store.transaction(s => { s.syncQueues.friday.flushDay = '2026-10-18'; });
+  f.set(noon + 2 * HOUR + 5000);
+  const out = await f.bridge.flushSync();
+  assert.deepEqual(out.dispatch, [batch]);
+  await f.bridge.markSyncDispatched(out.dispatch);
+  f.set(noon + 4 * HOUR + 5000);
+  assert.deepEqual((await f.bridge.flushSync()).dispatch, [], 'not rehomed twice');
+  assert.equal(f.snapshot().syncQueues.friday.flushCount, 1);
+  // Events-peer recipient without an active subscription: nothing changes until one exists.
+  const g = await fixture({ recipients: ['jarvis'] });
+  const y = g.sync('friday'); await g.send(y);
+  const wy = g.message('friday'); await g.send(wy, who('friday', start + 30000));
+  const gb = g.snapshot().messages[wy.id].syncBatchIds[0];
+  await g.store.transaction(s => { for (const sub of Object.values(s.subscriptions)) sub.expiresAt = start + 1; });
+  g.set(noon + 5000);
+  assert.deepEqual((await g.bridge.flushSync()).results, [{ recipient: 'jarvis', outcome: 'no_destination' }]);
+  assert.deepEqual(g.snapshot().messages[gb].jobIds, []); assert.equal(g.snapshot().messages[gb].syncBatch.rehomedTo, undefined);
+});
+
+test('carrier loss: repeated flushes in the same hour re-offer the same batch without re-homing or another cap slot', async () => {
+  const { f, batch } = await deadCarrier();
+  f.set(noon + 5000);
+  const first = await f.bridge.flushSync();
+  const again = await f.bridge.flushSync(); // e.g. curl retry after a lost publication
+  assert.deepEqual([first.dispatch, again.dispatch], [[batch], [batch]]);
+  assert.deepEqual(again.results, []);
+  assert.equal(f.snapshot().messages[batch].jobIds.length, 1);
+  assert.equal(f.snapshot().syncQueues.friday.flushCount, 1);
+});
+
+test('carrier loss: two stranded batches plus new data due together cost one wake and one cap slot', async () => {
+  const f = await fixture();
+  f.set(start + HOUR); // 11:30 CDT
+  const strand = async subject => {
+    const x = f.sync('jarvis', { subject }); await f.send(x);
+    const w = f.message(); await f.send(w);
+    await f.store.transaction(s => { for (const id of s.messages[w.id].jobIds) s.jobs[id].state = 'dead'; });
+    return { x, w, batch: f.snapshot().messages[w.id].syncBatchIds[0] };
+  };
+  const one = await strand('one'), two = await strand('two'), held = await strand('held');
+  // A receiver read and claimed the third carrier just before the run: its batch is held through that claim.
+  f.set(noon - 30000);
+  await f.bridge.read(friday, { messageId: held.w.id });
+  const claimHeld = await f.bridge.claim(friday, { messageId: held.w.id });
+  assert.deepEqual(claimHeld.syncBatchIds, [held.batch]);
+  const z = f.sync('jarvis', { subject: 'new' }); await f.send(z); // newly pending at the due run
+  const holdBefore = f.snapshot().receipts[held.batch];
+  const jobsBefore = Object.keys(f.snapshot().jobs).length;
+  f.set(noon + 5000);
+  // Concurrent and retried runs at the same due time.
+  const runs = await Promise.all([f.bridge.flushSync(), f.bridge.flushSync()]);
+  const retry = await f.bridge.flushSync();
+  const flushed = [...runs, retry].flatMap(r => r.results);
+  assert.deepEqual(flushed, [{ recipient: 'friday', outcome: 'flushed', reason: 'scheduled', items: 1, rehomedBatches: 2 }],
+    'scheduled once across all runs');
+  const carrier = runs[0].dispatch[0];
+  for (const r of [...runs, retry]) assert.deepEqual(r.dispatch, [carrier], 'one wake for everything due');
+  assert.equal(Object.keys(f.snapshot().jobs).length, jobsBefore + 1, 'one new delivery job, none per item or per batch');
+  assert.equal(f.snapshot().syncQueues.friday.flushCount, 1, 'same daily-cap accounting as a fresh flush');
+  // Batch identity is reused: the stranded batches ride the flush batch; the held one is untouched.
+  assert.deepEqual([...f.snapshot().messages[carrier].syncBatchIds].sort(), [one.batch, two.batch].sort());
+  for (const b of [one.batch, two.batch]) {
+    assert.deepEqual(f.snapshot().messages[b].jobIds, []); assert.equal(f.snapshot().messages[b].syncBatch.rehomedTo, carrier);
+  }
+  assert.equal(f.snapshot().messages[held.batch].syncBatch.rehomedTo, undefined);
+  assert.deepEqual(f.snapshot().receipts[held.batch], holdBefore, 'the carrier-held receipt is not invalidated');
+  // The new carrier's claim takes the two re-homed batches; the old IDs stay the only claim records for them.
+  const read = await f.bridge.read(friday, { messageId: carrier });
+  assert.deepEqual(read.syncBatches.map(b => b.messageId).sort(), [carrier, one.batch, two.batch].sort());
+  const claim = await f.bridge.claim(friday, { messageId: carrier });
+  assert.deepEqual(claim.syncBatchIds.sort(), [one.batch, two.batch].sort());
+  for (const b of [one.batch, two.batch]) await assert.rejects(f.bridge.claim(friday, { messageId: b }), /receipt_busy/);
+  // The old carrier is still valid and claimable, but it cannot take the batch the new carrier holds.
+  const oldCarrier = await f.bridge.claim(friday, { messageId: one.w.id });
+  assert.deepEqual([oldCarrier.syncBatchIds, oldCarrier.syncBatchesHeldElsewhere], [[], [one.batch]]);
+  const done = await f.bridge.complete(friday, { messageId: carrier, claimId: claim.claimId, hostedEventId: null,
+    hostedTurnId: null, syncBatchIds: [carrier, one.batch, two.batch] });
+  assert.deepEqual(done.syncBatchesAcked.sort(), [carrier, one.batch, two.batch].sort());
+  for (const id of [one.x.id, two.x.id, z.id]) assert.equal(f.snapshot().receipts[id].state, 'complete');
+  // The held batch is still completed through its own carrier's claim.
+  const heldDone = await f.bridge.complete(friday, { messageId: held.w.id, claimId: claimHeld.claimId, hostedEventId: null,
+    hostedTurnId: null, syncBatchIds: [held.batch] });
+  assert.deepEqual(heldDone.syncBatchesAcked, [held.batch]);
+  assert.equal(f.snapshot().receipts[held.x.id].state, 'complete');
+});
+
+test('carrier loss after rollback: a stranded batch is delivered on the next run even with the flag off', async () => {
+  const { f, batch } = await deadCarrier();
+  f.enabled.recipients = [];
+  f.set(start + 30 * MINUTE); // any run
+  const out = await f.bridge.flushSync();
+  assert.deepEqual(out.results, [{ recipient: 'friday', outcome: 'flushed', reason: 'rollback', items: 0, rehomedBatches: 1 }]);
+  assert.deepEqual(out.dispatch, [batch]);
+  // An unchanged receiver reads, claims and completes it as a v1 status message.
+  await f.bridge.read(friday, { messageId: batch });
+  assert.deepEqual((await f.handle(friday, batch)).syncBatchesAcked, [batch]);
+});
