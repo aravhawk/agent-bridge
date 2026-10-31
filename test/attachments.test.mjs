@@ -879,7 +879,9 @@ test('resume: an interrupted download keeps its ordered prefix and resumes with 
 });
 
 test('resume: partial state is bound to the same attachment, message, size, SHA-256 and object version', async () => {
-  const f = await fixture(), bytes = randomBytes(64 * 1024), { a, m, grant } = await sentAttachment(f, bytes);
+  const f = await fixture(), bytes = randomBytes(64 * 1024);
+  bytes[10] = 0x58; // The old constant-'X' corruption was a deterministic no-op for this byte.
+  const { a, m, grant } = await sentAttachment(f, bytes);
   const dir = tmp(), dest = path.join(dir, 'f.bin'), first = await grant();
   await assert.rejects(downloadFile(first, dest, { now: f.clock,
     fetchImpl: async () => new Response(dropAfter(bytes, 1000), { status: 200 }) }), /transfer_failed/);
@@ -902,7 +904,8 @@ test('resume: partial state is bound to the same attachment, message, size, SHA-
   // Corrupted partial bytes are caught by the whole-file SHA-256, and everything is discarded.
   await assert.rejects(downloadFile(first, dest, { now: f.clock,
     fetchImpl: async () => new Response(dropAfter(bytes, 1000), { status: 200 }) }), /transfer_failed/);
-  const changed = readFileSync(data)[10] ^ 0xff;
+  const original = readFileSync(data)[10]; assert.equal(original, 0x58);
+  const changed = original ^ 0xff; assert.notEqual(changed, original);
   const fd = openSync(data, 'r+'); writeSync(fd, Buffer.from([changed]), 0, 1, 10); closeSync(fd);
   await assert.rejects(downloadFile(resume, dest, { fetchImpl: f.r2.fetch, now: f.clock }), /sha256_mismatch/);
   assert.deepEqual(readdirSync(dir), []);
