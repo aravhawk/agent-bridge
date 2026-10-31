@@ -902,7 +902,8 @@ test('resume: partial state is bound to the same attachment, message, size, SHA-
   // Corrupted partial bytes are caught by the whole-file SHA-256, and everything is discarded.
   await assert.rejects(downloadFile(first, dest, { now: f.clock,
     fetchImpl: async () => new Response(dropAfter(bytes, 1000), { status: 200 }) }), /transfer_failed/);
-  const fd = openSync(data, 'r+'); writeSync(fd, Buffer.from('X'), 0, 1, 10); closeSync(fd);
+  const changed = readFileSync(data)[10] ^ 0xff;
+  const fd = openSync(data, 'r+'); writeSync(fd, Buffer.from([changed]), 0, 1, 10); closeSync(fd);
   await assert.rejects(downloadFile(resume, dest, { fetchImpl: f.r2.fetch, now: f.clock }), /sha256_mismatch/);
   assert.deepEqual(readdirSync(dir), []);
   assert.equal(m.id !== m2.id, true);
