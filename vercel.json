@@ -6,9 +6,10 @@
       "maxDuration": 60,
       "experimentalTriggers": [{ "type": "queue/v2beta", "topic": "jarvis-friday-bridge-v1", "maxDeliveries": 20 }]
     },
-    "api/index.mjs": { "maxDuration": 60 }
+    "api/index.mjs": { "maxDuration": 60 },
+    "api/cron.mjs": { "maxDuration": 60 }
   },
   "rewrites": [
-    { "source": "/((?!api/queue).*)", "destination": "/api/index" }
+    { "source": "/((?!api/queue|api/cron).*)", "destination": "/api/index" }
   ]
 }

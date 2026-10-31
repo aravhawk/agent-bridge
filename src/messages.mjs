@@ -6,6 +6,9 @@ import { CONFIG, PEER_IDS } from './config.mjs';
 export const MESSAGE_PROTOCOL = CONFIG.protocol;
 export const ACCEPTED_PROTOCOLS = CONFIG.acceptedProtocols;
 export const MESSAGE_TTL_MS = 3600000;
+// SYNC data waits for the next even-hour flush (up to three real hours), so a
+// message classified 'sync' may live longer. Every other message keeps one hour.
+export const SYNC_MESSAGE_TTL_MS = 12 * 3600000;
 export const CONTENT_RETENTION_MS = 86400000;
 export const IDEMPOTENCY_RETENTION_MS = 7 * 86400000;
 const isoTime = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
@@ -17,36 +20,84 @@ export const messageScope = (role, kind) => SCOPES[role]?.[kind === 'ack' ? 'ack
 // Text is data for a single inbox. It cannot choose a host task, endpoint,
 // credential, tool or permission. The native receiver owns workflow approval.
 export function validateMessage(input, principal, now = Date.now()) {
-  const keys = ['protocol', 'id', 'from', 'to', 'kind', 'sentAt', 'expiresAt', 'threadId', 'route', 'text', 'correlationId'];
+  const keys = ['protocol', 'id', 'from', 'to', 'kind', 'sentAt', 'expiresAt', 'threadId', 'route', 'text', 'correlationId',
+    ...CLASS_FIELDS, 'attachmentIds'];
   if (!input || typeof input !== 'object' || Array.isArray(input) ||
       Object.keys(input).some(k => !keys.includes(k)) || !PEER_IDS.includes(principal?.role) ||
       !ACCEPTED_PROTOCOLS.includes(input.protocol) || !uuid.test(input.id || '') || !uuid.test(input.threadId || '') ||
       input.from !== principal.role || !PEER_IDS.includes(input.to) || input.to === input.from ||
       input.route !== 'inbox' || !['message', 'status', 'handoff_request', 'ack'].includes(input.kind)) fail('invalid_message');
   if (!principal.scopes?.includes(messageScope(principal.role, input.kind))) fail('insufficient_scope', 403);
+  const classified = classification(input), attached = attachmentRefs(input);
   const sentAt = Date.parse(input.sentAt), expiresAt = Date.parse(input.expiresAt);
   if (typeof input.sentAt !== 'string' || typeof input.expiresAt !== 'string' ||
       !isoTime.test(input.sentAt) || !isoTime.test(input.expiresAt) ||
       !Number.isSafeInteger(sentAt) || !Number.isSafeInteger(expiresAt) || Math.abs(now - sentAt) > 300000 ||
-      expiresAt <= sentAt || expiresAt - sentAt > MESSAGE_TTL_MS) fail('invalid_message_lifetime');
+      expiresAt <= sentAt || expiresAt - sentAt > (input.class === 'sync' ? SYNC_MESSAGE_TTL_MS : MESSAGE_TTL_MS)) fail('invalid_message_lifetime');
   if (input.kind === 'ack' ? input.text !== undefined || !uuid.test(input.correlationId || '')
     : input.correlationId !== undefined || typeof input.text !== 'string' || !input.text.trim() ||
       Buffer.byteLength(input.text, 'utf8') > 4096) fail('invalid_message_content');
   const envelope = { protocol: MESSAGE_PROTOCOL, id: input.id.toLowerCase(), from: input.from, to: input.to,
     kind: input.kind, sentAt: new Date(sentAt).toISOString(), expiresAt: new Date(expiresAt).toISOString(),
     threadId: input.threadId.toLowerCase(), route: 'inbox',
-    ...(input.kind === 'ack' ? { correlationId: input.correlationId.toLowerCase() } : { text: input.text }) };
+    ...(input.kind === 'ack' ? { correlationId: input.correlationId.toLowerCase() } : { text: input.text }), ...classified,
+    ...attached };
   const serialized = JSON.stringify(envelope);
   if (Buffer.byteLength(serialized) > 8192) fail('message_too_large', 413);
   return { envelope, hash: createHash('sha256').update(serialized).digest('hex') };
 }
 
+// Optional attachment references (IDs only; bytes never enter a message).
+// Shape only here: ownership, state, recipient, policy and namespace are
+// admitted by the attachment capability inside the message transactions.
+export const MAX_MESSAGE_ATTACHMENTS = 4;
+function attachmentRefs(input) {
+  if (input.attachmentIds === undefined) return {};
+  const ids = input.attachmentIds;
+  if (input.kind === 'ack' || !Array.isArray(ids) || ids.length < 1 || ids.length > MAX_MESSAGE_ATTACHMENTS ||
+      ids.some(id => typeof id !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(id)) ||
+      new Set(ids.map(id => id.toLowerCase())).size !== ids.length) fail('invalid_message');
+  return { attachmentIds: ids.map(id => id.toLowerCase()) };
+}
+
+// Optional delivery-class fields. Absent fields leave the v1 envelope (and its
+// hash) byte-identical; they are only ever additive. ACKs carry none.
+const CLASS_FIELDS = ['class', 'subject', 'effectiveAt', 'dueAt'];
+function classification(input) {
+  if (CLASS_FIELDS.every(k => input[k] === undefined)) return {};
+  if (input.kind === 'ack' || (input.class !== undefined && !['wake', 'sync'].includes(input.class))) fail('invalid_message');
+  const subject = input.subject;
+  if (subject !== undefined && (typeof subject !== 'string' || !subject.trim() || subject.trim().length > 200 ||
+      /[\u0000-\u001f\u007f]/.test(subject))) fail('invalid_message_content');
+  const times = {};
+  for (const field of ['effectiveAt', 'dueAt']) {
+    if (input[field] === undefined) continue;
+    const at = Date.parse(input[field]);
+    if (typeof input[field] !== 'string' || !isoTime.test(input[field]) || !Number.isSafeInteger(at)) fail('invalid_message_schedule');
+    times[field] = new Date(at).toISOString();
+  }
+  return { ...(input.class !== undefined ? { class: input.class } : {}),
+    ...(subject !== undefined ? { subject: subject.trim() } : {}), ...times };
+}
+
 // Lazy bounded retention on ordinary authenticated storage transitions; no
 // timer, receiving-agent poll, migration or provider credential is introduced.
 // Synthetic history, subscription ciphertext and revocation tombstones survive.
+// SYNC data that is still pending, or in a batch not yet acknowledged, is held
+// past content retention (bounded by SYNC_HOLD_MS and capacity backpressure)
+// so queued context is never silently purged before the recipient has it.
+export const SYNC_HOLD_MS = 6 * 86400000;
+function heldForSync(state, m, now) {
+  if (!(m.storedAt + SYNC_HOLD_MS > now)) return false;
+  if (m.sync?.state === 'pending') return true;
+  // Re-sent natively after a rollback: held until completed or recovered.
+  if (m.sync?.state === 'delivered' && m.sync.via === 'native') return state.receipts[m.envelope.id]?.state !== 'complete';
+  const batch = m.syncBatch ? m : m.sync?.state === 'delivered' && m.sync.batchId ? state.messages[m.sync.batchId] : null;
+  return !!batch?.syncBatch && !batch.syncBatch.ackedAt && !batch.syncBatch.reclaimedAt;
+}
 export function retainMessages(state, now) {
   for (const [id, m] of Object.entries(state.messages)) {
-    if (dailyMessage(m.envelope) && m.retainUntil <= now) {
+    if (dailyMessage(m.envelope) && m.retainUntil <= now && !heldForSync(state, m, now)) {
       for (const jobId of m.jobIds) delete state.jobs[jobId];
       delete state.receipts[id]; delete state.messages[id];
     }

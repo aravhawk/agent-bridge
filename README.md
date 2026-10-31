@@ -53,8 +53,8 @@ through an authenticated MCP call.
   `bridge:ack:<self>`. A peer can send only to its counterpart and can read,
   claim and acknowledge only messages addressed to itself.
 - **Data, not instructions.** Text is at most 4 KiB, expires within one hour
-  and is validated against a fixed envelope. There are no free-form routes,
-  task selectors, URLs or tool choices. Reads return
+  (up to 12 hours for opt-in SYNC data) and is validated against a fixed
+  envelope. There are no free-form routes, task selectors, URLs or tool choices. Reads return
   `authority: "peer_data_requires_user_workflow"`.
 - **Closed by default.** Subscriptions, delivery and receiver policy are
   separate operator gates. Each one stays off until you attest it, and
@@ -74,14 +74,14 @@ Report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
 
 ## Quickstart: Vercel + Neon + Clerk
 
-You need Node.js 24, a Vercel account with
+You need Node.js 24.22.1 or newer within major 24, a Vercel account with
 [Vercel Queues](https://vercel.com/docs/queues) available, a Postgres database
 (Neon works well), an OAuth provider that issues JWT access tokens (Clerk
 works), and a domain for the bridge.
 
 1. **Get the code and run the tests.**
    ```sh
-   git clone https://github.com/aravhawk/agent-inbox-bridge.git && cd agent-inbox-bridge
+   git clone https://github.com/aravhawk/jarvis-friday-bridge.git && cd jarvis-friday-bridge
    npm ci && npm test
    ```
 2. **Choose your two peers.** For example, `BRIDGE_PEERS=alice:events,bob:webhook`.
@@ -117,8 +117,9 @@ works), and a domain for the bridge.
    BRIDGE_PEER_BOB_WEBHOOK_SECRET=whsec_<base64>
    ```
    `vercel.json` already routes all paths to the MCP function, keeps the queue
-   consumer private, and declares the queue trigger topic. That topic must
-   equal `BRIDGE_QUEUE_TOPIC`; both default to the same value.
+   consumer and the SYNC flush route (`/api/cron`) out of that catch-all, and
+   declares the queue trigger topic. The queue topic must equal
+   `BRIDGE_QUEUE_TOPIC`; both default to the same value.
 6. **Check the public boundary.**
    ```sh
    python3 scripts/check_v1.py --origin https://bridge.example.com --peers alice,bob \
@@ -155,6 +156,10 @@ The full reference, including the diagnostic and canary procedures, is in
 | `BRIDGE_PEER_<ID>_WEBHOOK_URL` / `_WEBHOOK_SECRET` / `_WEBHOOK_AUTH` | for delivery | Webhook peer endpoint and `standard-webhooks` (default) or `bearer` signing |
 | `BRIDGE_PEER_<ID>_RECEIVER_ID` / `_WEBHOOK_CONTRACT_VERIFIED` | for delivery | Webhook receiver attestations |
 | `BRIDGE_OAUTH_CONTRACT_VERIFIED`, `BRIDGE_SUBSCRIPTIONS_ENABLED`, `BRIDGE_RECEIVER_POLICY`, `BRIDGE_DELIVERY_ENABLED` | for delivery | Readiness gates, all closed by default |
+| `BRIDGE_ATTACHMENTS_ENABLED`, `BRIDGE_ATTACHMENT_MAX_BYTES`, `BLOB_STORE_ID` | no | Private temporary transfer through a connected private Vercel Blob store (default off, OIDC-first, 500 MB default and 1 GB hard cap); see [attachments](docs/attachments.md) |
+| `BRIDGE_WAKE_SYNC_RECIPIENTS` | no | Recipients with WAKE/SYNC batching (default off); see below |
+| `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY`, `BRIDGE_QSTASH_DESTINATION_URL` | for the scheduled tick | Verify signed QStash deliveries to `/api/cron`; see [scheduler](docs/scheduler.md) |
+| `CRON_SECRET` | optional | Bearer secret for any other scheduler calling `/api/cron` |
 | `BRIDGE_SERVICE_NAME`, `BRIDGE_MESSAGE_PROTOCOL`, `BRIDGE_RECEIVER_ID`, `BRIDGE_QUEUE_TOPIC`, `BRIDGE_QUEUE_REGION`, `BRIDGE_REQUIRE_ISSUER_UNDER_ORIGIN`, `BRIDGE_DATABASE_HOST_SUFFIX` | no | Naming and optional hardening |
 
 **Compatibility mode.** This project began as a private deployment between two
@@ -174,6 +179,8 @@ keep working with no change. New deployments should always set
 | `bridge_read` | recipient | Read a stored message by the ID from its wake-up event |
 | `bridge_receipt_claim` / `bridge_receipt_complete` | recipient | Claim with a 60 s lease, then complete and atomically create the ACK |
 | `bridge_status` | both | Delivery and receipt evidence for one known message |
+| `bridge_attachment_begin` / `_finalize` / `_download` | both, when attachments are enabled | Reserve a direct private single or resumable multipart Blob upload, finalize exact stored size, or get a short download URL (optionally an exact range to resume); recipients verify the full SHA-256 |
+| `bridge_inbox_read` | wake/sync recipient | Start-of-turn read of every unacknowledged SYNC batch plus pending data as one new delta batch |
 | `bridge_subscription_status` | events peer | Own subscriptions and renewal observations (no secrets) |
 | `bridge_webhook_diagnostic` | events peer (send scope) | One-time, operator-armed transport check of the webhook peer |
 
@@ -183,6 +190,78 @@ The events peer can also call `events/list`, `events/subscribe` and
 its tools are offered only once the OAuth contract is verified and delivery is
 enabled, and otherwise the bridge serves the v1 tools above unchanged. See
 [docs/task-kernel.md](docs/task-kernel.md).
+
+## Wake and sync delivery (optional)
+
+Every wake costs the recipient a turn. With
+`BRIDGE_WAKE_SYNC_RECIPIENTS=<peer>` (default off, per recipient, rolled back
+by clearing it), that recipient gets:
+
+- **ACKs are unchanged and immediate.** Completing a handled direct (WAKE)
+  message creates its correlated ACK at once, as in v1; completing a handled
+  non-empty batch creates one ACK for the batch, covering all its items (no
+  ACK per item). An ACK means the receiver handled the received data, not
+  that any requested task is done; ACKs are terminal (never ACKed, never
+  carrying SYNC data).
+- **WAKE vs SYNC.** `bridge_message_send` accepts optional fields:
+
+  | Field | Meaning |
+  |---|---|
+  | `class` | `wake` (default; needs action, a decision, a blocker, urgent, an awaited reply, or effect within 2 h) or `sync` (routine FYI: status, logged decisions, owner changes, later reminders) |
+  | `subject` | Topic key (≤ 200 chars). A newer pending item with the same subject replaces the older one |
+  | `effectiveAt` / `dueAt` | ISO 8601 times. Either within 2 h 30 min (the 2 h maximum wait plus scheduler slack) promotes `sync` to `wake` |
+  | `expiresAt` | Up to 12 h for `sync` (1 h otherwise). A `sync` item expiring within 2 h 30 min is sent as `wake` |
+
+  Messages without `class` behave exactly as before.
+- **One batch, not one wake per item.** Pending SYNC items are coalesced (delta
+  only, deduplicated by subject) into a batch: with the next WAKE, on the
+  recipient's next `bridge_read`/`bridge_inbox_read`, or as a single webhook at
+  the next even hour in America/Chicago (00:00, 02:00, … 22:00). The
+  requirement is that the oldest item waits no more than 2 elapsed hours (DST
+  included); every scheduled run flushes on that basis, but it depends on the
+  external scheduler actually running (an unresolved
+  [pre-rollout requirement](docs/configuration.md#pre-rollout-requirements),
+  together with the receiver-policy exceptions the contract needs). At most
+  12 batch wakes per day (13 on the 25-hour fall-back day), none for an empty
+  window. A batch is an ordinary `status` message, so its wake payload is
+  unchanged; `bridge_read` adds a `syncBatches` field with each item.
+- **Nothing lost, nothing handled twice.** A batch is replayed by
+  `bridge_inbox_read` until the recipient acknowledges it after its items were
+  presented: directly, by claiming and completing the batch (naming its own ID
+  in `syncBatchIds`), or by completing the WAKE it came with while naming the
+  batch in `syncBatchIds` (the WAKE and each named batch then get their own
+  ACKs). Both paths share one claim per batch, so only one
+  claim at a time can handle it, and only batches from that receiver's own
+  read and held by its own claim are acknowledged. A SYNC item inside a batch
+  cannot be claimed on its own (the refusal names the batch to use), so a
+  batch is acknowledged only with every item covered. Expired items are still
+  delivered, flagged late. Receivers read, claim, handle, then complete; see the
+  [receiver contract](docs/inbox-policy.md#flagged-receiver-contract).
+
+The flush is driven by an external scheduled tick to `/api/cron`; the
+selected scheduler is Upstash QStash (signed deliveries, verified against the
+exact configured destination; see [scheduler](docs/scheduler.md)), and any
+other scheduler can use `Authorization: Bearer $CRON_SECRET`. There is no
+Vercel cron and no GitHub Actions communication workflow. Each run flushes
+only what is due (a Chicago even hour has passed, or waiting would exceed the
+2-hour maximum), re-offers overdue outbox work, and is a 200 no-op otherwise;
+a flush or publication it cannot complete is a 503, so the scheduler retries.
+To roll out, in this order:
+
+1. Set `BRIDGE_QSTASH_DESTINATION_URL` (the exact `https://<host>/api/cron`)
+   in Vercel alongside the QStash signing keys, and redeploy.
+2. Review and create the schedule from the dry-run plan
+   (`node scripts/qstash-schedule-plan.mjs --dry-run --destination <url>`).
+3. Update the recipient's receiver to follow the
+   [flagged receiver contract](docs/inbox-policy.md#flagged-receiver-contract),
+   then set `BRIDGE_WAKE_SYNC_RECIPIENTS=bob` in Vercel and redeploy.
+
+To roll back, first stop senders from creating new `class: sync` messages for
+the recipient. With the flag still set, have the recipient call
+`bridge_inbox_read` and claim, handle and complete every batch until it returns
+no batches; then clear `BRIDGE_WAKE_SYNC_RECIPIENTS`, redeploy, and only then
+switch back to a legacy receiver. Details:
+[configuration](docs/configuration.md#rollout-and-rollback).
 
 ## Limitations
 

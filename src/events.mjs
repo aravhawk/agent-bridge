@@ -187,11 +187,16 @@ export class NativeEvents {
 // Called only inside a message transaction, after its durable identity exists.
 // A pinned subscriptionId restricts events-peer fan-out to that one return path;
 // maxAttempts persists a stricter per-job transport limit.
-export function appendDeliveryJobs(state, envelope, now, { subscriptionId, maxAttempts } = {}) {
-  const destinations = envelope.to === EVENTS_PEER
+function deliveryDestinations(state, envelope, now, subscriptionId) {
+  return envelope.to === EVENTS_PEER
     ? Object.values(state.subscriptions).filter(sub => (!subscriptionId || sub.id === subscriptionId) &&
       subscriptionAccessAllowed(state, sub, sub.authorization?.policyId, now))
     : [{ id: WEBHOOK_PEER, recipient: WEBHOOK_PEER }];
+}
+// Whether appendDeliveryJobs would find a destination now, without creating one.
+export const hasDeliveryDestination = (state, envelope, now) => deliveryDestinations(state, envelope, now).length > 0;
+export function appendDeliveryJobs(state, envelope, now, { subscriptionId, maxAttempts } = {}) {
+  const destinations = deliveryDestinations(state, envelope, now, subscriptionId);
   const jobIds = [];
   for (const sub of destinations) {
     const eventId = 'evt_' + digest(JSON.stringify([envelope.id, sub.id]));
