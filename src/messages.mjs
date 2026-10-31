@@ -76,6 +76,8 @@ export const SYNC_HOLD_MS = 6 * 86400000;
 function heldForSync(state, m, now) {
   if (!(m.storedAt + SYNC_HOLD_MS > now)) return false;
   if (m.sync?.state === 'pending') return true;
+  // Re-sent natively after a rollback: held until completed or recovered.
+  if (m.sync?.state === 'delivered' && m.sync.via === 'native') return state.receipts[m.envelope.id]?.state !== 'complete';
   const batch = m.syncBatch ? m : m.sync?.state === 'delivered' && m.sync.batchId ? state.messages[m.sync.batchId] : null;
   return !!batch?.syncBatch && !batch.syncBatch.ackedAt && !batch.syncBatch.reclaimedAt;
 }

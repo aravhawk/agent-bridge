@@ -5,7 +5,8 @@ import { CONFIG, PEER_IDS } from './config.mjs';
 // Resource-server verification only. The OAuth provider owns PKCE, consent,
 // issuance and refresh. No authorization server, signing key or token issuer exists here.
 export class BridgeError extends Error {
-  constructor(code, status) { super(code); this.code = code; this.status = status; }
+  // details: optional fixed ID fields for conflicts that redirect the caller.
+  constructor(code, status, details = undefined) { super(code); this.code = code; this.status = status; this.details = details; }
 }
 const reject = (code, status = 400) => { throw new BridgeError(code, status); };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;

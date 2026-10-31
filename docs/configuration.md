@@ -253,10 +253,22 @@ For an enabled recipient:
   items are queued again.
 - **Nothing is silently dropped.** Items whose own `expiresAt` passes while
   queued or re-queued are still delivered, flagged `expired` and `late`.
-  Pending items and items in unacknowledged batches are held past the 24-hour
-  content retention (up to 6 days, within the 100-message capacity). Only a
-  policy change or a durable access denial withdraws queued data
-  (`bridge_status` then shows `sync.state: "withdrawn"`).
+  Pending items, items in unacknowledged batches and items re-sent natively
+  after a rollback but not yet completed are held past the 24-hour content
+  retention (up to 6 days, within the 100-message capacity). Only a policy
+  change or a durable access denial withdraws queued data (`bridge_status`
+  then shows `sync.state: "withdrawn"`). When items are re-queued (an expired,
+  unacknowledged batch, or a failed native re-send), the newest update per
+  `subject`, by the time the bridge accepted it, wins; an older one is marked
+  superseded and never replaces a newer one.
+- **One fence per item.** A queued or batch-carried SYNC item is handled only
+  through its batch: claiming the item itself is refused with
+  `sync_item_in_batch` (plus `batchMessageId`), `sync_item_not_delivered` or
+  `sync_item_superseded`, so an item can never be held by a claim the batch does
+  not see. A batch whose item still has a live claim from before this rule is
+  refused (`sync_batch_item_busy`, with `itemIds`) for both claim and
+  completion, stays outstanding, and is acknowledged only once every item is
+  covered. Natively re-sent rollback items keep the v1 claim path.
 
 A batch is stored as an ordinary v1 `status` message from the counterpart, so
 its wake is the unchanged `{"event":"bridge.message.received","data":{"messageId":…}}`
@@ -347,7 +359,10 @@ Safety net for anything queued after the drain: on the next hourly run it is
 re-sent under its own message ID where its original v1 authority is still
 valid (an unchanged receiver handles it like any message, ACK included); the
 rest goes out once as a standard `status` batch whose text lists each item's
-message ID. Keep the secrets, the variable and the workflow in place until
+message ID. A natively re-sent item that is not completed before its v1
+authority lapses, or whose native delivery jobs all die, is recovered on a
+later run into such a batch (never re-sent natively again) instead of being
+stranded. Keep the secrets, the variable and the workflow in place until
 that run has happened (an unconfigured workflow fails loudly).
 
 ## Bounded queue recovery

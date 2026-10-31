@@ -102,9 +102,11 @@ export function classify(envelope, now) {
 //   lastFlushBoundary, flushDay, flushCount, undispatched: [messageId] }.
 // Created only once a SYNC item is queued, so flag-off state is unchanged.
 // Item lifecycle (message.sync.state): pending -> delivered (in a batch, until
-// that batch is acknowledged) | superseded (newer same-subject update) |
-// withdrawn (policy change or durable denial). Nothing is dropped for time:
-// expired items are still delivered, flagged late.
+// that batch is acknowledged; or natively after a rollback, until completed) |
+// superseded (newer same-subject update) | withdrawn (policy change or durable
+// denial). Nothing is dropped for time: expired items are still delivered,
+// flagged late. A queued or batch-carried item is handled only through its
+// batch: its own claim is refused with a redirect (see syncItemClaimRedirect).
 const queueOf = (state, recipient) => state.syncQueues?.[recipient];
 const queueFor = (state, recipient) => (state.syncQueues ||= {})[recipient] ||= { pending: {} };
 export function enqueueSync(state, message, now) {
@@ -136,26 +138,86 @@ function itemAllowed(state, message, policyIds) {
 }
 const batches = (state, recipient) => Object.values(state.messages)
   .filter(m => m.syncBatch?.recipient === recipient).sort((a, b) => a.syncBatch.createdAt - b.syncBatch.createdAt);
-// Unacknowledged batches whose replay lifetime is over: their unacknowledged
-// items go back to the queue (a newer same-subject item supersedes them).
+// The newest later update for the same subject addressed to this recipient: a
+// queued, batched, natively sent or WAKE message accepted after this item and
+// not itself superseded or withdrawn. Unsubjected items have no successor.
+function newerUpdate(state, item) {
+  const { key } = item.sync;
+  if (!key?.startsWith('s:')) return null;
+  let newest = null;
+  for (const m of Object.values(state.messages)) {
+    if (m === item || m.syncBatch || m.envelope.to !== item.envelope.to || m.envelope.kind === 'ack' ||
+        !(m.storedAt > item.storedAt) || ['superseded', 'withdrawn'].includes(m.sync?.state) ||
+        (m.sync?.key ?? subjectKey(m.envelope.subject)) !== key) continue;
+    if (!newest || m.storedAt > newest.storedAt) newest = m;
+  }
+  return newest;
+}
+// Put an undelivered or unhandled item back in the queue, unless a newer
+// same-subject update exists (then it is superseded). Ordering is by the time
+// the bridge accepted each message, never by the order of recovery.
+function requeue(state, recipient, item, now, extra = {}) {
+  const queue = queueFor(state, recipient), { key } = item.sync, newer = newerUpdate(state, item);
+  if (newer) { item.sync = { ...item.sync, state: 'superseded', supersededBy: newer.envelope.id, supersededAt: now }; return; }
+  const queued = state.messages[queue.pending[key]];
+  if (queued?.sync?.state === 'pending') Object.assign(queued.sync, { state: 'superseded', supersededBy: item.envelope.id, supersededAt: now });
+  queue.pending[key] = item.envelope.id;
+  item.sync = { state: 'pending', key, queuedAt: now, redeliveries: (item.sync.redeliveries || 0) + 1,
+    ...(item.sync.nativeFailed ? { nativeFailed: true } : {}), ...extra };
+}
+// Unacknowledged batches whose replay lifetime is over: their unhandled items
+// go back to the queue (a newer same-subject update supersedes them).
 function reclaimExpired(state, recipient, now) {
   for (const batch of batches(state, recipient)) {
     const b = batch.syncBatch;
     if (b.ackedAt || b.reclaimedAt || Date.parse(batch.envelope.expiresAt) > now) continue;
     b.reclaimedAt = now;
-    const queue = queueFor(state, recipient);
     for (const id of b.itemIds) {
       const item = state.messages[id];
       if (item?.sync?.state !== 'delivered' || item.sync.batchId !== batch.envelope.id || state.receipts[id]?.state === 'complete') continue;
-      const { key } = item.sync, newer = state.messages[queue.pending[key]];
-      if (newer?.sync?.state === 'pending') { Object.assign(item.sync, { state: 'superseded', supersededBy: newer.envelope.id, supersededAt: now }); continue; }
-      queue.pending[key] = id;
-      item.sync = { state: 'pending', key, queuedAt: now, redeliveries: (item.sync.redeliveries || 0) + 1 };
+      requeue(state, recipient, item, now);
     }
   }
 }
-function livePending(state, recipient, policyIds, now) {
+// Rollback re-sends items natively under their own IDs. If such an item is not
+// completed and can no longer be delivered or claimed that way (its v1
+// authority lapsed, or every native job is dead), it goes back to the queue for
+// a derived batch instead of being stranded; it is never sent natively again.
+function recoverNative(state, recipient, policyIds, now) {
+  for (const item of Object.values(state.messages)) {
+    if (item.envelope.to !== recipient || item.sync?.state !== 'delivered' || item.sync.via !== 'native') continue;
+    const receipt = state.receipts[item.envelope.id];
+    if (receipt?.state === 'complete' || (receipt?.leaseUntil > now && messageAccessAllowed(state, item, policyIds, now))) continue;
+    const dead = item.jobIds.length > 0 && item.jobIds.every(id => !state.jobs[id] || state.jobs[id].state === 'dead');
+    if (messageAccessAllowed(state, item, policyIds, now) && !dead) continue;
+    requeue(state, recipient, item, now, { nativeFailed: true });
+  }
+}
+// Bring a recipient's SYNC state up to date before any read, claim or flush.
+export function reconcileSync(state, recipient, policyIds, now) {
   reclaimExpired(state, recipient, now);
+  recoverNative(state, recipient, policyIds, now);
+}
+// Why an item may not be claimed on its own, or null when it may (no SYNC
+// metadata, or re-sent natively after a rollback). Call after reconcileSync.
+export function syncItemClaimRedirect(state, message) {
+  const s = message.sync;
+  if (!s || (s.state === 'delivered' && s.via === 'native')) return null;
+  if (s.state === 'delivered' && s.batchId) return { code: 'sync_item_in_batch', details: { batchMessageId: s.batchId } };
+  if (s.state === 'superseded') return { code: 'sync_item_superseded', details: { supersededBy: s.supersededBy } };
+  return { code: 'sync_item_not_delivered' };
+}
+// Items of a batch whose receipt is a live claim other than claimId (only
+// possible for claims written before item claims were fenced). While any
+// exists, the batch can be neither claimed nor acknowledged.
+export function batchItemsBusy(state, batch, claimId, now) {
+  return (batch?.syncBatch?.itemIds || []).filter(id => {
+    const receipt = state.receipts[id];
+    return state.messages[id] && receipt?.state === 'claimed' && receipt.leaseUntil > now && receipt.claimId !== claimId;
+  });
+}
+function livePending(state, recipient, policyIds, now) {
+  reconcileSync(state, recipient, policyIds, now);
   const queue = queueOf(state, recipient), live = [];
   if (!queue) return live;
   for (const [key, id] of Object.entries(queue.pending)) {
@@ -268,14 +330,16 @@ export function ackBatch(state, batchId, principal, now, evidence) {
   const batch = state.messages[batchId], b = batch?.syncBatch, held = state.receipts[batchId];
   if (!b?.presentedAt || b.ackedAt) return false;
   if (held?.state !== 'complete' && !(held?.state === 'claimed' && held.claimId === evidence.claimId)) return false;
+  // Never finalize a batch while another live claim holds one of its items.
+  if (batchItemsBusy(state, batch, evidence.claimId, now).length) return false;
   b.ackedAt = now;
   const receipt = { state: 'complete', owner: principal.principalKey, completedAt: now, ackMessageId: null,
     hostedEventId: evidence.hostedEventId, hostedTurnId: evidence.hostedTurnId,
     evidenceStatus: 'reported_requires_independent_host_confirmation', ackSuppressed: true };
   if (held.state !== 'complete') state.receipts[batchId] = { ...receipt, claimId: evidence.claimId, viaMessage: evidence.via };
   for (const id of b.itemIds) {
-    const own = state.receipts[id];
-    if (!state.messages[id] || own?.state === 'complete' || (own?.leaseUntil > now && own.claimId !== evidence.claimId)) continue;
+    // Covered already (completed by its own claim) or stale (lapsed lease).
+    if (!state.messages[id] || state.receipts[id]?.state === 'complete') continue;
     state.receipts[id] = { ...receipt, viaBatch: batchId };
   }
   return true;
@@ -304,7 +368,7 @@ export function flushDue(state, now, { policyIds, recipients = [] }) {
     if (!recipients.includes(recipient)) {
       const native = [];
       for (const item of live) {
-        if (!messageAccessAllowed(state, item, policyIds, now)) continue;
+        if (item.sync.nativeFailed || !messageAccessAllowed(state, item, policyIds, now)) continue;
         const jobIds = appendDeliveryJobs(state, item.envelope, now);
         if (!jobIds.length) continue;
         item.jobIds = jobIds; native.push(item.envelope.id);

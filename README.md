@@ -220,8 +220,10 @@ by clearing it), that recipient gets:
   in `syncBatchIds`), or by completing the WAKE it came with while naming the
   batch in `syncBatchIds`. Both paths share one claim per batch, so only one
   claim at a time can handle it, and only batches from that receiver's own
-  read and held by its own claim are acknowledged. Expired items are still delivered, flagged late. Receivers
-  read, claim, handle, then complete; see the
+  read and held by its own claim are acknowledged. A SYNC item inside a batch
+  cannot be claimed on its own (the refusal names the batch to use), so a
+  batch is acknowledged only with every item covered. Expired items are still
+  delivered, flagged late. Receivers read, claim, handle, then complete; see the
   [receiver contract](docs/inbox-policy.md#flagged-receiver-contract).
 
 The flush is triggered hourly by the GitHub Actions workflow

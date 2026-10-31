@@ -7,9 +7,12 @@ import { diagnosticReadCandidate, diagnosticReadStatus, observeDiagnosticRead,
   canaryReadCandidate, canaryReadStatus, observeCanaryRead } from './observability.mjs';
 import { canaryEnvelope, reserveCanary, canaryReceipt } from './canary.mjs';
 import { EVENTS_PEER, NAMES } from './config.mjs';
-import { classify, enqueueSync, supersedeBySubject, cutBatch, presentBatch, ackBatch, outstandingBatches, flushDue, markDispatched } from './sync.mjs';
+import { classify, enqueueSync, supersedeBySubject, cutBatch, presentBatch, ackBatch, outstandingBatches, flushDue, markDispatched,
+  reconcileSync, syncItemClaimRedirect, batchItemsBusy } from './sync.mjs';
 
 const fail = (code, status = 400) => { throw new BridgeError(code, status); };
+// A conflict that names the IDs to use instead (batch or blocking items only).
+const conflict = (code, details) => { throw new BridgeError(code, 409, details); };
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 function messageId(value) { if (typeof value !== 'string' || !uuid.test(value)) fail('invalid_message_id'); }
 function admitMessage(state, role, now) {
@@ -87,7 +90,9 @@ function claimAttachedBatches(state, message, principal, claimId, leaseUntil, no
   for (const id of message.syncBatchIds) {
     const b = state.messages[id]?.syncBatch, receipt = state.receipts[id];
     if (!b?.presentedAt || b.ackedAt || b.reclaimedAt || receipt?.state === 'complete') continue;
-    if (receipt?.leaseUntil > now) { heldElsewhere.push(id); continue; }
+    // Held by another claim of the batch, or one of its items still has a
+    // live independent claim (pre-fence): not this claim's to handle.
+    if (receipt?.leaseUntil > now || batchItemsBusy(state, state.messages[id], claimId, now).length) { heldElsewhere.push(id); continue; }
     state.receipts[id] = { state: 'claimed', owner: principal.principalKey, claimId, leaseUntil, viaMessage: message.envelope.id };
     held.push(id);
   }
@@ -274,10 +279,21 @@ export class Bridge {
       if (this.canary) canaryReceipt(state, this.canary, principal, params.messageId);
       const old = state.receipts[params.messageId];
       if (old?.state === 'complete') return { duplicate: true, completed: true, ackMessageId: old.ackMessageId };
+      // Item vs batch fence: a queued or batch-carried SYNC item is handled only
+      // through its batch, so its own claim is refused with the batch to use.
+      if (message.sync) {
+        reconcileSync(state, message.envelope.to, this.messagePolicyIds, now);
+        const redirect = syncItemClaimRedirect(state, message);
+        if (redirect) conflict(redirect.code, redirect.details);
+      }
       if (!messageAccessAllowed(state, message, this.messagePolicyIds, now)) fail('message_authorization_inactive', 403);
       requireAckPath(state, message.envelope, message.authorization, this.messagePolicyIds, now, this.canary?.subscriptionId,
         this.ackSuppressed(message));
       if (old?.leaseUntil > now) fail('receipt_busy', 409);
+      if (message.syncBatch) {
+        const busy = batchItemsBusy(state, message, null, now);
+        if (busy.length) conflict('sync_batch_item_busy', { itemIds: busy });
+      }
       const claimId = randomUUID(), leaseUntil = now + 60000;
       state.receipts[params.messageId] = { state: 'claimed', owner: principal.principalKey,
         claimId, leaseUntil };
@@ -332,6 +348,11 @@ export class Bridge {
         if (!(message.syncBatchIds || []).includes(id) || !state.messages[id]?.syncBatch?.presentedAt) fail('sync_batch_not_presented', 409);
         if (state.receipts[id]?.state !== 'claimed' || state.receipts[id].claimId !== params.claimId) fail('sync_batch_not_held', 409);
       }
+      // A batch is never finalized with an item still under another live claim:
+      // refuse the whole completion before anything changes.
+      const busyItems = [...new Set([ownBatch, ...ackIds].filter(Boolean)
+        .flatMap(id => batchItemsBusy(state, state.messages[id], params.claimId, now)))];
+      if (busyItems.length) conflict('sync_batch_item_busy', { itemIds: busyItems });
       const ackSuppressed = original.kind !== 'ack' && this.ackSuppressed(message);
       requireAckPath(state, original, message.authorization, this.messagePolicyIds, now, this.canary?.subscriptionId, ackSuppressed);
       let ackMessageId = null; let jobIds = [];

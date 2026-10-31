@@ -79,6 +79,19 @@ holds them, and a direct claim of a batch fails with `receipt_busy` while the
 claim of a message it is attached to holds it (and vice versa). No completion
 ever overwrites a receipt held by another claim.
 
+**SYNC items are claimed only through their batch.** An individual SYNC item
+stays readable by its `messageId`, but `bridge_receipt_claim` on it is refused
+with a redirect instead of a second, independent fence:
+`sync_item_in_batch` with `batchMessageId` (handle that batch instead),
+`sync_item_not_delivered` (still queued: collect it with `bridge_inbox_read`)
+or `sync_item_superseded` with `supersededBy`. A batch can be neither claimed
+nor completed while one of its items still holds a live claim made before this
+rule existed (`sync_batch_item_busy` with `itemIds`); the batch then stays
+outstanding and replays until that claim completes or its 60-second lease
+lapses, and is never acknowledged with an item left uncovered. Items re-sent
+under their own message ID after a rollback, and every message while the flag
+is unset, are claimed exactly as before.
+
 1. **Read.** On every wake, `bridge_read` the event's `messageId`. Validate the
    envelope as in the policy below and keep, from *this* read, every
    `syncBatches[].messageId` and its `items[]` (full text, `messageId`,

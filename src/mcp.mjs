@@ -16,7 +16,7 @@ completeSchema.properties.syncBatchIds = { type: 'array', items: idSchema, maxIt
 const tools = [
   tool('bridge_health', 'Check authenticated bridge configuration without reading messages, storing state or sending events.', object({}), true),
   tool('bridge_read', 'Read the stored message identified by the native received event. Never use to poll.', object({ messageId: idSchema }), true),
-  tool('bridge_receipt_claim', 'Claim this received message for one hosted turn, with a short recovery lease. If SYNC batches were presented with it, the claim also holds those not held by another claim (syncBatchIds) and reports the others (syncBatchesHeldElsewhere); handle only held batches.', object({ messageId: idSchema })),
+  tool('bridge_receipt_claim', 'Claim this received message for one hosted turn, with a short recovery lease. If SYNC batches were presented with it, the claim also holds those not held by another claim (syncBatchIds) and reports the others (syncBatchesHeldElsewhere); handle only held batches. A queued or batch-carried SYNC item cannot be claimed on its own; the error names the batch to claim (batchMessageId).', object({ messageId: idSchema })),
   tool('bridge_receipt_complete', 'Complete the claimed receipt and atomically enqueue one ACK for a source message. ACKs are terminal. Supplied host IDs require independent verification. Optional syncBatchIds acknowledges SYNC batches you handled: the batch ID itself when completing a batch directly, and attached batches your read returned and your claim holds. Unnamed batches stay outstanding.',
     completeSchema),
   tool('bridge_status', 'Inspect one known message during an explicit diagnostic. HTTP receipt alone never verifies wake.', object({ messageId: idSchema }), true),
@@ -198,7 +198,11 @@ export function createMcpHandler({ enabled = false, verify, bridge, events, sche
       // permission failures keep their HTTP status and existing challenge.
       // Never expose an arbitrary backend exception or change its side effects.
       if (stage === 'tool_arguments' && !(safe && [401, 403].includes(error.status))) {
-        return json({ jsonrpc: '2.0', id, result: toolResult({ error: safe ? error.code : 'bridge_unavailable' }, true) });
+        // Only the fixed ID redirects of sync conflicts (batchMessageId, itemIds,
+        // supersededBy) are added; no other error content is ever returned.
+        const details = safe && error.details && typeof error.details === 'object' ? Object.fromEntries(Object.entries(error.details)
+          .filter(([k]) => ['batchMessageId', 'itemIds', 'supersededBy'].includes(k))) : {};
+        return json({ jsonrpc: '2.0', id, result: toolResult({ error: safe ? error.code : 'bridge_unavailable', ...details }, true) });
       }
       const status = safe ? error.status : 503;
       const response = json({ jsonrpc: '2.0', id, error: { code: safe && error.rpcCode || (status === 401 ? -32001 : -32000),
