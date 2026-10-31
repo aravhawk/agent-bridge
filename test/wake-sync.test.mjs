@@ -946,8 +946,10 @@ async function runtimeFixture(changes = {}, at = start) {
   let document = emptyState(), now = at, consumer;
   const sends = [], posts = [];
   // Fault injection: faults.send(args) / faults.update() returning true makes
-  // that queue publish or that storage commit fail (the commit is not applied).
-  const faults = { send: null, update: null };
+  // that queue publish or that storage write fail (the write is not applied).
+  // faults.commit() returning true throws from COMMIT after the write was
+  // applied: the server committed but the client lost the response.
+  const faults = { send: null, update: null, commit: null };
   const { publicKey, privateKey } = await generateKeyPair('RS256');
   class Pool { on() {} async connect() { return { release() {}, async query(sql, params) {
     if (sql.startsWith('SELECT document')) return { rows: [{ document: structuredClone(document) }] };
@@ -955,6 +957,7 @@ async function runtimeFixture(changes = {}, at = start) {
       if (faults.update?.()) throw Error('FIXTURE_STORAGE_FAULT');
       document = JSON.parse(params[0]);
     }
+    if (sql === 'COMMIT' && faults.commit?.()) throw Error('FIXTURE_COMMIT_RESPONSE_LOST');
     return { rows: [] };
   } }; } }
   const env = { BRIDGE_OAUTH_ISSUER: ISSUER, BRIDGE_OAUTH_CONTRACT_VERIFIED: 'true', BRIDGE_ALLOWED_SUBJECT: 'fixture', BRIDGE_DELIVERY_ENABLED: 'true',
@@ -1191,4 +1194,47 @@ test('runtime cron: a failed flush commit is a 503 that loses and duplicates not
   const ok = await f.cron(auth);
   assert.equal(ok.status, 200); assert.equal((await ok.json()).flushed, 1);
   assert.equal(batchIdsOf(f).length, 1);
+});
+
+test('runtime cron: a flush COMMIT whose response is lost is a 503; the retry finds the committed batch and wakes once', async () => {
+  const f = await runtimeFixture();
+  const x = f.message({ subject: 'X' });
+  await f.call('jarvis', 'bridge_message_send', x);
+  f.set(noon + 5000);
+  const sendsBefore = f.sends.length;
+  let commits = 0;
+  f.faults.commit = () => ++commits === 1; // the flush transaction commits, its response is lost
+  const lost = await f.cron(auth);
+  assert.equal(lost.status, 503); assert.deepEqual(await lost.json(), { error: 'flush_unavailable' });
+  // Durably committed despite the error: one batch, counted once, waiting to be published.
+  const [batch] = batchIdsOf(f);
+  assert.ok(batch);
+  assert.deepEqual(f.document().syncQueues.friday.undispatched, [batch]);
+  assert.equal(f.document().syncQueues.friday.flushCount, 1);
+  assert.equal(f.sends.length, sendsBefore, 'this call published nothing');
+  f.faults.commit = null;
+  const retry = await f.cron(auth);
+  assert.equal(retry.status, 200);
+  assert.deepEqual(await retry.json(), { ...idle(iso(noon)), dispatched: 1 }, 'same batch published; nothing re-cut');
+  assert.deepEqual(batchIdsOf(f), [batch]); assert.equal(f.document().syncQueues.friday.flushCount, 1);
+  for (const payload of f.sends.map(args => args[1]).filter(p => p.dispatchMessageId === batch)) await f.consume(payload);
+  assert.deepEqual(f.posts.filter(p => p.event === EVENT_NAME), [{ event: EVENT_NAME, data: { messageId: batch } }]);
+});
+
+test('runtime cron: a lost COMMIT response while recording publication is a 503 with no duplicate wake', async () => {
+  const f = await runtimeFixture();
+  await f.call('jarvis', 'bridge_message_send', f.message({ subject: 'X' }));
+  f.set(noon + 5000);
+  let commits = 0;
+  f.faults.commit = () => ++commits === 2; // 1st = flush, 2nd = recording publication (applied, response lost)
+  const unconfirmed = await f.cron(auth);
+  assert.equal(unconfirmed.status, 503);
+  assert.equal((await unconfirmed.json()).status, 'dispatch_unconfirmed');
+  const [batch] = batchIdsOf(f);
+  assert.deepEqual(f.document().syncQueues.friday.undispatched, [], 'the recording did commit');
+  f.faults.commit = null;
+  assert.deepEqual(await (await f.cron(auth)).json(), idle(iso(noon)), 'retry: nothing left, nothing re-cut');
+  assert.deepEqual(batchIdsOf(f), [batch]); assert.equal(f.document().syncQueues.friday.flushCount, 1);
+  for (const payload of f.sends.map(args => args[1]).filter(p => p.dispatchMessageId === batch)) await f.consume(payload);
+  assert.equal(f.posts.filter(p => p.event === EVENT_NAME).length, 1);
 });

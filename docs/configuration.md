@@ -331,13 +331,17 @@ after the flush commits, and a run reports `200` only when everything due is
 published and recorded as published. Otherwise it answers `503`, so the
 workflow's curl retries and, if the outage persists, the run fails visibly:
 
-- `{"error":"flush_unavailable"}`: the flush could not be committed; nothing
-  changed and nothing was published.
+- `{"error":"flush_unavailable"}`: the flush commit failed or could not be
+  confirmed (a commit can succeed on the server and its response still be
+  lost). No publication was attempted by this call; a retry discovers any
+  batches that were committed and publishes them, without re-cutting them or
+  counting them again against the daily cap.
 - `"status":"dispatch_pending"`: some committed batches (or native rollback
   re-sends) could not be published; `dispatched` counts those that were,
   `dispatchPending` those still waiting.
-- `"status":"dispatch_unconfirmed"`: publication happened but could not be
-  recorded; those IDs are offered again.
+- `"status":"dispatch_unconfirmed"`: publication happened but recording it
+  failed or could not be confirmed; any IDs not recorded are offered again
+  (publishing again is harmless, see below).
 
 Committed batches are never lost or re-cut: a retry, or the next run,
 publishes exactly the IDs still waiting, without using another daily-cap

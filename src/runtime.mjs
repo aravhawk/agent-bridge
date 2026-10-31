@@ -252,7 +252,9 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
         if (!readiness().deliveryEnabled) return reply({ status: 'skipped', reason: 'delivery_not_enabled' });
         configure();
         let flush;
-        // An uncommitted flush changed nothing: retryable, nothing to publish.
+        // The flush commit failed or could not be confirmed (it may have
+        // committed server-side). No publication is attempted by this call; a
+        // retry discovers any committed batches through the undispatched list.
         try { flush = await bridge.flushSync(); } catch { return reply({ error: 'flush_unavailable' }, 503); }
         const { boundary, results, dispatch } = flush;
         const published = [];
