@@ -21,14 +21,14 @@ export const messageScope = (role, kind) => SCOPES[role]?.[kind === 'ack' ? 'ack
 // credential, tool or permission. The native receiver owns workflow approval.
 export function validateMessage(input, principal, now = Date.now()) {
   const keys = ['protocol', 'id', 'from', 'to', 'kind', 'sentAt', 'expiresAt', 'threadId', 'route', 'text', 'correlationId',
-    ...CLASS_FIELDS];
+    ...CLASS_FIELDS, 'attachmentIds'];
   if (!input || typeof input !== 'object' || Array.isArray(input) ||
       Object.keys(input).some(k => !keys.includes(k)) || !PEER_IDS.includes(principal?.role) ||
       !ACCEPTED_PROTOCOLS.includes(input.protocol) || !uuid.test(input.id || '') || !uuid.test(input.threadId || '') ||
       input.from !== principal.role || !PEER_IDS.includes(input.to) || input.to === input.from ||
       input.route !== 'inbox' || !['message', 'status', 'handoff_request', 'ack'].includes(input.kind)) fail('invalid_message');
   if (!principal.scopes?.includes(messageScope(principal.role, input.kind))) fail('insufficient_scope', 403);
-  const classified = classification(input);
+  const classified = classification(input), attached = attachmentRefs(input);
   const sentAt = Date.parse(input.sentAt), expiresAt = Date.parse(input.expiresAt);
   if (typeof input.sentAt !== 'string' || typeof input.expiresAt !== 'string' ||
       !isoTime.test(input.sentAt) || !isoTime.test(input.expiresAt) ||
@@ -40,10 +40,24 @@ export function validateMessage(input, principal, now = Date.now()) {
   const envelope = { protocol: MESSAGE_PROTOCOL, id: input.id.toLowerCase(), from: input.from, to: input.to,
     kind: input.kind, sentAt: new Date(sentAt).toISOString(), expiresAt: new Date(expiresAt).toISOString(),
     threadId: input.threadId.toLowerCase(), route: 'inbox',
-    ...(input.kind === 'ack' ? { correlationId: input.correlationId.toLowerCase() } : { text: input.text }), ...classified };
+    ...(input.kind === 'ack' ? { correlationId: input.correlationId.toLowerCase() } : { text: input.text }), ...classified,
+    ...attached };
   const serialized = JSON.stringify(envelope);
   if (Buffer.byteLength(serialized) > 8192) fail('message_too_large', 413);
   return { envelope, hash: createHash('sha256').update(serialized).digest('hex') };
+}
+
+// Optional attachment references (IDs only; bytes never enter a message).
+// Shape only here: ownership, state, recipient, policy and namespace are
+// admitted by the attachment capability inside the message transactions.
+export const MAX_MESSAGE_ATTACHMENTS = 4;
+function attachmentRefs(input) {
+  if (input.attachmentIds === undefined) return {};
+  const ids = input.attachmentIds;
+  if (input.kind === 'ack' || !Array.isArray(ids) || ids.length < 1 || ids.length > MAX_MESSAGE_ATTACHMENTS ||
+      ids.some(id => typeof id !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(id)) ||
+      new Set(ids.map(id => id.toLowerCase())).size !== ids.length) fail('invalid_message');
+  return { attachmentIds: ids.map(id => id.toLowerCase()) };
 }
 
 // Optional delivery-class fields. Absent fields leave the v1 envelope (and its

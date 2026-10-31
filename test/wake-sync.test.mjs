@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { generateKeyPair, SignJWT } from 'jose';
 import { Bridge } from '../src/bridge.mjs';
 import { MemoryStore, emptyState } from '../src/store.mjs';
@@ -27,12 +27,14 @@ function who(role, until = start + 7 * 86400000) {
     VERIFIED_AUTHORIZATION, { value: { policyId: policy, expiresAt: until } });
 }
 const jarvis = who('jarvis'), friday = who('friday');
-async function fixture({ recipients = ['friday'], at = start, wakeSync = true } = {}) {
+// bridgeOptions: extra Bridge options (e.g. a prepareReceipt spy); wrapStore:
+// wraps the store the bridge (only) uses, for commit-fault injection.
+async function fixture({ recipients = ['friday'], at = start, wakeSync = true, bridgeOptions = {}, wrapStore } = {}) {
   let now = at;
   const enabled = { recipients };
   const store = new MemoryStore(), clock = () => now;
-  const bridge = new Bridge({ store, clock, dailyEnabled: true, messagePolicyIds: { jarvis: policy, friday: policy },
-    ...(wakeSync ? { wakeSync: () => enabled.recipients } : {}) });
+  const bridge = new Bridge({ store: wrapStore ? wrapStore(store) : store, clock, dailyEnabled: true,
+    messagePolicyIds: { jarvis: policy, friday: policy }, ...(wakeSync ? { wakeSync: () => enabled.recipients } : {}), ...bridgeOptions });
   const events = new NativeEvents({ store, protector: createProtector(randomBytes(32)), clock, policyId: policy, enabled: true,
     transport: async (_url, req) => ({ status: 200, body: JSON.stringify({ challenge: JSON.parse(req.body).challenge }) }) });
   await events.subscribe(who('jarvis', now + 7 * 86400000), { name: EVENT_NAME, arguments: { recipient: 'jarvis' }, ttlMs: null,
@@ -137,7 +139,12 @@ test('coalescing: pending SYNC dedupes by subject (latest wins); after acknowled
   assert.deepEqual((await f.bridge.inboxRead(friday)).syncBatches, []);
   const v3 = f.sync('jarvis', { subject: 'Deploy status', text: 'v3' }); await f.send(v3);
   assert.deepEqual(ids((await f.bridge.inboxRead(friday)).syncBatches), [[v3.id]]);
-  assert.equal(Object.keys(f.snapshot().jobs).length, 0, 'no item ever produced its own wake');
+  const jobs = Object.values(f.snapshot().jobs);
+  assert.equal(jobs.filter(j => j.recipient === 'friday').length, 0, 'no item ever produced its own wake');
+  // The one handled batch got one ACK back to the sender (none per item).
+  const acks = Object.values(f.snapshot().messages).filter(m => m.envelope.kind === 'ack');
+  assert.deepEqual(acks.map(m => m.envelope.correlationId), [first.syncBatches[0].messageId]);
+  assert.deepEqual(jobs.map(j => j.messageId), [acks[0].envelope.id]);
 });
 
 test('inbox read survives a lost response: unacknowledged batches replay until their receipt is acknowledged', async () => {
@@ -152,7 +159,7 @@ test('inbox read survives a lost response: unacknowledged batches replay until t
   const both = await f.bridge.inboxRead(friday);
   assert.deepEqual(ids(both.syncBatches), [[a.id], [b.id]]);
   const done = await f.handle(friday, lost.syncBatches[0].messageId, [lost.syncBatches[0].messageId]);
-  assert.equal(done.ackMessageId, null);
+  assert.equal(f.snapshot().messages[done.ackMessageId].envelope.correlationId, lost.syncBatches[0].messageId, 'batch ACK');
   assert.equal(f.snapshot().receipts[a.id].state, 'complete');
   assert.equal(f.snapshot().receipts[b.id], undefined, 'only the acknowledged batch is handled');
   assert.deepEqual(ids((await f.bridge.inboxRead(friday)).syncBatches), [[b.id]]);
@@ -260,12 +267,16 @@ test('scheduled batches are only handled once their full items were presented by
   assert.match(read.envelope.text, new RegExp(a.id));
   assert.deepEqual(read.syncBatches[0].items.map(i => [i.messageId, i.text]), [[a.id, a.text]]);
   const done = await f.bridge.complete(friday, { messageId: batchId, claimId: claim.claimId, hostedEventId: 'evt_1', hostedTurnId: null });
-  assert.equal(done.ackMessageId, null); assert.equal(done.ackSuppressed, true);
+  assert.equal('ackSuppressed' in done, false);
+  const ack = f.snapshot().messages[done.ackMessageId].envelope;
+  assert.deepEqual([ack.kind, ack.from, ack.to, ack.correlationId, ack.threadId], ['ack', 'friday', 'jarvis', batchId, batchId]);
   const item = await f.bridge.status(jarvis, { messageId: a.id });
   assert.equal(item.receiptCompleted, true); assert.equal(item.sync.via, 'flush'); assert.equal(item.sync.batchMessageId, batchId);
+  assert.equal(item.ackMessageId, null, 'no ACK per item'); assert.equal(item.batchAckMessageId, done.ackMessageId, 'covered by the batch ACK');
   assert.equal(f.snapshot().receipts[a.id].viaBatch, batchId);
   assert.deepEqual((await f.bridge.inboxRead(friday)).syncBatches, []);
-  assert.equal(Object.keys(f.snapshot().jobs).length, 1, 'batch receipt creates no ACK wake');
+  assert.deepEqual(Object.values(f.snapshot().jobs).map(j => [j.messageId, j.recipient]).sort(),
+    [[batchId, 'friday'], [done.ackMessageId, 'jarvis']].sort(), 'the batch wake plus one batch ACK');
 });
 
 // Hourly runs on time across a whole Chicago day, an item every 30 minutes:
@@ -295,6 +306,71 @@ for (const [name, y, m, d, flushes] of [['spring forward', 2026, 2, 8, 12], ['no
     assert.equal(count, flushes); assert.ok(count <= dailyFlushCap(date));
   });
 }
+
+test('malformed recipient rollout fails closed and preserves queued SYNC data', async () => {
+  const f = await fixture();
+  const queued = f.sync(); await f.send(queued);
+  const before = f.snapshot();
+  f.enabled.recipients = null;
+  f.set(noon + 5000);
+  await assert.rejects(f.bridge.flushSync(), /wake_sync_configuration_invalid/);
+  assert.deepEqual(f.snapshot(), before);
+  const urgent = f.message();
+  const sent = await f.send(urgent);
+  assert.equal(sent.jobIds.length, 1, 'ordinary direct traffic keeps the v1 route');
+  assert.equal('delivery' in sent, false);
+  const done = await f.handle(friday, urgent.id);
+  assert.ok(done.ackMessageId, 'ordinary terminal ACK remains available');
+});
+
+test('flush rechecks an invalidated rollout after the storage-lock wait before mutating queued SYNC', async () => {
+  let config = { valid: true, recipients: ['friday'] }, hold = false;
+  let entered, release;
+  const enteredLockWait = new Promise(resolve => { entered = resolve; });
+  const lockReleased = new Promise(resolve => { release = resolve; });
+  const f = await fixture({ bridgeOptions: { wakeSync: () => config }, wrapStore: store => ({
+    transaction: async fn => {
+      if (!hold) return store.transaction(fn);
+      hold = false; entered(); await lockReleased;
+      return store.transaction(fn);
+    },
+  }) });
+  const queued = f.sync(); await f.send(queued);
+  f.set(noon + 5000);
+  const before = f.snapshot();
+  hold = true;
+  const flushing = f.bridge.flushSync();
+  await enteredLockWait;
+  config = { valid: false, recipients: [] };
+  release();
+  await assert.rejects(flushing, error => error.code === 'wake_sync_configuration_invalid' && error.status === 503);
+  assert.deepEqual(f.snapshot(), before, 'invalidating while lock-waiting neither flushes nor rolls back queued data');
+});
+
+test('flush applies valid recipient removal observed after the storage-lock wait', async () => {
+  let config = { valid: true, recipients: ['friday'] }, hold = false;
+  let entered, release;
+  const enteredLockWait = new Promise(resolve => { entered = resolve; });
+  const lockReleased = new Promise(resolve => { release = resolve; });
+  const f = await fixture({ bridgeOptions: { wakeSync: () => config }, wrapStore: store => ({
+    transaction: async fn => {
+      if (!hold) return store.transaction(fn);
+      hold = false; entered(); await lockReleased;
+      return store.transaction(fn);
+    },
+  }) });
+  const queued = f.sync(); await f.send(queued);
+  f.set(noon + 5000);
+  hold = true;
+  const flushing = f.bridge.flushSync();
+  await enteredLockWait;
+  config = { valid: true, recipients: [] };
+  release();
+  const out = await flushing;
+  assert.deepEqual(out.results, [{ recipient: 'friday', outcome: 'native', items: 1 }]);
+  assert.deepEqual(out.dispatch, [queued.id], 'the locked mutation uses rollback routing, not the stale enabled setting');
+  assert.equal(f.snapshot().messages[queued.id].sync.via, 'native');
+});
 
 for (const [name, queuedAt, runs] of [
   // 00:10 CDT; the next even hour (02:00 CST) is three elapsed hours away, so 01:00 CST flushes.
@@ -562,27 +638,32 @@ test('bridge_read drains pending SYNC into a batch attached to an open message o
   await assert.rejects(f.bridge.inboxRead(jarvis), /wake_sync_not_enabled/);
 });
 
-test('no ACK wakes for an enabled recipient: receipts still complete, no reply message or job is created', async () => {
+test('ACKs are not suppressed: an enabled recipient\'s direct messages get an immediate correlated ACK at completion', async () => {
   const f = await fixture({ recipients: ['friday'] });
   const fromFriday = f.message('friday'); await f.send(fromFriday);
   const before = f.snapshot();
+  assert.equal(Object.values(before.messages).some(m => m.envelope.kind === 'ack'), false, 'no ACK at send or enqueue time');
   const done = await f.handle(jarvis, fromFriday.id);
-  assert.equal(done.ackMessageId, null); assert.equal(done.ackSuppressed, true);
-  const after = f.snapshot();
-  assert.deepEqual(Object.keys(after.messages), Object.keys(before.messages));
-  assert.deepEqual(after.jobs, before.jobs);
+  assert.equal('ackSuppressed' in done, false);
+  const ack = f.snapshot().messages[done.ackMessageId];
+  assert.deepEqual([ack.envelope.kind, ack.envelope.to, ack.envelope.correlationId], ['ack', 'friday', fromFriday.id]);
+  assert.deepEqual(done.jobIds, ack.jobIds); assert.equal(ack.jobIds.length, 1, 'delivered at once, never batched');
+  assert.equal(f.snapshot().syncQueues?.friday, undefined, 'an ACK is never queued as SYNC');
   const status = await f.bridge.status(friday, { messageId: fromFriday.id });
-  assert.equal(status.receiptCompleted, true); assert.equal(status.ackMessageId, null);
+  assert.equal(status.receiptCompleted, true); assert.equal(status.ackMessageId, done.ackMessageId);
+  // Completing the ACK itself (it is terminal) creates nothing.
+  const terminal = await f.handle(friday, done.ackMessageId);
+  assert.equal(terminal.ackMessageId, null); assert.deepEqual(terminal.jobIds, []);
   const fromJarvis = f.message('jarvis'); await f.send(fromJarvis);
-  assert.ok((await f.handle(friday, fromJarvis.id)).ackMessageId, 'Jarvis is not enabled, so it still gets ACKs');
+  assert.ok((await f.handle(friday, fromJarvis.id)).ackMessageId);
 });
 
-test('both recipients enabled: no ACK path is required or created in either direction', async () => {
+test('both recipients enabled: the v1 return-path rule applies again to direct messages in both directions', async () => {
   const f = await fixture({ recipients: ['friday', 'jarvis'] });
+  const ok = f.message('jarvis'); await f.send(ok);
   await f.store.transaction(s => { for (const sub of Object.values(s.subscriptions)) sub.expiresAt = start - 1; });
-  const m = f.message('jarvis');
-  assert.equal((await f.send(m)).jobIds.length, 1, 'no return subscription needed when no ACK will be sent');
-  assert.equal((await f.handle(friday, m.id)).ackMessageId, null);
+  await assert.rejects(f.send(f.message('jarvis')), /return_subscription_required/, 'an ACK will be sent, so its path is required');
+  await assert.rejects(f.bridge.claim(friday, { messageId: ok.id }), /return_subscription_required/);
   await assert.rejects(f.send(f.sync('friday')), /recipient_subscription_required/);
 });
 
@@ -924,18 +1005,16 @@ test('rollback native delivery is recovered into a batch when its v1 authority l
   assert.equal((await h.bridge.flushSync()).results[0].reason, 'rollback');
 });
 
-test('repository wiring: no Vercel cron; the GitHub Actions hourly trigger POSTs the route outside the MCP catch-all', () => {
+test('repository wiring: no Vercel cron and no GitHub Actions communication workflow; the route is outside the MCP catch-all', () => {
   const config = JSON.parse(readFileSync(new URL('../vercel.json', import.meta.url)));
-  assert.equal(config.crons, undefined, 'Hobby plans reject hourly Vercel crons');
-  const workflow = readFileSync(new URL('../.github/workflows/bridge-cron-flush.yml', import.meta.url), 'utf8');
-  for (const line of ["- cron: '0 * * * *'", 'workflow_dispatch:', 'permissions: {}', 'timeout-minutes: 5',
-    'group: bridge-cron-flush', 'secrets.CRON_SECRET', 'vars.BRIDGE_CRON_URL', '--fail-with-body', '--request POST',
-    'echo "::error::Bridge SYNC flush is not configured', 'exit 1']) {
-    assert.ok(workflow.includes(line), line);
+  assert.equal(config.crons, undefined, 'no Vercel cron (the scheduler is external: QStash or any bearer caller)');
+  // Repository CI stays; nothing under .github drives agent communication.
+  const workflows = readdirSync(new URL('../.github/workflows/', import.meta.url)).sort();
+  assert.deepEqual(workflows, ['ci.yml', 'codeql.yml']);
+  for (const name of workflows) {
+    const text = readFileSync(new URL(`../.github/workflows/${name}`, import.meta.url), 'utf8');
+    for (const word of ['/api/cron', 'CRON_SECRET', 'QSTASH', 'BRIDGE_CRON_URL', 'flush']) assert.equal(text.includes(word), false, `${name}: ${word}`);
   }
-  assert.equal(/^\s*-?\s*uses:/m.test(workflow), false, 'no third-party actions');
-  assert.equal(/exit 0/.test(workflow), false, 'a missing secret or URL never passes silently');
-  for (const name of ['BRIDGE_PUBLIC_ORIGIN', 'BRIDGE_PEERS']) assert.equal(workflow.includes(name), false, name);
   const catchAll = new RegExp('^' + config.rewrites[0].source + '$');
   assert.equal(catchAll.test('/api/cron'), false); assert.equal(catchAll.test('/api/queue'), false);
   assert.equal(catchAll.test('/bridge/friday/mcp'), true);
@@ -1009,6 +1088,28 @@ test('runtime: tool schemas, readiness and inbox tool follow the per-recipient f
   assert.equal((await off.rpc('friday', 'tools/list', {})).body.result.tools.some(t => t.name === 'bridge_inbox_read'), false);
 });
 
+test('runtime: malformed recipient rollout holds queued data while v1 direct delivery and ACKs continue', async () => {
+  const f = await runtimeFixture();
+  const queued = f.message({ subject: 'held' });
+  assert.equal((await f.call('jarvis', 'bridge_message_send', queued)).structuredContent.delivery, 'batched');
+  f.env.BRIDGE_WAKE_SYNC_RECIPIENTS = 'friday,bogus';
+  const health = await f.call('friday', 'bridge_health', {});
+  assert.deepEqual(health.structuredContent.readiness.wakeSync, { valid: false, recipients: [], flushScheduleConfigured: true });
+  const before = structuredClone(f.document());
+  f.set(noon + 5000);
+  const failed = await f.cron(auth);
+  assert.equal(failed.status, 503); assert.deepEqual(await failed.json(), { error: 'flush_unavailable' });
+  assert.deepEqual(f.document(), before, 'invalid configuration cannot turn queued SYNC into rollback wakes');
+
+  const direct = f.message({ expiresAt: iso(noon + HOUR) }); delete direct.class;
+  const sent = (await f.call('jarvis', 'bridge_message_send', direct)).structuredContent;
+  assert.equal('delivery' in sent, false); assert.equal(f.document().messages[direct.id].jobIds.length, 1);
+  const claim = (await f.call('friday', 'bridge_receipt_claim', { messageId: direct.id })).structuredContent;
+  const done = (await f.call('friday', 'bridge_receipt_complete', { messageId: direct.id, claimId: claim.claimId,
+    hostedEventId: null, hostedTurnId: null })).structuredContent;
+  assert.ok(done.ackMessageId, 'ordinary terminal ACK remains enabled');
+});
+
 const auth = { authorization: 'Bearer fixture-cron-secret-value' };
 test('runtime cron auth: POST and GET need the exact CRON_SECRET bearer; other methods and an unset secret are refused', async () => {
   const f = await runtimeFixture({}, noon + 5 * MINUTE);
@@ -1052,8 +1153,11 @@ test('runtime cron: odd hour is a no-op; even-hour (late) POST flushes one v1-sh
   const claim = (await f.call('friday', 'bridge_receipt_claim', { messageId: batchId })).structuredContent;
   const done = (await f.call('friday', 'bridge_receipt_complete', { messageId: batchId, claimId: claim.claimId,
     hostedEventId: null, hostedTurnId: null, syncBatchIds: read.syncBatches.map(x => x.messageId) })).structuredContent;
-  assert.equal(done.ackMessageId, null); assert.deepEqual(done.syncBatchesAcked, [batchId]);
-  assert.equal((await f.call('jarvis', 'bridge_status', { messageId: a.id })).structuredContent.receiptCompleted, true);
+  assert.ok(done.ackMessageId, 'the batch gets one ACK'); assert.deepEqual(done.syncBatchesAcked, [batchId]);
+  // Pre-armed before the commit: the receipt dispatch for the batch resolves to its ACK.
+  assert.ok(f.sends.some(args => args[1].dispatchReceiptOf === batchId));
+  const itemStatus = (await f.call('jarvis', 'bridge_status', { messageId: a.id })).structuredContent;
+  assert.equal(itemStatus.receiptCompleted, true); assert.equal(itemStatus.batchAckMessageId, done.ackMessageId);
   assert.deepEqual((await f.call('friday', 'bridge_inbox_read', {})).structuredContent, { syncBatches: [] });
 });
 
@@ -1573,4 +1677,397 @@ test('completion capacity: an oversized existing carrier holds 32 and defers the
   assert.deepEqual((await f.bridge.complete(friday, { messageId: overflow, claimId: direct.claimId, hostedEventId: null,
     hostedTurnId: null, syncBatchIds: [overflow] })).syncBatchesAcked, [overflow]);
   for (const t of stranded) assert.equal(f.snapshot().receipts[t.x.id].state, 'complete');
+});
+
+// --- Restored ACKs (owner instruction) ------------------------------------------
+// ACK = the receiver reports it handled the received data. One immediate
+// correlated ACK per handled direct message and per handled non-empty batch,
+// created at completion (never at send or enqueue), never for an ACK.
+const acksIn = s => Object.values(s.messages).filter(m => m.envelope.kind === 'ack');
+const ackOf = (s, id) => acksIn(s).filter(m => m.envelope.correlationId === id);
+// Records each pre-commit receipt dispatch together with whether the receipt
+// was still uncommitted at that moment.
+function prepareSpy(get) {
+  const calls = [];
+  return { calls, prepareReceipt: async id => { calls.push({ id, committed: get()?.receipts[id]?.state === 'complete' }); } };
+}
+
+test('ACK (direct/urgent): a promoted WAKE is ACKed at completion only; an omitted piggyback batch gets no ACK until handled', async () => {
+  let f; const spy = prepareSpy(() => f.snapshot());
+  f = await fixture({ bridgeOptions: { prepareReceipt: id => spy.prepareReceipt(id) } });
+  const a = f.sync('jarvis', { subject: 'A' }); await f.send(a);
+  const urgent = f.sync('jarvis', { subject: 'Now', dueAt: iso(start + HOUR) });
+  const sent = await f.send(urgent);
+  assert.equal(sent.class, 'wake'); assert.equal(sent.piggybackedSyncItems, 1);
+  assert.deepEqual(acksIn(f.snapshot()), [], 'no ACK at send time');
+  const read = await f.bridge.read(friday, { messageId: urgent.id });
+  const batch = read.syncBatches[0].messageId;
+  const claim = await f.bridge.claim(friday, { messageId: urgent.id });
+  assert.deepEqual(claim.syncBatchIds, [batch]);
+  assert.deepEqual(acksIn(f.snapshot()), [], 'no ACK at claim time');
+  const done = await f.bridge.complete(friday, { messageId: urgent.id, claimId: claim.claimId, hostedEventId: null, hostedTurnId: null });
+  assert.deepEqual(spy.calls, [{ id: urgent.id, committed: false }], 'only the message ACK is pre-armed: the batch was not named');
+  assert.deepEqual(ackOf(f.snapshot(), urgent.id).map(m => m.envelope.id), [done.ackMessageId]);
+  assert.equal('syncBatchAcks' in done, false); assert.equal('syncBatchesAcked' in done, false);
+  assert.deepEqual(ackOf(f.snapshot(), batch), [], 'omitted batch: no ACK');
+  assert.equal(f.snapshot().receipts[batch], undefined, 'hold released, not acknowledged');
+  // Handled later on its own: exactly one ACK for it.
+  assert.deepEqual(ids((await f.bridge.inboxRead(friday)).syncBatches), [[a.id]]);
+  const direct = await f.handle(friday, batch, [batch]);
+  assert.deepEqual(ackOf(f.snapshot(), batch).map(m => m.envelope.id), [direct.ackMessageId]);
+  assert.equal(acksIn(f.snapshot()).length, 2);
+});
+
+test('ACK (piggyback): the carrier ACK plus one separate ACK per handled attached batch; items share their batch ACK', async () => {
+  let f; const spy = prepareSpy(() => f.snapshot());
+  f = await fixture({ bridgeOptions: { prepareReceipt: id => spy.prepareReceipt(id) } });
+  const a = f.sync('jarvis', { subject: 'A' }), a2 = f.sync('jarvis', { subject: 'A2' }); await f.send(a); await f.send(a2);
+  const w = f.message(); await f.send(w); // piggybacks batch 1 (a, a2)
+  const b = f.sync('jarvis', { subject: 'B' }); await f.send(b);
+  const read = await f.bridge.read(friday, { messageId: w.id }); // collects batch 2 (b)
+  assert.deepEqual(ids(read.syncBatches), [[a.id, a2.id], [b.id]]);
+  const [b1, b2] = read.syncBatches.map(x => x.messageId);
+  const claim = await f.bridge.claim(friday, { messageId: w.id });
+  assert.deepEqual(claim.syncBatchIds, [b1, b2]);
+  const done = await f.bridge.complete(friday, { messageId: w.id, claimId: claim.claimId, hostedEventId: null, hostedTurnId: null,
+    syncBatchIds: [b1, b2] });
+  assert.deepEqual(spy.calls, [w.id, b1, b2].map(id => ({ id, committed: false })), 'every ACK pre-armed before the commit');
+  const s = f.snapshot();
+  assert.deepEqual(done.syncBatchesAcked, [b1, b2]);
+  assert.deepEqual(done.syncBatchAcks.map(x => x.batchMessageId), [b1, b2]);
+  const all = [done.ackMessageId, ...done.syncBatchAcks.map(x => x.ackMessageId)];
+  assert.equal(new Set(all).size, 3, 'three distinct ACKs; the carrier ACK is never reused');
+  assert.deepEqual(all.map(id => s.messages[id].envelope.correlationId), [w.id, b1, b2]);
+  for (const id of all) assert.deepEqual([s.messages[id].envelope.from, s.messages[id].envelope.to], ['friday', 'jarvis']);
+  // Each batch receipt links its own ACK (what queue dispatchReceiptOf resolves).
+  assert.equal(s.receipts[w.id].ackMessageId, done.ackMessageId);
+  for (const x of done.syncBatchAcks) {
+    assert.equal(s.receipts[x.batchMessageId].ackMessageId, x.ackMessageId);
+    assert.equal(s.receipts[x.batchMessageId].viaMessage, w.id);
+    assert.ok(s.messages[x.ackMessageId].jobIds.length === 1);
+  }
+  // Items: no ACK of their own; covered by their batch's ACK.
+  for (const [item, x] of [[a, 0], [a2, 0], [b, 1]]) {
+    assert.deepEqual([s.receipts[item.id].ackMessageId, s.receipts[item.id].batchAckMessageId], [null, done.syncBatchAcks[x].ackMessageId]);
+    assert.deepEqual(ackOf(s, item.id), []);
+  }
+  assert.deepEqual(done.jobIds.sort(), all.flatMap(id => s.messages[id].jobIds).sort());
+  // ACK -> no ACK: the original sender completing a batch ACK creates nothing.
+  const back = await f.handle(jarvis, done.syncBatchAcks[0].ackMessageId);
+  assert.equal(back.ackMessageId, null); assert.deepEqual(back.jobIds, []);
+  assert.equal(acksIn(f.snapshot()).length, 3);
+});
+
+test('ACK dedup: a lost completion response, retries and re-claims never duplicate an ACK or spend quota', async () => {
+  let lose = false;
+  const wrapStore = inner => ({ transaction: async fn => {
+    const out = await inner.transaction(fn);
+    if (lose && out?.completed === true && out.duplicate === false) { lose = false; throw Error('FIXTURE_COMMIT_RESPONSE_LOST'); }
+    return out;
+  } });
+  const f = await fixture({ wrapStore });
+  const a = f.sync('jarvis', { subject: 'A' }); await f.send(a);
+  const w = f.message(); await f.send(w);
+  const read = await f.bridge.read(friday, { messageId: w.id }), batch = read.syncBatches[0].messageId;
+  const claim = await f.bridge.claim(friday, { messageId: w.id });
+  const params = { messageId: w.id, claimId: claim.claimId, hostedEventId: null, hostedTurnId: null, syncBatchIds: [batch] };
+  const before = f.snapshot();
+  lose = true;
+  await assert.rejects(f.bridge.complete(friday, params), /FIXTURE_COMMIT_RESPONSE_LOST/);
+  const committed = f.snapshot();
+  assert.equal(acksIn(committed).length, 2, 'committed despite the lost response');
+  const retry = await f.bridge.complete(friday, params);
+  assert.equal(retry.duplicate, true);
+  assert.equal(retry.ackMessageId, committed.receipts[w.id].ackMessageId);
+  assert.deepEqual(retry.syncBatchAcks, [{ batchMessageId: batch, ackMessageId: committed.receipts[batch].ackMessageId }]);
+  assert.deepEqual(retry.syncBatchesAcked, [batch]);
+  // Further retries, a direct re-claim of the batch, and a re-read change nothing.
+  await f.bridge.complete(friday, params);
+  assert.deepEqual(await f.bridge.claim(friday, { messageId: batch }), { duplicate: true, completed: true,
+    ackMessageId: committed.receipts[batch].ackMessageId });
+  await f.bridge.read(friday, { messageId: w.id });
+  const after = f.snapshot();
+  assert.equal(acksIn(after).length, 2);
+  assert.deepEqual(after.probeAdmissions, before.probeAdmissions, 'ACKs never spend send admission quota');
+  assert.deepEqual(Object.keys(after.messageIds).length, Object.keys(committed.messageIds).length);
+  assert.deepEqual(after.jobs, committed.jobs);
+});
+
+test('ACK lost commit: a failed completion commit leaves the pre-armed dispatch harmless and the retry ACKs once', async () => {
+  let failCommit = false;
+  const wrapStore = inner => ({ transaction: fn => inner.transaction(state => {
+    const out = fn(state);
+    if (failCommit && out?.completed === true && out.duplicate === false) { failCommit = false; throw Error('FIXTURE_COMMIT_FAILED'); }
+    return out;
+  }) });
+  let f; const spy = prepareSpy(() => f.snapshot());
+  f = await fixture({ wrapStore, bridgeOptions: { prepareReceipt: id => spy.prepareReceipt(id) } });
+  const a = f.sync('jarvis', { subject: 'A' }); await f.send(a);
+  const w = f.message(); await f.send(w);
+  const batch = (await f.bridge.read(friday, { messageId: w.id })).syncBatches[0].messageId;
+  const claim = await f.bridge.claim(friday, { messageId: w.id });
+  const params = { messageId: w.id, claimId: claim.claimId, hostedEventId: null, hostedTurnId: null, syncBatchIds: [batch] };
+  failCommit = true;
+  await assert.rejects(f.bridge.complete(friday, params), /FIXTURE_COMMIT_FAILED/);
+  assert.deepEqual(spy.calls.map(c => c.id), [w.id, batch], 'both ACK dispatches were armed before the failed commit');
+  const rolled = f.snapshot();
+  assert.deepEqual(acksIn(rolled), []);
+  assert.equal(rolled.receipts[w.id].state, 'claimed'); assert.equal(rolled.messages[batch].syncBatch.ackedAt, undefined);
+  // What the queue's dispatchReceiptOf resolves now: nothing (no ACK, no spawned work).
+  assert.equal(rolled.receipts[batch].ackMessageId, undefined);
+  const done = await f.bridge.complete(friday, params);
+  const s = f.snapshot();
+  assert.equal(acksIn(s).length, 2);
+  // And after the retry: each armed receipt resolves to its own ACK's jobs.
+  for (const id of [w.id, batch]) assert.equal(s.messages[s.receipts[id].ackMessageId].jobIds.length, 1, id);
+  assert.equal(s.receipts[batch].ackMessageId, done.syncBatchAcks[0].ackMessageId);
+});
+
+test('ACK is terminal (repro): reading, claiming or completing an ACK collects no SYNC and the pending queue stays pending', async () => {
+  // A legacy ACK created with the flag off...
+  const f = await fixture({ recipients: [] });
+  const m = f.message('jarvis'); await f.send(m);
+  const ackId = (await f.handle(friday, m.id)).ackMessageId;
+  assert.ok(ackId);
+  // ...then batching is enabled for the ACK's recipient and SYNC is queued to it.
+  f.enabled.recipients = ['jarvis'];
+  const pending = f.sync('friday', { subject: 'queued for jarvis' }); await f.send(pending);
+  const before = f.snapshot();
+  assert.equal(before.messages[pending.id].sync.state, 'pending');
+  const read = await f.bridge.read(jarvis, { messageId: ackId });
+  assert.equal('syncBatches' in read, false, 'an ACK read presents nothing');
+  const claim = await f.bridge.claim(jarvis, { messageId: ackId });
+  assert.equal('syncBatchIds' in claim, false);
+  const done = await f.bridge.complete(jarvis, { messageId: ackId, claimId: claim.claimId, hostedEventId: null, hostedTurnId: null });
+  assert.deepEqual([done.ackMessageId, done.jobIds, 'syncBatchAcks' in done], [null, [], false]);
+  const after = f.snapshot();
+  assert.equal(after.messages[pending.id].sync.state, 'pending', 'still queued');
+  assert.deepEqual(batchesIn(after), [], 'no batch was cut');
+  assert.equal(after.messages[ackId].syncBatchIds, undefined);
+  assert.deepEqual(acksIn(after).map(x => x.envelope.id), [ackId], 'no reciprocal ACK');
+  assert.deepEqual(after.jobs, before.jobs);
+  // The data is intact for the next real read.
+  assert.deepEqual(ids((await f.bridge.inboxRead(jarvis)).syncBatches), [[pending.id]]);
+});
+
+test('ACK return path (repro): a batch ACK needs only a usable return window, not the batch\'s 12 h synthetic authority', async () => {
+  const f = await fixture();
+  const setSub = until => f.store.transaction(s => { for (const sub of Object.values(s.subscriptions)) sub.expiresAt = until; });
+  const a = f.sync('jarvis', { subject: 'A' }); await f.send(a);
+  const batch = (await f.bridge.inboxRead(friday)).syncBatches[0].messageId;
+  assert.equal(Date.parse(f.snapshot().messages[batch].envelope.expiresAt), start + SYNC_BATCH_TTL_MS);
+  // 30 minutes of return subscription: unobtainable under a 12 h coverage rule, enough for a <= 1 h ACK.
+  await setSub(start + 30 * MINUTE);
+  // The v1 rule still applies to a real message whose authority outlasts the path.
+  await assert.rejects(f.send(f.message()), /return_subscription_required/);
+  const claim = await f.bridge.claim(friday, { messageId: batch });
+  // Revoked between claim and completion: refused, nothing changes.
+  await setSub(start - 1);
+  const params = { messageId: batch, claimId: claim.claimId, hostedEventId: null, hostedTurnId: null, syncBatchIds: [batch] };
+  const held = f.snapshot();
+  await assert.rejects(f.bridge.complete(friday, params), /return_subscription_required/);
+  assert.deepEqual(f.snapshot(), held);
+  await setSub(start + 30 * MINUTE);
+  const done = await f.bridge.complete(friday, params);
+  const ack = f.snapshot().messages[done.ackMessageId];
+  assert.equal(Date.parse(ack.envelope.expiresAt), start + 30 * MINUTE, 'ACK lifetime capped to the return window');
+  assert.ok(ack.authorization.expiresAt <= start + 30 * MINUTE);
+  // Too short a window (under 5 min past the lease) is refused at claim, with no state change.
+  // (Sending a SYNC item keeps the strict v1 rule: after a rollback it is ACKed natively.)
+  await setSub(start + 6 * HOUR);
+  const b = f.sync('jarvis', { subject: 'B' }); await f.send(b);
+  const next = (await f.bridge.inboxRead(friday)).syncBatches[0].messageId;
+  await setSub(start + 5 * MINUTE);
+  const before = f.snapshot();
+  await assert.rejects(f.bridge.claim(friday, { messageId: next }), /return_subscription_required/);
+  assert.deepEqual(f.snapshot(), before);
+  // A durable denial of the return path's owner closes it the same way.
+  await setSub(start + 30 * MINUTE);
+  await f.store.transaction(s => { s.resourceDenials = { [jarvis.principalKey]: {} }; });
+  await assert.rejects(f.bridge.claim(friday, { messageId: next }), /message_authorization_inactive|return_subscription_required/);
+  assert.deepEqual(ackOf(f.snapshot(), next), []);
+});
+
+test('ACK return path: an attached batch without a usable return path is deferred at claim and cannot be ACKed by the carrier', async () => {
+  const f = await fixture();
+  const a = f.sync('jarvis', { subject: 'A' }); await f.send(a);
+  const w = f.message(); await f.send(w);
+  const batch = (await f.bridge.read(friday, { messageId: w.id })).syncBatches[0].messageId;
+  // A batch owned by a principal that has no return subscription (e.g. a rotated key).
+  await f.store.transaction(s => { s.messages[batch].authorization.owner = 'd'.repeat(64); });
+  const claim = await f.bridge.claim(friday, { messageId: w.id });
+  assert.deepEqual([claim.syncBatchIds, claim.syncBatchesDeferred], [[], [batch]]);
+  await assert.rejects(f.bridge.complete(friday, { messageId: w.id, claimId: claim.claimId, hostedEventId: null, hostedTurnId: null,
+    syncBatchIds: [batch] }), /sync_batch_not_held/);
+  const done = await f.bridge.complete(friday, { messageId: w.id, claimId: claim.claimId, hostedEventId: null, hostedTurnId: null });
+  assert.ok(done.ackMessageId); assert.deepEqual(ackOf(f.snapshot(), batch), []);
+});
+
+test('ACK: expired items, current policy and durable denial', async () => {
+  // Items that expired while queued are still covered by their batch's ACK.
+  const f = await fixture();
+  const a = f.sync('jarvis', { subject: 'A', expiresAt: iso(start + 3 * HOUR) }); await f.send(a);
+  f.set(start + 4 * HOUR);
+  const read = await f.bridge.inboxRead(friday), batch = read.syncBatches[0].messageId;
+  assert.equal(read.syncBatches[0].items[0].expired, true);
+  const done = await f.handle(friday, batch, [batch]);
+  assert.equal(f.snapshot().receipts[a.id].batchAckMessageId, done.ackMessageId);
+  assert.deepEqual(ackOf(f.snapshot(), batch).map(m => m.envelope.id), [done.ackMessageId]);
+  // A policy change closes the batch: no claim, no ACK.
+  const g = await fixture();
+  await g.send(g.sync('jarvis', { subject: 'P' }));
+  const gb = (await g.bridge.inboxRead(friday)).syncBatches[0].messageId;
+  g.bridge.messagePolicyIds.jarvis = 'e'.repeat(64);
+  await assert.rejects(g.bridge.claim(friday, { messageId: gb }), /message_authorization_inactive/);
+  // A durable denial of the batch's sender after the claim refuses the completion.
+  const h = await fixture();
+  await h.send(h.sync('jarvis', { subject: 'D' }));
+  const hb = (await h.bridge.inboxRead(friday)).syncBatches[0].messageId;
+  const claim = await h.bridge.claim(friday, { messageId: hb });
+  await h.store.transaction(s => { s.resourceDenials = { [jarvis.principalKey]: {} }; });
+  await assert.rejects(h.bridge.complete(friday, { messageId: hb, claimId: claim.claimId, hostedEventId: null, hostedTurnId: null,
+    syncBatchIds: [hb] }), /message_authorization_inactive/);
+  for (const x of [g, h]) assert.deepEqual(acksIn(x.snapshot()), []);
+});
+
+test('ACK (stranded fallback): a re-homed batch on a flush carrier gets its own ACK, and its old carrier does not repeat it', async () => {
+  const { f, x, w, batch } = await deadCarrier();
+  const y = f.sync('jarvis', { subject: 'Y' }); await f.send(y);
+  f.set(noon + 5000);
+  const carrier = (await f.bridge.flushSync()).dispatch[0];
+  assert.notEqual(carrier, batch);
+  const done = await f.receive(carrier);
+  assert.deepEqual(done.syncBatchesAcked, [carrier, batch]);
+  const s = f.snapshot();
+  assert.equal(s.messages[done.ackMessageId].envelope.correlationId, carrier);
+  assert.deepEqual(done.syncBatchAcks.map(a => [a.batchMessageId, s.messages[a.ackMessageId].envelope.correlationId]), [[batch, batch]]);
+  assert.equal(s.receipts[x.id].batchAckMessageId, done.syncBatchAcks[0].ackMessageId);
+  assert.equal(s.receipts[y.id].batchAckMessageId, done.ackMessageId);
+  // The original carrier, if still handled, ACKs only itself.
+  const old = await f.receive(w.id);
+  assert.equal('syncBatchAcks' in old, false);
+  assert.equal(ackOf(f.snapshot(), batch).length, 1);
+});
+
+test('ACK capacity: a 32-ID completion creates and pre-arms 32 distinct batch ACKs in one commit', async () => {
+  let f; const spy = prepareSpy(() => f.snapshot());
+  f = await fixture({ bridgeOptions: { prepareReceipt: id => spy.prepareReceipt(id) } });
+  await strandMany(f, 32);
+  f.set(noon + 5000);
+  const carrier = (await f.bridge.flushSync()).dispatch[0];
+  const done = await f.receive(carrier);
+  assert.equal(done.syncBatchesAcked.length, 32);
+  const acked = done.syncBatchesAcked, s = f.snapshot();
+  assert.deepEqual(spy.calls.map(c => c.id).sort(), [...acked].sort());
+  assert.ok(spy.calls.every(c => !c.committed));
+  const ackIds = acked.map(id => s.receipts[id].ackMessageId);
+  assert.equal(new Set(ackIds).size, 32);
+  assert.deepEqual(ackIds.map(id => s.messages[id].envelope.correlationId), acked);
+  assert.equal(done.jobIds.length, 32);
+});
+
+test('ACK with the flag turned off: an outstanding batch still gets exactly one ACK; v1 messages keep theirs', async () => {
+  const f = await fixture();
+  await f.send(f.sync('jarvis', { subject: 'A' }));
+  const batch = (await f.bridge.inboxRead(friday)).syncBatches[0].messageId;
+  f.enabled.recipients = [];
+  const done = await f.handle(friday, batch, [batch]);
+  assert.deepEqual(ackOf(f.snapshot(), batch).map(m => m.envelope.id), [done.ackMessageId]);
+  const m = f.message(); await f.send(m);
+  assert.equal('syncBatches' in await f.bridge.read(friday, { messageId: m.id }), false);
+  assert.ok((await f.handle(friday, m.id)).ackMessageId);
+  assert.equal(acksIn(f.snapshot()).length, 2);
+});
+
+test('ACK: an empty flush creates no batch and no ACK', async () => {
+  const f = await fixture();
+  f.set(noon + 5000);
+  assert.deepEqual(await f.bridge.flushSync(), { boundary: noon, results: [], dispatch: [] });
+  assert.deepEqual(Object.keys(f.snapshot().messages), []);
+});
+
+// --- ACK targets keep their own current authority -----------------------------
+const OTHER_POLICY = 'd'.repeat(64);
+const whoWith = (role, { policyId = policy, key } = {}) => Object.defineProperty({ role, scopes: Object.values(SCOPES[role]),
+  principalKey: key || (role === 'jarvis' ? 'a' : 'b').repeat(64) }, VERIFIED_AUTHORIZATION,
+{ value: { policyId, expiresAt: start + 7 * 86400000 } });
+// An old-policy batch stranded on its old carrier, then a policy rotation and
+// new SYNC data: the noon flush makes a fresh (new-policy) carrier that
+// attaches the old batch (normal carrier-loss fallback).
+async function freshCarrierOldBatch(sender) {
+  const recipient = sender === 'jarvis' ? 'friday' : 'jarvis';
+  const f = await fixture({ recipients: [recipient] });
+  const old = f.sync(sender, { subject: 'old' }); await f.send(old);
+  const w = f.message(sender); await f.send(w);
+  const oldBatch = f.snapshot().messages[w.id].syncBatchIds[0];
+  f.bridge.messagePolicyIds[sender] = OTHER_POLICY;
+  if (sender === 'jarvis') {
+    // The events peer re-subscribes under the new policy (its return path).
+    await f.store.transaction(s => { for (const sub of Object.values(s.subscriptions)) sub.authorization.policyId = OTHER_POLICY; });
+  }
+  const fresh = f.sync(sender, { subject: 'new' }); await f.send(fresh, whoWith(sender, { policyId: OTHER_POLICY }));
+  f.set(noon + 5000);
+  const carrier = (await f.bridge.flushSync()).dispatch.find(id => id !== oldBatch);
+  assert.deepEqual(f.snapshot().messages[carrier].syncBatchIds, [oldBatch], 'old batch attached to the fresh carrier');
+  return { f, recipient, old, fresh, oldBatch, carrier, as: whoWith(recipient) };
+}
+for (const sender of ['friday', 'jarvis']) {
+  test(`ACK target authority (${sender} -> peer): a fresh carrier never holds or ACKs a batch whose policy was withdrawn`, async () => {
+    const { f, old, fresh, oldBatch, carrier, as } = await freshCarrierOldBatch(sender);
+    const read = await f.bridge.read(as, { messageId: carrier });
+    assert.deepEqual(read.syncBatches.map(b => b.messageId), [carrier, oldBatch]);
+    const claim = await f.bridge.claim(as, { messageId: carrier });
+    assert.deepEqual([claim.syncBatchIds, claim.syncBatchesInactive], [[], [oldBatch]]);
+    assert.equal(f.snapshot().receipts[oldBatch], undefined, 'not held');
+    await assert.rejects(f.bridge.complete(as, { messageId: carrier, claimId: claim.claimId, hostedEventId: null, hostedTurnId: null,
+      syncBatchIds: [carrier, oldBatch] }), /sync_batch_not_held/);
+    const done = await f.bridge.complete(as, { messageId: carrier, claimId: claim.claimId, hostedEventId: null, hostedTurnId: null,
+      syncBatchIds: [carrier] });
+    assert.deepEqual(done.syncBatchesAcked, [carrier]); assert.equal('syncBatchAcks' in done, false);
+    const s = f.snapshot();
+    assert.deepEqual(ackOf(s, oldBatch), [], 'no ACK for withdrawn data');
+    assert.equal(s.receipts[old.id], undefined);
+    assert.equal(s.receipts[fresh.id].batchAckMessageId, done.ackMessageId);
+    // Not claimable directly either.
+    await assert.rejects(f.bridge.claim(as, { messageId: oldBatch }), /message_authorization_inactive/);
+  });
+}
+
+test('ACK target authority mid-await (friday -> jarvis): a batch denied between pre-arm and commit refuses the whole completion', async () => {
+  let f, deny = false;
+  const itemOwner = 'f'.repeat(64);
+  f = await fixture({ recipients: ['jarvis'], bridgeOptions: { prepareReceipt: async () => {
+    if (deny) await f.store.transaction(s => { s.resourceDenials = { [itemOwner]: {} }; });
+  } } });
+  // Items admitted by one principal, the carrier by another (same role and policy).
+  const item = f.sync('friday', { subject: 'I' }); await f.send(item, whoWith('friday', { key: itemOwner }));
+  const w = f.message('friday'); await f.send(w);
+  const batch = (await f.bridge.read(jarvis, { messageId: w.id })).syncBatches[0].messageId;
+  const claim = await f.bridge.claim(jarvis, { messageId: w.id });
+  assert.deepEqual(claim.syncBatchIds, [batch]);
+  const params = { messageId: w.id, claimId: claim.claimId, hostedEventId: null, hostedTurnId: null, syncBatchIds: [batch] };
+  const before = f.snapshot();
+  deny = true;
+  await assert.rejects(f.bridge.complete(jarvis, params), e => e.code === 'sync_batch_authorization_inactive' &&
+    e.details?.batchMessageId === batch);
+  deny = false;
+  const after = f.snapshot();
+  assert.deepEqual(acksIn(after), []); assert.deepEqual(after.receipts, before.receipts, 'nothing committed');
+  // The carrier alone still completes; the withdrawn batch gets no ACK.
+  const done = await f.bridge.complete(jarvis, { ...params, syncBatchIds: [] });
+  assert.ok(done.ackMessageId); assert.deepEqual(ackOf(f.snapshot(), batch), []);
+});
+
+test('ACK target authority mid-await (jarvis -> friday): a policy rotation between pre-arm and commit creates no ACK at all', async () => {
+  let f, rotate = false;
+  f = await fixture({ bridgeOptions: { prepareReceipt: async () => { if (rotate) f.bridge.messagePolicyIds.jarvis = OTHER_POLICY; } } });
+  await f.send(f.sync('jarvis', { subject: 'I' }));
+  const w = f.message(); await f.send(w);
+  const batch = (await f.bridge.read(friday, { messageId: w.id })).syncBatches[0].messageId;
+  const claim = await f.bridge.claim(friday, { messageId: w.id });
+  const before = f.snapshot();
+  rotate = true;
+  await assert.rejects(f.bridge.complete(friday, { messageId: w.id, claimId: claim.claimId, hostedEventId: null, hostedTurnId: null,
+    syncBatchIds: [batch] }), /message_authorization_inactive/);
+  assert.deepEqual(acksIn(f.snapshot()), []); assert.deepEqual(f.snapshot().receipts, before.receipts);
 });

@@ -171,3 +171,45 @@ export async function reconcileOutbox(store, enqueueJob, now = Date.now()) {
   for (const job of ids) await enqueueJob(job.id, job.dueAt);
   return { scheduled: ids.length };
 }
+
+// Scheduled-tick catch-up: re-offer overdue outbox work to the native queue.
+// Unlike reconcileOutbox above (kept unchanged for its existing callers):
+// - eligibility: a pending job only after `pendingGraceMs` past its due time
+//   (its own dispatch normally publishes it), an expired lease at once;
+// - fairness: each offered job records `reofferedAt` durably, and jobs are
+//   taken least-recently-offered first, so a backlog larger than `limit` is
+//   worked through in rotation (every job within ceil(n / limit) runs), never
+//   the same first `limit` forever;
+// - priority only within a rotation round, from durable data only (never
+//   request input): ACKs, then direct messages (WAKE), then SYNC batch
+//   deliveries. Rotation comes first, so a job offered in an earlier round
+//   waits behind jobs not yet offered, whatever their class; the bound is
+//   fairness (every overdue job within ceil(n / limit) runs), not strict
+//   priority. Immediate WAKE/ACK dispatch at send/completion is separate and
+//   never waits for this backstop;
+// - isolation: one job's publication failure does not stop the others; it is
+//   counted, rotated to the back, and retried on a later run.
+// Publication only enqueues the job ID: the worker's own leases, fencing and
+// idempotence decide what is sent.
+const jobPriority = (state, job) => {
+  const message = state.messages[job.messageId];
+  return message?.envelope?.kind === 'ack' ? 0 : message?.syncBatch ? 2 : 1;
+};
+export async function reofferOverdueJobs(store, enqueueJob, now, { pendingGraceMs = 0, limit = 100 } = {}) {
+  if (typeof enqueueJob !== 'function') throw new BridgeError('queue_configuration_required', 503);
+  const { picked, eligible } = await store.transaction(state => {
+    const due = Object.values(state.jobs).filter(job => (job.state === 'pending' && job.dueAt <= now - pendingGraceMs) ||
+      (job.state === 'leased' && job.leaseUntil <= now));
+    due.sort((a, b) => (a.reofferedAt ?? 0) - (b.reofferedAt ?? 0) || jobPriority(state, a) - jobPriority(state, b) ||
+      a.dueAt - b.dueAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    return { picked: due.slice(0, limit).map(job => ({ id: job.id, dueAt: job.dueAt })), eligible: due.length };
+  });
+  let scheduled = 0, failed = 0;
+  for (const job of picked) {
+    try { await enqueueJob(job.id, job.dueAt); scheduled++; } catch { failed++; }
+  }
+  if (picked.length) {
+    await store.transaction(state => { for (const { id } of picked) if (state.jobs[id]) state.jobs[id].reofferedAt = now; });
+  }
+  return { scheduled, failed, deferred: eligible - picked.length };
+}

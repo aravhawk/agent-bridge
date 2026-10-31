@@ -6,7 +6,7 @@ import { PostgresStore } from './store.mjs';
 import { Bridge } from './bridge.mjs';
 import { NativeEvents, authorizeRecipient } from './events.mjs';
 import { createProtector, createPublicWebhookTransport, decodeStorageKey } from './webhook.mjs';
-import { DeliveryWorker } from './worker.mjs';
+import { DeliveryWorker, reofferOverdueJobs } from './worker.mjs';
 import { createMcpHandler } from './mcp.mjs';
 import { createQueueAdapter } from './queue.mjs';
 import { resourceFor, metadataFor, providerConfiguration } from './resource.mjs';
@@ -20,7 +20,16 @@ import { CONFIG, EVENTS_PEER, WEBHOOK_PEER, PEER_IDS, NAMES, peerCode, webhookPe
 import { createTaskCapability, validateTaskCapabilityOptions } from './task-capability.mjs';
 import { createTaskAccess } from './task-access.mjs';
 import { wakeSyncRecipients, WAKE_SYNC_FLAG } from './sync.mjs';
+import { attachmentConfig, createBlobProvider } from './blob.mjs';
+import { createAttachments, admitAttachments, validRetentionPolicy } from './attachments.mjs';
+import { qstashConfig, verifyQStashTick, boundedBody, tickSeen, recordTick } from './qstash.mjs';
 import { timingSafeEqual } from 'node:crypto';
+
+// Pending outbox jobs this long past their due time are re-offered to the
+// native queue by each scheduled tick (fresh jobs are left to their own
+// dispatch); jobs whose lease expired are re-offered at once. A lost queue
+// publication or missed ticks therefore cannot strand a WAKE, ACK or batch.
+export const OUTBOX_RECONCILE_GRACE_MS = 10 * 60000;
 
 // Canary callbacks are one-shot: every invocation is recorded as a terminal
 // outcome, so no ambiguous result is retried. Response bodies are dropped.
@@ -41,7 +50,7 @@ function terminalTransport(transport) {
 // credentials, issuance and refresh. Secrets are injected by the platform, never pulled.
 export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
   queueClient, accessAllowed, webhookSender, clock = Date.now, transportFactory = createPublicWebhookTransport,
-  taskData } = {}) {
+  taskData, attachmentProviderFactory, attachmentRetention } = {}) {
   // Constructor-only opt-in. No environment variable or request can enable it;
   // the exported production instance below deliberately supplies no option.
   if (taskData !== undefined && (!taskData || typeof taskData !== 'object' || Array.isArray(taskData)))
@@ -53,6 +62,15 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
     'maxLinks', 'maxLinksPerTask', 'purgeEnabled', 'retention'].includes(key)) ||
     (taskOptions.enabled !== undefined && typeof taskOptions.enabled !== 'boolean')))
     throw new BridgeError('task_runtime_configuration_required', 503);
+  // Physical deletion of attachment objects: only with a trusted,
+  // owner-approved retention policy passed here (constructor-only, like
+  // taskData). No environment variable, setting or request can supply one,
+  // and the exported production instance supplies none, so by default no
+  // DELETE is ever sent and no quota is released.
+  if (attachmentRetention !== undefined && !validRetentionPolicy(attachmentRetention)) {
+    throw new BridgeError('attachment_retention_policy_invalid', 503);
+  }
+  const retention = attachmentRetention === undefined ? undefined : Object.freeze(structuredClone(attachmentRetention));
   const taskOptedIn = taskOptions?.enabled === true;
   if (taskOptedIn && [taskOptions.leaseMs, taskOptions.linkRetentionMs].some(value => !Number.isSafeInteger(value) || value <= 0))
     throw new BridgeError('task_runtime_configuration_required', 503);
@@ -66,7 +84,12 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
   const peerSettings = () => webhookPeerSettings(env);
   const destination = () => { const peer = peerSettings(); return { endpoint: peer.url, secret: peer.secret, auth: peer.auth }; };
   // Wake/sync rollout flag, read per use so flipping it rolls back at once.
-  const wakeSync = () => wakeSyncRecipients(env[WAKE_SYNC_FLAG]).recipients;
+  // Preserve the parser's validity bit: malformed explicit configuration is
+  // v1 for ordinary traffic, but a flush must distinguish it from an explicit
+  // valid empty or recipient-removing rollout (which intentionally drains
+  // queued data through rollback).
+  const wakeSyncStatus = () => wakeSyncRecipients(env[WAKE_SYNC_FLAG]);
+  const wakeSync = () => wakeSyncStatus().recipients;
   let pool, store, bridge, events, queue, diagnostic, transport, protector, authorize, taskCapability;
   const resolver = keyResolver || (provider ? createRemoteJWKSet(new URL(provider.jwks), { timeoutDuration: 5000 }) : undefined);
   const client = queueClient || new QueueClient({ region: QUEUE_REGION, telemetry: { isEnabled: false } });
@@ -74,11 +97,28 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
     ? authorizationPolicyId({ issuer: provider.issuer, audience: resourceFor(role), role,
       subject: env.BRIDGE_ALLOWED_SUBJECT, subjectHash: env.BRIDGE_ALLOWED_SUBJECT_SHA256,
       scopeClaim: env.BRIDGE_OAUTH_SCOPE_CLAIM || 'scope' }) : null]));
+  // Private attachments: read per invocation; off unless BRIDGE_ATTACHMENTS_ENABLED
+  // is 'true' and the Blob store ID (and any size limit) validate. While off, no
+  // attachment tool, state, credential or limit read, or provider call
+  // exists. Readiness shows only booleans, and only once the flag is set.
+  const attachmentSettings = () => attachmentConfig(env);
+  const providerFor = config => (attachmentProviderFactory || (c => createBlobProvider({ config: c, clock, timeoutMs: 5000 })))(config);
+  function attachmentCapability() {
+    const config = attachmentSettings();
+    if (!config.valid) throw new BridgeError('attachments_not_enabled', 503);
+    configure();
+    return createAttachments({ store, clock, policyIds, config, provider: providerFor(config), configNow: attachmentSettings, retention });
+  }
+  function attachmentReadiness() {
+    const config = attachmentSettings();
+    return config.configured ? { attachments: { enabled: config.enabled, configured: config.valid } } : {};
+  }
   // Reported only once the flag is set, so the v1 health shape is unchanged.
   function wakeSyncReadiness() {
     const parsed = wakeSyncRecipients(env[WAKE_SYNC_FLAG]);
     return parsed.configured ? { wakeSync: { valid: parsed.valid, recipients: parsed.recipients,
-      flushScheduleConfigured: !!env.CRON_SECRET } } : {};
+      // A boolean only: a valid QStash configuration, or a usable bearer secret.
+      flushScheduleConfigured: qstashConfig(env).valid || (typeof env.CRON_SECRET === 'string' && env.CRON_SECRET.length >= 16) } } : {};
   }
   function readiness() {
     const callbackProtectorConfigured = !!decodeStorageKey(env.BRIDGE_SUBSCRIPTION_STORAGE_KEY);
@@ -101,7 +141,7 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
       subscriptionSetupEnabled: !!base && env.BRIDGE_SUBSCRIPTIONS_ENABLED === 'true',
       [NAMES.senderConfigured]: senderConfigured, receiverPolicyVerified,
       [NAMES.contractVerified]: webhookContractVerified, [NAMES.diagnosticArmed]: webhookDiagnosticArmed,
-      canaryArmed, deliveryEnabled, ...wakeSyncReadiness() };
+      canaryArmed, deliveryEnabled, ...wakeSyncReadiness(), ...attachmentReadiness() };
   }
   const taskPolicy = { issuer: provider?.issuer, subject: env.BRIDGE_ALLOWED_SUBJECT,
     subjectHash: env.BRIDGE_ALLOWED_SUBJECT_SHA256, scopeClaim: env.BRIDGE_OAUTH_SCOPE_CLAIM || 'scope' };
@@ -155,7 +195,12 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
     diagnostic = createWebhookDiagnostic({ store, ...destination(),
       transport: transport || transportFactory({ enabled: true }), from: peer.diagnosticFrom,
       until: peer.diagnosticUntil, clock });
-    bridge = new Bridge({ store, clock, messagePolicyIds: policyIds, dailyEnabled: true, wakeSync,
+    bridge = new Bridge({ store, clock, messagePolicyIds: policyIds, dailyEnabled: true, wakeSync: wakeSyncStatus,
+      admitAttachments: (state, envelope, principal, now) => {
+        const config = attachmentSettings();
+        if (!config.valid) throw new BridgeError('attachments_not_enabled', 503);
+        admitAttachments(state, envelope, principal, now, { namespace: config.namespace, policyIds, maxBytes: config.maxBytes });
+      },
       prepareMessage: id => queue.prepareMessage(id), prepareReceipt: id => queue.prepareReceipt(id) });
   }
   // Built per use from the current armed configuration. The webhook sender's
@@ -214,6 +259,8 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
       } };
       return createMcpHandler({ enabled: true, verify, bridge: operations, events: nativeEvents,
         dailyEnabled: true, healthOnly: !contractReady, webhookDiagnostic, tasks: taskOperations, wakeSync,
+        attachments: { enabled: () => attachmentSettings().valid, maxBytes: () => attachmentSettings().maxBytes,
+          ...Object.fromEntries(['begin', 'finalize', 'download'].map(m => [m, async (...args) => attachmentCapability()[m](...args)])) },
         health: () => ({ status: 'ok', authenticated: true, serverVersion: VERSION, readiness: readiness() }),
         scheduleJobs: async ids => {
           if (!readiness().deliveryEnabled) throw new BridgeError('queue_not_enabled', 503);
@@ -234,8 +281,11 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
         throw new BridgeError('delivery_not_enabled', 503);
       }, { visibilityTimeoutSeconds: 60, retry: queue.retry });
     },
-    // Hourly scheduled trigger (GitHub Actions POST, or any GET/POST caller with
-    // `Authorization: Bearer $CRON_SECRET`). Each run flushes a recipient only
+    // Scheduled trigger. Authenticated either by a verified QStash signature
+    // (POST with Upstash-Signature; see qstash.mjs) or, for any other
+    // scheduler, GET/POST with `Authorization: Bearer $CRON_SECRET`. Every
+    // check fails closed before storage is touched. Runs may arrive every few
+    // minutes; flush decisions are unchanged (extra runs are no-ops). Each run flushes a recipient only
     // when due (see flushDue: America/Chicago even hour, the 2h elapsed maximum,
     // or expiry); otherwise it is a 200 no-op. A flush that cannot commit, or
     // a committed batch that cannot be published or recorded as published, is
@@ -243,14 +293,59 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
     // No request input besides the bearer is used.
     cronHandler() {
       const reply = (body, status = 200) => Response.json(body, { status, headers: { 'cache-control': 'no-store' } });
+      // A permanently bad signed delivery: QStash must not retry (and bill) it.
+      const permanent = code => Response.json({ error: code }, { status: 489,
+        headers: { 'cache-control': 'no-store', 'upstash-nonretryable-error': 'true' } });
       return async request => {
-        if (!['GET', 'POST'].includes(request.method)) return reply({ error: 'method_not_allowed' }, 405);
-        const secret = env.CRON_SECRET;
-        if (typeof secret !== 'string' || secret.length < 16) return reply({ error: 'cron_not_configured' }, 503);
-        const wanted = Buffer.from('Bearer ' + secret), actual = Buffer.from(request.headers.get('authorization') || '');
-        if (actual.length !== wanted.length || !timingSafeEqual(actual, wanted)) return reply({ error: 'unauthorized' }, 401);
-        if (!readiness().deliveryEnabled) return reply({ status: 'skipped', reason: 'delivery_not_enabled' });
+        let tick = null;
+        if (request.headers.has('upstash-signature')) {
+          if (request.method !== 'POST') return reply({ error: 'method_not_allowed' }, 405);
+          const config = qstashConfig(env);
+          if (!config.valid) return reply({ error: 'scheduler_not_configured' }, 503);
+          try {
+            const body = await boundedBody(request);
+            tick = await verifyQStashTick({ config, signature: request.headers.get('upstash-signature'), body, now: clock() });
+          } catch (error) {
+            // A body that did not arrive in time is retryable; everything else is permanent.
+            if (error instanceof BridgeError && error.code === 'scheduler_body_timeout') return reply({ error: error.code }, 408);
+            return permanent(error instanceof BridgeError && error.status === 401 ? error.code : 'scheduler_signature_invalid');
+          }
+          // Rechecked after the awaits: the key that verified and the exact
+          // destination are still configured (a withdrawn key stops here).
+          const current = qstashConfig(env);
+          if (!current.valid || current.destination !== config.destination || ![current.current, current.next].includes(tick.key)) {
+            return reply({ error: 'scheduler_not_configured' }, 503);
+          }
+        } else {
+          if (!['GET', 'POST'].includes(request.method)) return reply({ error: 'method_not_allowed' }, 405);
+          const secret = env.CRON_SECRET;
+          if (typeof secret !== 'string' || secret.length < 16) return reply({ error: 'cron_not_configured' }, 503);
+          const wanted = Buffer.from('Bearer ' + secret), actual = Buffer.from(request.headers.get('authorization') || '');
+          if (actual.length !== wanted.length || !timingSafeEqual(actual, wanted)) return reply({ error: 'unauthorized' }, 401);
+        }
+        // Attachments appear only while enabled, so every other response keeps
+        // its exact shape. Without an approved retention policy this is a
+        // read-only report (no DELETE, no quota released, never a failure by
+        // itself); with one, a failed or blocked delete is a retryable 503.
+        const cleanup = async () => {
+          if (!attachmentSettings().valid) return null;
+          try { return await attachmentCapability().cleanup(); } catch { return { error: 'attachment_cleanup_unavailable' }; }
+        };
+        const cleanupFailed = c => !!c && (!!c.error || (c.retention === 'approved' && (c.failed > 0 || c.namespaceMismatch > 0)));
+        if (!readiness().deliveryEnabled) {
+          const attachments = await cleanup();
+          return attachments ? reply({ status: cleanupFailed(attachments) ? 'attachment_cleanup_pending' : 'skipped',
+            reason: 'delivery_not_enabled', attachments }, cleanupFailed(attachments) ? 503 : 200)
+            : reply({ status: 'skipped', reason: 'delivery_not_enabled' });
+        }
         configure();
+        // A signed tick already accepted (a replay within its token lifetime) does nothing.
+        if (tick) {
+          let seen;
+          try { seen = await store.transaction(state => tickSeen(state, tick.jti, clock())); }
+          catch { return reply({ error: 'flush_unavailable' }, 503); }
+          if (seen) return reply({ status: 'duplicate_tick' });
+        }
         let flush;
         // The flush commit failed or could not be confirmed (it may have
         // committed server-side). No publication is attempted by this call; a
@@ -272,11 +367,26 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
         const dispatchPending = dispatch.length - recorded;
         // Anything still unpublished (or not recorded as published) is a
         // retryable 503, so the trigger's retries and failure reporting apply.
-        return reply({ status: !dispatchPending ? 'ok' : unconfirmed ? 'dispatch_unconfirmed' : 'dispatch_pending',
+        // Catch-up after missed ticks or lost publications: overdue outbox
+        // jobs are re-offered in fair rotation, urgent first (see
+        // reofferOverdueJobs); any publication failure makes this run a 503.
+        let outbox = { scheduled: 0, failed: 0, deferred: 0 }, outboxFailed = false;
+        try { outbox = await reofferOverdueJobs(store, id => queue.scheduleJobs([id]), clock(), { pendingGraceMs: OUTBOX_RECONCILE_GRACE_MS }); }
+        catch { outboxFailed = true; }
+        outboxFailed ||= outbox.failed > 0;
+        const attachments = await cleanup(), attachmentsFailed = cleanupFailed(attachments);
+        const failed = dispatchPending || outboxFailed || attachmentsFailed;
+        const response = reply({ status: dispatchPending ? (unconfirmed ? 'dispatch_unconfirmed' : 'dispatch_pending')
+          : outboxFailed ? 'outbox_pending' : attachmentsFailed ? 'attachment_cleanup_pending' : 'ok',
           boundary: new Date(boundary).toISOString(),
           flushed: results.filter(r => r.outcome === 'flushed').length, capped: results.filter(r => r.outcome === 'daily_cap').length,
           redeliveredNative: results.filter(r => r.outcome === 'native').reduce((n, r) => n + r.items, 0),
-          dispatched: published.length, dispatchPending }, dispatchPending ? 503 : 200);
+          dispatched: published.length, dispatchPending, ...(outbox.scheduled ? { outboxRescheduled: outbox.scheduled } : {}),
+          ...(outbox.failed ? { outboxFailed: outbox.failed } : {}), ...(outbox.deferred ? { outboxDeferred: outbox.deferred } : {}),
+          ...(attachments ? { attachments } : {}) }, failed ? 503 : 200);
+        // Remember a fully handled signed tick (best effort; replays are idempotent anyway).
+        if (tick && !failed) await store.transaction(state => recordTick(state, tick.jti, tick.expiresAt, clock())).catch(() => {});
+        return response;
       };
     },
     async close() { await pool?.end(); },

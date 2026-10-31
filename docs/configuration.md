@@ -201,27 +201,48 @@ The results are server operation evidence only (`wakeVerified: false`).
 
 | Variable | Meaning |
 |---|---|
-| `BRIDGE_WAKE_SYNC_RECIPIENTS` | Comma-separated recipient peer IDs that get WAKE/SYNC routing, e.g. `friday`. Unset or empty: v1 behavior. Any unknown ID disables the whole flag. Read on every call, so clearing it rolls back immediately. |
-| `CRON_SECRET` | Flush-route secret (16+ random characters), set in Vercel and, with the same value, as the GitHub Actions secret `CRON_SECRET`. Callers send `Authorization: Bearer <secret>` to `/api/cron`; without it the route answers 503 and SYNC data only leaves on a WAKE or an inbox read. |
-| `BRIDGE_CRON_URL` | GitHub Actions repository **variable** (not a Vercel setting): the full HTTPS URL of the deployed `/api/cron` route. |
+| `BRIDGE_WAKE_SYNC_RECIPIENTS` | Comma-separated recipient peer IDs that get WAKE/SYNC routing, e.g. `bob` for the generic quickstart. Unset or empty: v1 behavior. A valid configuration rolls back queued recipients omitted from the list. Any ID not present in `BRIDGE_PEERS` makes the whole value invalid: ordinary traffic stays on the v1 path, while scheduled flushes fail closed and preserve queued data. Read on every call. |
+| `QSTASH_CURRENT_SIGNING_KEY` / `QSTASH_NEXT_SIGNING_KEY` | QStash signing keys (from the Upstash integration). A delivery carrying `Upstash-Signature` must verify against one of them; see [scheduler](scheduler.md). Never returned or logged. |
+| `BRIDGE_QSTASH_DESTINATION_URL` | The exact public URL the QStash schedule targets, `https://<host>/api/cron` (no port, query or trailing slash). Signed deliveries must name it as their subject; it is never taken from the request. Unset: every signed delivery is refused (`503`). |
+| `CRON_SECRET` | Optional bearer secret (16+ random characters) for any other scheduler: `Authorization: Bearer <secret>` to `/api/cron`. |
+
+Without a configured scheduler, SYNC data only leaves on a WAKE or an inbox
+read, and overdue outbox work is not re-offered.
 
 With the flag unset nothing below applies: every wake names the native
 message ID, ACKs are created, and no tool, field or state is added.
 
 For an enabled recipient:
 
-- **No ACK wakes.** Completing a receipt still records it exactly as before
-  (`bridge_status` shows `receiptCompleted`), but no ACK message or webhook is
-  created for that recipient. The events peer then also needs no return
-  subscription for its own sends. The completion result says `ackSuppressed: true`.
+- **ACKs as in v1, per handled source.** Completing a handled direct
+  message creates its correlated ACK immediately (never at send or enqueue
+  time, never batched). Completing a handled non-empty batch creates exactly
+  one ACK correlated to the batch, covering all its items (an item's status
+  shows `batchAckMessageId`, not an ACK of its own). Completing a WAKE that
+  carried batches creates the WAKE's ACK plus a separate ACK for each named
+  batch the claim holds (`syncBatchAcks`); an omitted, unheld or withdrawn
+  batch gets none and stays outstanding. ACKs are terminal: completing one
+  creates nothing, and reading or claiming one never collects SYNC data. An
+  ACK means the receiver handled the received data, not that a requested
+  task is done or that a host independently verified anything. Every ACK is
+  pre-armed on the native queue before the completion commits, and a retry
+  after a lost response returns the recorded ACK IDs without creating more.
+- **Return path.** A real message keeps the v1 rule (an events-peer sender
+  needs a return subscription covering the message's authority). A batch's
+  12-hour authority is synthetic, so its ACK instead needs an active return
+  subscription of the batch's owner for at least 5 minutes past the claim
+  lease (or until the batch expires); the batch ACK lives until the earliest
+  of 1 hour, the batch's expiry, that subscription and the completing token.
+  Each attached batch is also checked against its own current authority
+  (policy, durable denial, expiry) at claim and again at completion.
 - **Two classes.** `bridge_message_send` takes optional `class` (`wake` or
   `sync`), `subject`, `effectiveAt` and `dueAt`. A message with no class is
   WAKE, unchanged. SYNC is promoted to WAKE when its `effectiveAt`, `dueAt` or
   `expiresAt` is at or before now + 2 h 30 min: the 2-hour maximum wait plus
   30 minutes of scheduler slack. That margin covers a trigger run that is
-  somewhat late; it does not make on-time delivery certain if the hourly
+  somewhat late; it does not make on-time delivery certain if the scheduled
   trigger is delayed further or skipped (see
-  [owner rollout blockers](#owner-rollout-blockers-unresolved)). Only
+  [pre-rollout requirements](#pre-rollout-requirements)). Only
   `class: sync` may set `expiresAt` up to 12 h after `sentAt`; everything else
   keeps 1 h.
 - **Batching.** Pending SYNC items coalesce per recipient: delta only, and a
@@ -310,33 +331,30 @@ full data. The exact receiver contract is in
 
 ### Flush schedule and the 2-hour maximum
 
-The flush is triggered by the GitHub Actions workflow
-`.github/workflows/bridge-cron-flush.yml` (`0 * * * *`, hourly UTC, plus manual
-`workflow_dispatch`), which POSTs to `/api/cron` with the bearer secret. It is
-not a Vercel cron, because Vercel Hobby only allows daily crons. The workflow
-has no permissions, no third-party actions, a 5-minute timeout and a
-non-overlapping concurrency group. If the `CRON_SECRET` secret or the
-`BRIDGE_CRON_URL` variable is missing or empty, the run fails with an error
-(nothing is sent), so configure both before the workflow reaches the default
-branch, or disable the workflow. Any non-2xx response also fails the run (curl
-retries 3 times with a 30-second limit per attempt; redirects are not
-followed and count as failures).
+The flush is driven by an external scheduled tick to `/api/cron`. The
+selected scheduler is Upstash QStash: a 5-minute schedule whose signed POST
+carries only static control metadata (see [scheduler](scheduler.md) for
+verification, the reviewed dry-run plan, retries and cost). Any other
+scheduler may call the route with the `CRON_SECRET` bearer (GET or POST).
+There is no Vercel cron and no GitHub Actions communication workflow.
+Every check on a request (signature, destination, body, method, size, keys)
+happens before any storage access.
 
-The route accepts POST and GET. Every run checks each enabled recipient with
-pending SYNC data and flushes one batch when:
+Every run checks each enabled recipient with pending SYNC data and flushes
+one batch when:
 
 1. **scheduled** - an America/Chicago even hour (00:00, 02:00, … 22:00) has
    passed since its last flush and items were queued before it. A run that
    starts late, or the run after a skipped one, still delivers;
-2. **max_wait** - waiting for the next hourly run would push the oldest pending
+2. **max_wait** - waiting until the next top of the hour would push the oldest pending
    item past 2 hours of elapsed time since it was queued; or
 3. **expiring** - an item expires before the next run (plus slack), or already
    has (re-queued data).
 
 Otherwise the run is a `200` no-op (`flushed: 0`) and empty queues send
-nothing. These rules meet the 2-hour requirement only while the hourly runs
-happen on time; a delayed or skipped run delays delivery past it (see
-[owner rollout blockers](#owner-rollout-blockers-unresolved)). Each recipient is flushed at most once per boundary, so duplicate
+nothing. These rules meet the 2-hour requirement only while scheduled runs
+happen; a scheduler outage delays delivery past it (see
+[pre-rollout requirements](#pre-rollout-requirements)). Each recipient is flushed at most once per boundary, so duplicate
 runs send nothing new. The maximum is elapsed time, not wall-clock hours: on
 the fall-back day (e.g. 1 November 2026) 00:00 CDT to 02:00 CST is three real
 hours, so data queued after midnight is flushed by the 01:00 CST run instead;
@@ -349,7 +367,7 @@ capped recipient's items stay pending (held, delivered with the next WAKE,
 inbox read or the next day's first run). Batches are published to the queue
 after the flush commits, and a run reports `200` only when everything due is
 published and recorded as published. Otherwise it answers `503`, so the
-workflow's curl retries and, if the outage persists, the run fails visibly:
+scheduler retries (bounded) and the next tick tries again:
 
 - `{"error":"flush_unavailable"}`: the flush commit failed or could not be
   confirmed (a commit can succeed on the server and its response still be
@@ -363,61 +381,76 @@ workflow's curl retries and, if the outage persists, the run fails visibly:
   failed or could not be confirmed; any IDs not recorded are offered again
   (publishing again is harmless, see below).
 
+- `"status":"outbox_pending"`: overdue outbox work could not be re-offered
+  to the queue this run.
+
+**Catch-up after missed ticks.** Nothing is collapsed to the latest tick or
+silently dropped: the first run after an outage flushes every pending item
+(one batch per recipient, deduplicated only by subject as designed),
+re-offers every committed but unpublished batch, re-homes stranded batches
+(32 per completion; the overflow waits for the next run, unchanged and
+counted), and re-offers overdue outbox jobs (WAKE, ACK or batch delivery):
+pending more than 10 minutes past due, or with an expired lease, at most 100
+per run in durable rotation (least recently offered first; within a round
+ACKs, then direct messages, then batches), so every overdue job is offered
+within ceil(n / 100) runs (`outboxRescheduled`, `outboxDeferred`; a failed
+publication is isolated, counted in `outboxFailed` and makes the run a
+`503 outbox_pending`). This is bounded fairness, not strict priority. The
+daily cap and the receiver policy are not changed by catch-up: a capped
+recipient's data waits for the next day or the next WAKE or inbox read.
+Immediate WAKE and ACK delivery never waits for a tick (normal dispatch uses
+the native queue directly and is not ordered behind batches).
+
 Committed batches are never lost or re-cut: a retry, or the next run,
 publishes exactly the IDs still waiting, without using another daily-cap
 slot. Publishing an already-published batch again is harmless, because
 dispatch runs each job's idempotent worker and an accepted job is not sent
 again. A persistent queue outage still delays delivery until the queue
-recovers, which is part of the scheduling blocker (see
-[owner rollout blockers](#owner-rollout-blockers-unresolved)).
+recovers, which is part of the scheduling limitation (see
+[pre-rollout requirements](#pre-rollout-requirements)).
 Queued SYNC items stay deliverable after the sender's access token expires
 (a FYI must survive until it is flushed), but a policy change or durable
 denial still withdraws them.
 
-### Owner rollout blockers (unresolved)
+### Pre-rollout requirements
 
-This branch implements the mechanism; it does not settle the following, which
-the owner must resolve before `BRIDGE_WAKE_SYNC_RECIPIENTS` is set for anyone:
+The implementation does not settle the following. Resolve them before setting
+`BRIDGE_WAKE_SYNC_RECIPIENTS` for a recipient:
 
 - **The 2-hour maximum is a requirement, not yet a proven guarantee.** The
   requested rule is delivery of SYNC data no more than 2 elapsed hours after it
-  was queued. The bridge flushes on that basis at every run of its hourly
-  trigger, but that trigger is a nominal GitHub Actions schedule, which GitHub
-  can delay or skip. The current code therefore does not prove the guarantee.
-  The scheduling or service decision (for example a different scheduler, or an
-  accepted, documented exception) must be made before enabling. The 30-minute
-  slack in SYNC promotion only covers modest lateness.
+  was queued. The bridge flushes on that basis at every scheduled run; with
+  the selected QStash 5-minute schedule (at-least-once, bounded retries) that
+  holds while QStash and the queue are available, but an outage of either
+  still delays delivery, so it is not a proven guarantee. The schedule is
+  a separately configured operator action (see [scheduler](scheduler.md)). The
+  30-minute slack in SYNC promotion only covers modest lateness.
 - **Receiver policy exceptions are required and not adopted here.** The
   [flagged receiver contract](inbox-policy.md#flagged-receiver-contract)
   needs the receiver to (1) handle SYNC batches and their items, (2) call
   `bridge_inbox_read` at the start of a turn, which departs from the current
   no-polling rule, and (3) accept and report expired or `late` items, which
   departs from the current rule to reject expired content. Each needs an
-  owner-approved exception to the receiver policy before rollout. This
+  explicit operator policy decision before rollout. This
   documentation describes the contract; it does not adopt those exceptions or
   change any receiver policy.
 
 ### Rollout and rollback
 
 Rollout (in this order; nothing here is set by the repository; do not start
-until the owner rollout blockers above are resolved):
+until the pre-rollout requirements above are resolved):
 
-1. Generate one random secret of 16+ characters, e.g. `openssl rand -hex 32`.
-2. In Vercel (Production environment), set `CRON_SECRET` to that value and
-   redeploy so the function sees it.
-3. In GitHub (Settings → Secrets and variables → Actions), add a repository
-   secret `CRON_SECRET` with the same value.
-4. In the same place, add a repository variable `BRIDGE_CRON_URL` with the full
-   HTTPS URL of the deployed flush route, e.g. `https://<your-bridge-host>/api/cron`.
-   Do steps 1–4 before the workflow is merged to the default branch: until both
-   exist, every scheduled run fails with an error.
-5. Optionally run the "Bridge SYNC flush" workflow by hand (`workflow_dispatch`).
-   With nothing queued it should succeed with `"status":"ok"` and
-   `"flushed":0`; a 401 means the two secrets differ, a 503 means the Vercel
-   value is missing or shorter than 16 characters.
-6. Update the recipient's receiver to follow the
+1. In Vercel (Production), set `BRIDGE_QSTASH_DESTINATION_URL` to the exact
+   `https://<your-bridge-host>/api/cron` next to the existing QStash signing
+   keys, and redeploy.
+2. Review and create the 5-minute schedule from
+   `node scripts/qstash-schedule-plan.mjs --dry-run --destination <url>`.
+   The first ticks should answer `"status":"ok"` with `"flushed":0`;
+   `503 scheduler_not_configured` means a key or the destination is missing,
+   `489` means a signature, destination or body mismatch (not retried).
+3. Update the recipient's receiver to follow the
    [flagged receiver contract](inbox-policy.md#flagged-receiver-contract).
-7. Set `BRIDGE_WAKE_SYNC_RECIPIENTS=friday` in Vercel and redeploy.
+4. Set `BRIDGE_WAKE_SYNC_RECIPIENTS=bob` in Vercel and redeploy.
 
 Rollback (drain first, then switch; in this order):
 
@@ -428,22 +461,36 @@ Rollback (drain first, then switch; in this order):
    claim it, handle its items and complete it, repeating until a call returns
    `"syncBatches": []`. Each call cuts any pending SYNC data into a batch and
    replays every unacknowledged one, so an empty result means nothing is
-   queued or outstanding. (Running the workflow by hand first flushes anything
-   already due as a webhook.)
+   queued or outstanding.
 3. Clear `BRIDGE_WAKE_SYNC_RECIPIENTS` and redeploy. New SYNC messages are then
-   delivered as WAKE and ACKs resume.
+   delivered as WAKE (ACKs are unchanged either way).
 4. Only now switch the recipient back to an old-format or legacy-only
    receiver.
 
-Safety net for anything queued after the drain: on the next hourly run it is
+Safety net for anything queued after the drain: on the next scheduled run it is
 re-sent under its own message ID where its original v1 authority is still
 valid (an unchanged receiver handles it like any message, ACK included); the
 rest goes out once as a standard `status` batch whose text lists each item's
 message ID. A natively re-sent item that is not completed before its v1
 authority lapses, or whose native delivery jobs all die, is recovered on a
 later run into such a batch (never re-sent natively again) instead of being
-stranded. Keep the secrets, the variable and the workflow in place until
-that run has happened (an unconfigured workflow fails loudly).
+stranded. Keep the schedule and its configuration in place until that run
+has happened.
+
+## Private attachments (default off)
+
+| Variable | Meaning |
+|---|---|
+| `BRIDGE_ATTACHMENTS_ENABLED` | `true` enables private temporary file transfer; anything else (or unset) keeps it off, with no tools, state, provider calls or reads of the settings below. Read on every call. |
+| `BRIDGE_ATTACHMENT_MAX_BYTES` | Optional per-file maximum in decimal bytes, `500000000` (default) to `1000000000` (hard cap). Digits only; anything else disables the capability (fail closed). |
+| `BLOB_STORE_ID` | Vercel Blob store connected to the project (`store_<id>` or `<id>`). It is an identifier, not a credential. The intended server-side path is the deployment's ordinary Vercel OIDC, and this bridge does not configure or pass a static token. `@vercel/blob` 2.8.2 can read `BLOB_READ_WRITE_TOKEN` as a fallback when OIDC is unavailable; do not configure or rely on that fallback here. Deployment OIDC permission is not live-qualified by local tests. Changing the store makes existing attachments fail closed. |
+
+`bridge_health` adds `readiness.attachments` (`enabled`, `configured`
+booleans) once the flag is set. Nothing is ever physically deleted by the
+bridge unless a trusted, owner-approved retention policy is supplied to the
+runtime constructor (no setting enables it); expired records keep their
+metadata and reserved quota. Design, limits, resume, retention, private Blob
+behavior and the setup checklist: [attachments](attachments.md).
 
 ## Bounded queue recovery
 

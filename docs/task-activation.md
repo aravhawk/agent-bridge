@@ -10,8 +10,8 @@ ordinary authenticated health/read/receipt/unsubscribe when task readiness is
 unavailable, without changing either verifier. Unexpected errors retain503.
 The fallback is sticky until a fresh instance/deployment; it never silently
 enables task tools later. The queue entry uses the unchanged core runtime.
-The owner has authorized activation after independent review and both native
-receiver preparations; acceptance is coordinated separately. Credentials,
+Enable activation only after independent review and both native receiver
+preparations are complete; coordinate acceptance separately. Credentials,
 OAuth grants and security configuration are unchanged and outside this release.
 
 Task reads include the authenticated caller's role and next command sequence.

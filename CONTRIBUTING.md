@@ -12,7 +12,8 @@ npm audit
 python3 scripts/audit_repo.py  # secret/identifier audit of the index and Git history
 ```
 
-Node.js 24 is required (see `engines` in `package.json`). If you have
+Node.js 24.22.1 or newer within major 24 is required (see `engines` in
+`package.json`). If you have
 [Gitleaks](https://github.com/gitleaks/gitleaks), also run `gitleaks git .`.
 
 ## Pull requests

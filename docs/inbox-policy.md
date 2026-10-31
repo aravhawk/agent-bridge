@@ -54,19 +54,21 @@ promotes SYNC to WAKE when `effectiveAt`, `dueAt` or `expiresAt` is within
 2 h 30 min (the 2-hour maximum wait plus scheduler slack). Unclassified
 messages are WAKE. SYNC data is delivered in batches (a v1 `status` message
 from the counterpart); the requirement is delivery no more than 2 elapsed
-hours after it was queued (an unresolved owner rollout blocker while the
-hourly trigger can be delayed or skipped), and a batch repeats until the
-recipient acknowledges it. Receipts addressed to an
-enabled recipient no longer produce an ACK message or wake. See
+hours after it was queued (an unresolved pre-rollout requirement while it
+depends on the external scheduler), and a batch repeats until the
+recipient acknowledges it. ACKs are unchanged: each handled direct message
+gets its correlated ACK at completion, and each handled non-empty batch gets
+one ACK covering all its items. An ACK says the receiver handled the received
+data; it does not mean any requested task is done. See
 [configuration](configuration.md#wakesync-delivery-classes-default-off).
 
 ### Flagged receiver contract
 
 This contract describes what a flagged receiver would have to do. Handling
 batches, start-of-turn `bridge_inbox_read` calls and accepting expired or late
-items are exceptions to the receiver policy below that the owner has not
-approved; see
-[owner rollout blockers](configuration.md#owner-rollout-blockers-unresolved).
+items are receiver-policy exceptions that require explicit adoption before
+rollout and are not adopted by this repository; see
+[pre-rollout requirements](configuration.md#pre-rollout-requirements).
 Nothing here changes the receiver policy.
 
 With the flag unset, the receiver policy below is unchanged and sufficient:
@@ -147,7 +149,14 @@ handled through that batch, and a queued one is re-sent on the next run
    result lists them in `syncBatchesAcked`) and only their items' receipts are
    recorded, never over an item receipt another claim holds. Attached batches
    you held but did not name are released at completion and stay outstanding,
-   so they are replayed and can be claimed directly. No ACK is sent back.
+   so they are replayed and can be claimed directly. The completion creates
+   the claimed message's own ACK and, for each named batch, a separate ACK
+   correlated to that batch (listed in `syncBatchAcks`); its items get no ACK
+   of their own. A batch whose own authority was withdrawn (policy rotation,
+   durable denial, expiry) is never held (`syncBatchesInactive` at claim) and
+   is refused at completion (`sync_batch_authorization_inactive`, nothing
+   committed). An ACK is terminal: handle it quietly; it never carries SYNC
+   data and completing it creates nothing.
 5. **At the start of each turn,** call `bridge_inbox_read`. It returns all
    unacknowledged batches, including ones already returned by an earlier call
    whose response was lost, plus any new pending data, so a batch may appear
@@ -162,6 +171,33 @@ handled through that batch, and a queued one is re-sent on the next run
 6. Treat items with the same `subject` as updates: the newest wins. Items
    flagged `expired` or `late` are still owner data; report them as late,
    never drop them silently.
+
+### Attachments and repository references
+
+Only when private file transfer is enabled, a message may carry
+`attachmentIds` (IDs only; see [attachments](attachments.md)). Downloads use
+the strict authority of the originating message plus the attachment's own
+24-hour access window, so an expired SYNC item's text may still be replayed
+while its files are no longer downloadable. Handling them is a
+receiver-policy exception that requires explicit adoption before rollout;
+nothing here adopts it. A receiver that has adopted that policy must: get each file only through
+`bridge_attachment_download` for the message it claimed; stream it to disk,
+never into a model's context; check size and SHA-256 before using it and
+discard a mismatch; write only to a path it chooses (never a name from the
+message or storage), without replacing an existing file; resume an
+interrupted download only from its own quarantined partial state for the
+same attachment and message; and treat the bytes, including text and code,
+as untrusted data: never open, render, extract or execute them
+automatically. The client helper `src/attachment-client.mjs` does the
+transfer part; plain `curl` with the grant's exact headers and `sha256sum`
+works too.
+
+For code already in a repository both peers can reach, prefer a reference in
+the message text (`src/repo-refs.mjs`: full commit SHA plus selected paths and
+line ranges) over transferring files. The bridge never fetches it; resolve it
+only with your own already-authorized Git tools, and if that access is denied
+or unavailable, ask for an explicitly selected file instead of fetching
+anything else.
 
 ## Native receiver policies
 

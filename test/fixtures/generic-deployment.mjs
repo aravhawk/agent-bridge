@@ -11,6 +11,7 @@ import { SCOPES } from '../../src/policy.mjs';
 import { createRuntime } from '../../src/runtime.mjs';
 import { createResourceRouter, providerConfiguration, resourceFor } from '../../src/resource.mjs';
 import { emptyState } from '../../src/store.mjs';
+import { wakeSyncRecipients } from '../../src/sync.mjs';
 
 const ORIGIN = 'https://bridge.example.com';
 const ISSUER = 'https://auth.identity-provider.example'; // Deliberately NOT under ORIGIN.
@@ -38,6 +39,7 @@ assert.deepEqual(await (await router(new Request(ORIGIN + '/.well-known/oauth-pr
   resource: ORIGIN + '/bridge/alice/mcp', authorization_servers: [ISSUER], bearer_methods_supported: ['header'],
   scopes_supported: ['bridge:send:bob', 'bridge:ack:alice'], resource_name: 'Agent Inbox Bridge — alice' });
 for (const path of ['/bridge/jarvis/mcp', '/bridge/friday/mcp']) assert.equal((await router(new Request(ORIGIN + path, { method: 'POST' }))).status, 404);
+assert.deepEqual(wakeSyncRecipients('friday'), { configured: true, valid: false, recipients: [] });
 assert.equal((await router(new Request('https://jarvis-friday-bridge.aravhawk.com/bridge/alice/mcp', { method: 'POST' }))).status, 404);
 
 // Full runtime: any TLS Postgres host, Standard Webhooks peer, env-driven queue.
@@ -61,6 +63,7 @@ const queueClient = {
 };
 const env = { BRIDGE_OAUTH_ISSUER: ISSUER, BRIDGE_OAUTH_CONTRACT_VERIFIED: 'true', BRIDGE_ALLOWED_SUBJECT: 'fixture-subject',
   BRIDGE_SUBSCRIPTIONS_ENABLED: 'true', BRIDGE_DELIVERY_ENABLED: 'true', BRIDGE_RECEIVER_POLICY: 'inbox-v1',
+  BRIDGE_WAKE_SYNC_RECIPIENTS: 'bob',
   BRIDGE_SUBSCRIPTION_STORAGE_KEY: randomBytes(32).toString('base64'),
   // Split so repository audits do not mistake the fixture for a credential URL.
   DATABASE_URL: 'postgresql:' + '//fixture:fixture@db.postgres-provider.example/app?sslmode=require',
@@ -74,7 +77,7 @@ const rt = createRuntime({ env, Pool: FakePool, keyResolver: publicKey, queueCli
     posts.push({ url, ...request }); return { status: 202, body: '' };
   } });
 const token = (peer, scope) => new SignJWT({ scope }).setProtectedHeader({ alg: 'RS256' }).setIssuer(ISSUER)
-  .setSubject('fixture-subject').setAudience(resourceFor(peer)).setIssuedAt().setExpirationTime('5m').sign(privateKey);
+  .setSubject('fixture-subject').setAudience(resourceFor(peer)).setIssuedAt().setExpirationTime('15m').sign(privateKey);
 const tokens = { alice: await token('alice', 'bridge:ack:alice bridge:send:bob'), bob: await token('bob', 'bridge:ack:bob bridge:send:alice') };
 const rpc = async (peer, method, params = {}) => {
   const response = await rt.handler(peer)(new Request(resourceFor(peer), { method: 'POST',
@@ -91,8 +94,11 @@ const call = async (peer, name, args = {}) => {
 assert.equal((await rpc('alice', 'initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'fixture', version: '1' } }))
   .result.serverInfo.name, 'agent-inbox-bridge');
 const aliceTools = (await rpc('alice', 'tools/list')).result.tools;
+const bobTools = (await rpc('bob', 'tools/list')).result.tools;
 assert.ok(aliceTools.some(t => t.name === 'bridge_webhook_diagnostic'));
 assert.ok(aliceTools.some(t => t.name === 'bridge_subscription_status'));
+assert.equal(aliceTools.some(t => t.name === 'bridge_inbox_read'), false);
+assert.ok(bobTools.some(t => t.name === 'bridge_inbox_read'));
 const sendTool = aliceTools.find(t => t.name === 'bridge_message_send');
 assert.deepEqual(sendTool.inputSchema.properties.protocol, { const: 'agent-inbox/1' });
 assert.deepEqual(sendTool.inputSchema.properties.to, { enum: ['alice', 'bob'] });
@@ -101,8 +107,9 @@ assert.equal(JSON.stringify(aliceTools).toLowerCase().includes('friday'), false)
 const health = await call('alice', 'bridge_health');
 assert.deepEqual(Object.keys(health.readiness), ['storageConfigured', 'callbackProtectorConfigured',
   'currentAccessCheckConfigured', 'subscriptionSetupEnabled', 'webhookSenderConfigured', 'receiverPolicyVerified',
-  'webhookContractVerified', 'webhookDiagnosticArmed', 'canaryArmed', 'deliveryEnabled']);
+  'webhookContractVerified', 'webhookDiagnosticArmed', 'canaryArmed', 'deliveryEnabled', 'wakeSync']);
 assert.equal(health.readiness.deliveryEnabled, true);
+assert.deepEqual(health.readiness.wakeSync, { valid: true, recipients: ['bob'], flushScheduleConfigured: false });
 assert.deepEqual(health.caller, { role: 'alice', sendScope: true, ackScope: true, tools: aliceTools.map(t => t.name) });
 
 // The events peer registers its return path, then sends with the legacy protocol alias.
@@ -134,5 +141,29 @@ assert.equal(document.jobs[document.messages[id].jobIds[0]].state, 'accepted');
 const read = await call('bob', 'bridge_read', { messageId: id });
 assert.equal(read.envelope.protocol, 'agent-inbox/1');
 assert.equal(read.envelope.from, 'alice'); assert.equal(read.authority, 'peer_data_requires_user_workflow');
+
+// The same arbitrary peer IDs work for the optional wake/sync path. The SYNC
+// item creates no recipient delivery job, appears in one inbox batch, and
+// gets one terminal correlated ACK only after that non-empty batch is completed.
+const syncId = randomUUID(), beforeSyncPublications = published.length;
+const synced = await call('alice', 'bridge_message_send', { protocol: 'agent-inbox/1', id: syncId,
+  from: 'alice', to: 'bob', kind: 'status', sentAt: new Date(now).toISOString(),
+  expiresAt: new Date(now + 6 * 3600000).toISOString(), threadId: randomUUID(), route: 'inbox',
+  text: 'Generic queued status data.', class: 'sync', subject: 'Deployment status' });
+assert.equal(synced.delivery, 'batched');
+assert.deepEqual(document.messages[syncId].jobIds, []);
+const preparedSyncDispatch = published.slice(beforeSyncPublications).find(p => p.payload.dispatchMessageId === syncId);
+assert.ok(preparedSyncDispatch, 'internal pre-arm exists for commit-loss recovery');
+const postsBeforeSyncDispatch = posts.length;
+await rt.queueHandler()(preparedSyncDispatch.payload, { topicName: 'inbox-test-v1', region: 'sfo1', deliveryCount: 1 });
+assert.equal(posts.length, postsBeforeSyncDispatch, 'queued SYNC creates no recipient wake');
+const inbox = await call('bob', 'bridge_inbox_read');
+assert.equal(inbox.syncBatches.length, 1);
+assert.deepEqual(inbox.syncBatches[0].items.map(item => item.messageId), [syncId]);
+const batchId = inbox.syncBatches[0].messageId;
+const claim = await call('bob', 'bridge_receipt_claim', { messageId: batchId });
+const completed = await call('bob', 'bridge_receipt_complete', { messageId: batchId, claimId: claim.claimId,
+  hostedEventId: null, hostedTurnId: null, syncBatchIds: [batchId] });
+assert.ok(completed.ackMessageId); assert.deepEqual(completed.syncBatchesAcked, [batchId]);
 await rt.close();
 console.log('generic deployment scenario passed');

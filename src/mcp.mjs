@@ -5,6 +5,7 @@ import { BridgeError, SCOPES } from './policy.mjs';
 import { ownKeys, authorizeRecipient } from './events.mjs';
 import { TASK_TOOLS } from './task-integration.mjs';
 import { MAX_SYNC_BATCH_IDS } from './sync.mjs';
+import { DEFAULT_MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_IDS, ATTACHMENT_KINDS, MIN_RANGE_BYTES, UPLOAD_MODES } from './attachments.mjs';
 
 const idSchema = { type: 'string', format: 'uuid' };
 const object = properties => ({ type: 'object', properties, required: Object.keys(properties), additionalProperties: false });
@@ -18,7 +19,7 @@ const tools = [
   tool('bridge_health', 'Check authenticated bridge configuration without reading messages, storing state or sending events.', object({}), true),
   tool('bridge_read', 'Read the stored message identified by the native received event. Never use to poll.', object({ messageId: idSchema }), true),
   tool('bridge_receipt_claim', 'Claim this received message for one hosted turn, with a short recovery lease. If SYNC batches were presented with it, the claim also holds those not held by another claim (syncBatchIds) and reports the others (syncBatchesHeldElsewhere); handle only held batches. A queued or batch-carried SYNC item cannot be claimed on its own; the error names the batch to claim (batchMessageId).', object({ messageId: idSchema })),
-  tool('bridge_receipt_complete', 'Complete the claimed receipt and atomically enqueue one ACK for a source message. ACKs are terminal. Supplied host IDs require independent verification. Optional syncBatchIds acknowledges SYNC batches you handled: the batch ID itself when completing a batch directly, and attached batches your read returned and your claim holds. Unnamed batches stay outstanding.',
+  tool('bridge_receipt_complete', 'After handling the received data, complete the claimed receipt; this atomically creates one immediate correlated ACK back to the sender (none for an ACK: ACKs are terminal). An ACK reports that you handled the received data, not that any requested task is done; supplied host IDs require independent verification. Optional syncBatchIds acknowledges SYNC batches you handled, each with its own ACK covering its items: the batch ID itself when completing a batch directly, and attached batches your read returned and your claim holds. Unnamed batches stay outstanding and get no ACK.',
     completeSchema),
   tool('bridge_status', 'Inspect one known message during an explicit diagnostic. HTTP receipt alone never verifies wake.', object({ messageId: idSchema }), true),
 ];
@@ -42,17 +43,43 @@ const inboxReadTool = { ...tool('bridge_inbox_read',
 const diagnosticTool = { ...tool(NAMES.diagnosticTool,
   'Operator-armed, one-time transport check: POST one synthetic bridge.message.received event with a fresh UUID to the configured webhook receiver. Visible while unarmed, but invocation requires an active operator window. No arguments or retries; later armed calls return the recorded attempt. HTTP status never proves wake.', object({})),
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true } };
+// Private attachments (offered only while enabled and configured). Bytes go
+// directly to or from storage through short presigned URLs; never through MCP.
+const attachmentSendTool = { ...dailySendTool, inputSchema: { ...sendSchema, properties: { ...sendSchema.properties,
+  attachmentIds: { type: 'array', items: idSchema, minItems: 1, maxItems: MAX_ATTACHMENT_IDS, uniqueItems: true,
+    description: 'Your own available attachments (bridge_attachment_finalize) for this recipient. IDs only.' } } } };
+// The size maximum is the current trusted configuration (500 MB to 1 GB,
+// decimal), so the advertised schema always matches what the core accepts.
+const attachmentToolsFor = maxBytes => [
+  { ...tool('bridge_attachment_begin', `Reserve a private file transfer (1 byte to ${maxBytes} bytes) for the other assistant and get a short-lived (at most 15 minutes) private upload capability for exactly this file: its storage pathname, size and content type, no overwrite. mode single (default): one PUT within an hour; a failed upload restarts (up to 5 capabilities). mode multipart (recommended above 100 MB): the storage provider's native multipart upload, driven and resumed by your client from its own local checkpoint; call begin again with the same id and identical fields for a fresh capability on a later wake (the reservation's expiry never moves). The capability covers the whole file, not single parts: treat it as a secret and never put it in a message. Retrying with the same id and identical fields continues the same reservation. kind (file, text or code) is an opaque hint; bytes are never interpreted. For code already in a repository both peers can access, prefer a commit/path reference in the message text.`,
+    { ...object({ id: idSchema, name: { type: 'string', minLength: 1, maxLength: 200 },
+      size: { type: 'integer', minimum: 1, maximum: maxBytes },
+      sha256: { type: 'string', pattern: '^[a-fA-F0-9]{64}$' },
+      kind: { enum: [...ATTACHMENT_KINDS] }, mode: { enum: [...UPLOAD_MODES] } }),
+    required: ['name', 'size', 'sha256'] }), annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true } },
+  { ...tool('bridge_attachment_finalize', 'After the upload completes, check that the stored object exists with the exact declared size and make the attachment available to reference with attachmentIds. Optionally pass the etag your upload returned as completion evidence. This is not a content check: the recipient must verify size and SHA-256 before using the file.',
+    { ...object({ id: idSchema, etag: { type: 'string', minLength: 1, maxLength: 256, pattern: '^[\\x21-\\x7e]+$' } }), required: ['id'] }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true } },
+  { ...tool('bridge_attachment_download', `Get a short presigned download URL for an attachment referenced by a message addressed to you; stream it to disk, never into context. Without a range it covers the whole file. To resume, pass rangeStart = bytes already received; rangeEnd optionally bounds a chunk (at least ${MIN_RANGE_BYTES} bytes unless it reaches the end). Each call is authorized and charged on its own. Verify size and SHA-256 before using the file; never open, render, extract or execute it automatically.`,
+    { ...object({ messageId: idSchema, attachmentId: idSchema,
+      rangeStart: { type: 'integer', minimum: 0, maximum: MAX_ATTACHMENT_BYTES - 1 },
+      rangeEnd: { type: 'integer', minimum: 0, maximum: MAX_ATTACHMENT_BYTES - 1 } }), required: ['messageId', 'attachmentId'] }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true } },
+];
 const subscriptionStatusTool = tool('bridge_subscription_status', 'Inspect your event subscription activity and renewal timestamps. No callback URL or secret is returned.', object({}), true);
-function allowedTools(principal, health, dailyEnabled, healthOnly, diagnostic, tasks, wakeSync) {
+function allowedTools(principal, health, dailyEnabled, healthOnly, diagnostic, tasks, wakeSync, attachments) {
   const syncRecipient = dailyEnabled && typeof wakeSync === 'function' && wakeSync().includes(principal.role);
-  const ordinary = [...tools, ...(dailyEnabled ? [dailySendTool, ...(principal.role === EVENTS_PEER ? [subscriptionStatusTool] : [])] : []),
-    ...(syncRecipient ? [inboxReadTool] : []),
+  const attached = dailyEnabled && attachments?.enabled?.() === true;
+  const ordinary = [...tools, ...(dailyEnabled ? [attached ? attachmentSendTool : dailySendTool,
+    ...(principal.role === EVENTS_PEER ? [subscriptionStatusTool] : [])] : []),
+    ...(syncRecipient ? [inboxReadTool] : []), ...(attached ? attachmentToolsFor(attachments.maxBytes?.() ?? DEFAULT_MAX_ATTACHMENT_BYTES) : []),
     // Discovery must not race the finite operator window. The runtime checks
     // readiness on every invocation before configuring storage or transport.
     ...(principal.role === EVENTS_PEER && typeof diagnostic?.run === 'function' ? [diagnosticTool] : [])]
     .filter(t => !healthOnly || t.name === 'bridge_health').filter(t => t.name === 'bridge_health'
     ? typeof health === 'function' && Object.values(SCOPES[principal.role]).some(s => principal.scopes.includes(s))
-    : [dailySendTool.name, diagnosticTool.name].includes(t.name) ? principal.scopes.includes(SCOPES[principal.role].probe)
+    : [dailySendTool.name, diagnosticTool.name, 'bridge_attachment_begin', 'bridge_attachment_finalize'].includes(t.name)
+      ? principal.scopes.includes(SCOPES[principal.role].probe)
     : t.name === 'bridge_status' || principal.scopes.includes(SCOPES[principal.role].ack));
   // The default runtime stays v1-only. Only an explicitly injected
   // capability exposes these; its kernel admits each call under current policy.
@@ -96,7 +123,7 @@ async function boundedJson(request) {
 // Mount only at the configured authenticated peer paths. This resource server
 // never creates a provider, issues tokens or registers a native plugin.
 export function createMcpHandler({ enabled = false, verify, bridge, events, scheduleJobs, resourceMetadataUrl,
-  observeValidationFailure, health, dailyEnabled = true, healthOnly = false, webhookDiagnostic, tasks, wakeSync }) {
+  observeValidationFailure, health, dailyEnabled = true, healthOnly = false, webhookDiagnostic, tasks, wakeSync, attachments }) {
   return async request => {
     let id = null, input, stage = 'before_authenticated_body';
     try {
@@ -135,13 +162,13 @@ export function createMcpHandler({ enabled = false, verify, bridge, events, sche
             serverInfo: { name: SERVER_NAME, version: VERSION } };
           break;
         case 'ping': ownKeys(params, [], []); result = {}; break;
-        case 'tools/list': ownKeys(params, [], []); result = { tools: allowedTools(principal, health, dailyEnabled, healthOnly, webhookDiagnostic, tasks, wakeSync) }; break;
+        case 'tools/list': ownKeys(params, [], []); result = { tools: allowedTools(principal, health, dailyEnabled, healthOnly, webhookDiagnostic, tasks, wakeSync, attachments) }; break;
         case 'events/list': if (healthOnly) throw new BridgeError('provider_contract_verification_required', 503); result = events.list(principal, params); break;
         case 'events/subscribe': if (healthOnly) throw new BridgeError('provider_contract_verification_required', 503); result = await events.subscribe(principal, params); break;
         case 'events/unsubscribe': result = await events.unsubscribe(principal, params); break;
         case 'tools/call': {
           ownKeys(params, ['name', 'arguments']);
-          const available = allowedTools(principal, health, dailyEnabled, healthOnly, webhookDiagnostic, tasks, wakeSync);
+          const available = allowedTools(principal, health, dailyEnabled, healthOnly, webhookDiagnostic, tasks, wakeSync, attachments);
           if (!available.some(t => t.name === params.name)) throw new BridgeError('tool_not_available', 403);
           stage = 'tool_arguments';
           let output;
@@ -161,6 +188,9 @@ export function createMcpHandler({ enabled = false, verify, bridge, events, sche
             case 'bridge_message_send': output = await bridge.sendMessage(principal, params.arguments); break;
             case 'bridge_read': output = await bridge.read(principal, params.arguments); break;
             case 'bridge_inbox_read': authorizeRecipient(principal); output = await bridge.inboxRead(principal, params.arguments); break;
+            case 'bridge_attachment_begin': output = await attachments.begin(principal, params.arguments); break;
+            case 'bridge_attachment_finalize': output = await attachments.finalize(principal, params.arguments); break;
+            case 'bridge_attachment_download': authorizeRecipient(principal); output = await attachments.download(principal, params.arguments); break;
             case 'bridge_receipt_claim': authorizeRecipient(principal); output = await bridge.claim(principal, params.arguments); break;
             case 'bridge_receipt_complete': authorizeRecipient(principal); output = await bridge.complete(principal, params.arguments); break;
             case 'bridge_status': output = await bridge.status(principal, params.arguments); break;

@@ -32,9 +32,8 @@ function incoming(state, principal, id, probeMessageId, probeSender) {
   if (probeMessageId && !testEnvelopeAllowed(message.envelope, probeMessageId, probeSender)) fail('contract_probe_only', 403);
   return message;
 }
-function requireAckPath(state, envelope, authorization, policyIds, now, subscriptionId, ackSuppressed = false) {
-  // A suppressed ACK (wake/sync recipient or server batch) needs no return path.
-  if (ackSuppressed || !dailyMessage(envelope) || envelope.kind === 'ack' || envelope.from !== EVENTS_PEER) return;
+function requireAckPath(state, envelope, authorization, policyIds, now, subscriptionId) {
+  if (!dailyMessage(envelope) || envelope.kind === 'ack' || envelope.from !== EVENTS_PEER) return;
   // The webhook peer must not handle a source whose required ACK has no usable return
   // path. Cover its entire immutable authority lifetime, not just this instant.
   // Revocation/shortening during handling still fails closed at completion.
@@ -44,6 +43,35 @@ function requireAckPath(state, envelope, authorization, policyIds, now, subscrip
       subscriptionAccessAllowed(state, sub, policyIds?.[EVENTS_PEER], now) &&
       sub.expiresAt >= authorization.expiresAt)) fail('return_subscription_required', 503);
 }
+// A batch ACK must reach the events peer for at least this long (or until the
+// batch itself ends, if sooner).
+export const BATCH_ACK_MIN_WINDOW_MS = 5 * 60000;
+// Latest time a batch's ACK can be delivered, or null when it has no usable
+// return path. A batch is a synthetic message whose 12 h authority is derived
+// from its items; it is not a sender's token, so (unlike requireAckPath for a
+// real message) the return subscription is not required to cover it. The ACK
+// itself is a normal one-hour, token-bound message: it lives until the
+// earliest of the batch's expiry, one hour, and (toward the events peer) the
+// latest active return subscription of the batch's owner, which must leave at
+// least BATCH_ACK_MIN_WINDOW_MS after `margin` (or reach the batch's expiry).
+// The completing principal's token bounds it further at creation. Nothing
+// here grants authority: the window only ever shortens the ACK.
+function batchAckWindow(state, batch, policyIds, now, margin = 0) {
+  const e = batch.envelope, expires = Date.parse(e.expiresAt);
+  let until = Math.min(expires, now + MESSAGE_TTL_MS);
+  if (e.from === EVENTS_PEER) {
+    const best = Math.max(-Infinity, ...Object.values(state.subscriptions).filter(sub => sub.owner === batch.authorization?.owner &&
+      subscriptionAccessAllowed(state, sub, policyIds?.[EVENTS_PEER], now)).map(sub => sub.expiresAt));
+    if (!(best >= Math.min(expires, now + margin + BATCH_ACK_MIN_WINDOW_MS))) return null;
+    until = Math.min(until, best);
+  }
+  return until > now ? until : null;
+}
+function requireBatchAckPath(state, batch, policyIds, now, margin) {
+  return batchAckWindow(state, batch, policyIds, now, margin) ?? fail('return_subscription_required', 503);
+}
+// Only a non-empty batch is acknowledged with an ACK message.
+const batchHasItems = (state, batch) => batch.syncBatch.itemIds.some(id => state.messages[id]);
 // routing is present only for a wake/sync-enabled recipient: { class, promoted?, policyIds }.
 function insert(state, envelope, hash, now, authorization, jobOptions, routing) {
   const saved = state.messages[envelope.id];
@@ -85,25 +113,35 @@ function insert(state, envelope, hash, now, authorization, jobOptions, routing) 
 // held elsewhere is reported and excluded, and a direct claim of a batch held
 // this way fails with receipt_busy. Messages without attached batches return
 // nothing new.
-function claimAttachedBatches(state, message, principal, claimId, leaseUntil, now) {
-  if (!message.syncBatchIds?.length) return {};
+function claimAttachedBatches(state, message, principal, claimId, leaseUntil, now, policyIds) {
+  // An ACK is terminal: it never carries or collects SYNC data.
+  if (!message.syncBatchIds?.length || message.envelope.kind === 'ack') return {};
   // A claim holds no more than one completion can acknowledge (its own ID
   // counts when the message is a batch). Further attached batches, possible
   // only in state written before this limit, are deferred: not held, so they
   // stay claimable directly and are replayed by bridge_inbox_read.
   const limit = MAX_SYNC_BATCH_IDS - (message.syncBatch ? 1 : 0);
-  const held = [], heldElsewhere = [], deferred = [];
+  const held = [], heldElsewhere = [], deferred = [], inactive = [];
   for (const id of message.syncBatchIds) {
     const b = state.messages[id]?.syncBatch, receipt = state.receipts[id];
     if (!b?.presentedAt || b.ackedAt || b.reclaimedAt || receipt?.state === 'complete') continue;
+    // Each batch is judged on its own current authority (policy, durable
+    // denial, expiry), not the carrier's: a batch whose admission was
+    // withdrawn is never held, so it is never ACKed through a fresh carrier.
+    if (!messageAccessAllowed(state, state.messages[id], policyIds, now)) { inactive.push(id); continue; }
     // Held by another claim of the batch, or one of its items still has a
     // live independent claim (pre-fence): not this claim's to handle.
     if (receipt?.leaseUntil > now || batchItemsBusy(state, state.messages[id], claimId, now).length) { heldElsewhere.push(id); continue; }
-    if (held.length >= limit) { deferred.push(id); continue; }
+    // Over the completion limit, or no usable return path for its own ACK
+    // (it can still be claimed directly once one exists): not held.
+    if (held.length >= limit || batchAckWindow(state, state.messages[id], policyIds, now, leaseUntil - now) === null) {
+      deferred.push(id); continue;
+    }
     state.receipts[id] = { state: 'claimed', owner: principal.principalKey, claimId, leaseUntil, viaMessage: message.envelope.id };
     held.push(id);
   }
-  return { syncBatchIds: held, syncBatchesHeldElsewhere: heldElsewhere, ...(deferred.length ? { syncBatchesDeferred: deferred } : {}) };
+  return { syncBatchIds: held, syncBatchesHeldElsewhere: heldElsewhere, ...(deferred.length ? { syncBatchesDeferred: deferred } : {}),
+    ...(inactive.length ? { syncBatchesInactive: inactive } : {}) };
 }
 
 // Additive status for wake/sync messages only; v1 messages report nothing new.
@@ -121,23 +159,54 @@ function syncStatus(message) {
 export class Bridge {
   // canary: trusted fixed configuration (canary.mjs). When present this
   // instance admits only that one source and its server-created ACK.
-  // wakeSync: trusted function returning the recipients with wake/sync enabled
-  // (BRIDGE_WAKE_SYNC_RECIPIENTS, read per use). Omitted or empty: v1 behavior.
-  constructor({ store, clock = Date.now, probeMessageId, probeSender = EVENTS_PEER, messagePolicyIds, deliveryUntil = Infinity, dailyEnabled = false, prepareMessage, prepareReceipt, canary, wakeSync }) {
+  // wakeSync: trusted function returning either the recipients with wake/sync
+  // enabled or the parsed rollout status (BRIDGE_WAKE_SYNC_RECIPIENTS, read per
+  // use). Omitted or empty: v1 behavior. Invalid status is v1 for ordinary
+  // traffic but fails scheduled flushes closed so it cannot trigger rollback.
+  // admitAttachments: trusted (state, envelope, principal, now) check for
+  // messages carrying attachmentIds; absent means attachments are disabled.
+  constructor({ store, clock = Date.now, probeMessageId, probeSender = EVENTS_PEER, messagePolicyIds, deliveryUntil = Infinity, dailyEnabled = false, prepareMessage, prepareReceipt, canary, wakeSync, admitAttachments }) {
+    this.admitAttachments = admitAttachments;
     this.prepareMessage = prepareMessage; this.prepareReceipt = prepareReceipt; this.canary = canary; this.wakeSync = wakeSync;
     this.store = store; this.clock = clock; this.dailyEnabled = dailyEnabled; this.probeMessageId = probeMessageId;
     this.probeSender = probeSender;
     this.messagePolicyIds = messagePolicyIds; this.deliveryUntil = deliveryUntil;
   }
-  syncEnabled(role) {
-    if (this.canary || this.probeMessageId || typeof this.wakeSync !== 'function') return false;
-    const recipients = this.wakeSync();
-    return Array.isArray(recipients) && recipients.includes(role);
+  // Checked in the preparation and the final insertion transaction, before
+  // any queue publication and again before the message is stored.
+  attachmentAdmission(state, envelope, principal, now) {
+    if (!envelope.attachmentIds) return;
+    if (this.canary || this.probeMessageId || typeof this.admitAttachments !== 'function') fail('attachments_not_enabled', 503);
+    this.admitAttachments(state, envelope, principal, now);
   }
-  // No ACK wakes: the ACK's recipient is the source's sender. Server-composed
-  // batches never ACK. The receipt itself is still recorded as before.
-  ackSuppressed(message) {
-    return !!message?.syncBatch || (dailyMessage(message?.envelope) && message.envelope.kind !== 'ack' && this.syncEnabled(message.envelope.from));
+  syncConfiguration() {
+    if (this.canary || this.probeMessageId || typeof this.wakeSync !== 'function') return { valid: true, recipients: [] };
+    const configured = this.wakeSync();
+    if (Array.isArray(configured)) return { valid: true, recipients: configured };
+    if (configured && typeof configured.valid === 'boolean' && Array.isArray(configured.recipients)) return configured;
+    return { valid: false, recipients: [] };
+  }
+  syncEnabled(role) {
+    const config = this.syncConfiguration();
+    return config.valid && config.recipients.includes(role);
+  }
+  // One correlated ACK for a handled source (a direct message or a batch),
+  // inserted with its delivery jobs in the caller's transaction. `until`
+  // (batches) caps its lifetime to the usable return window.
+  createAck(state, principal, original, now, until) {
+    const ackMessageId = randomUUID();
+    const { envelope, hash } = dailyMessage(original) ? validateMessage({ protocol: MESSAGE_PROTOCOL,
+      id: ackMessageId, from: principal.role, to: original.from, kind: 'ack', sentAt: new Date(now).toISOString(),
+      expiresAt: new Date(Math.min(Date.parse(original.expiresAt), now + MESSAGE_TTL_MS, until ?? Infinity)).toISOString(),
+      threadId: original.threadId, route: original.route, correlationId: original.id }, principal, now)
+      : validateEnvelope({ id: ackMessageId, testId: original.testId,
+        from: principal.role, to: original.from, kind: 'ack', sentAt: new Date(now).toISOString(),
+        correlationId: original.id, marker: original.marker }, principal, now);
+    // The canary ACK targets only the pinned return subscription, one attempt.
+    const { jobIds } = insert(state, envelope, hash, now, verifiedMessageAuthorization(principal, envelope, now, this.deliveryUntil),
+      this.canary ? { subscriptionId: this.canary.subscriptionId, maxAttempts: 1 } : undefined);
+    if (this.canary) state[NAMES.canaryState].ackMessageId = ackMessageId;
+    return { ackMessageId, jobIds };
   }
   routing(envelope, now) {
     if (envelope.kind === 'ack' || !this.syncEnabled(envelope.to)) return undefined;
@@ -175,8 +244,8 @@ export class Bridge {
       if (this.canary) canaryEnvelope(validated.envelope, this.canary);
       if (!prior) {
         const authorization = verifiedMessageAuthorization(principal, validated.envelope, this.clock(), this.deliveryUntil);
-        requireAckPath(state, validated.envelope, authorization, this.messagePolicyIds, this.clock(), this.canary?.subscriptionId,
-          this.ackSuppressed({ envelope: validated.envelope }));
+        requireAckPath(state, validated.envelope, authorization, this.messagePolicyIds, this.clock(), this.canary?.subscriptionId);
+        this.attachmentAdmission(state, validated.envelope, principal, this.clock());
         checkMessageCapacity(state);
         const now = this.clock();
         state.messagePreparations ||= {};
@@ -210,7 +279,8 @@ export class Bridge {
       : { messageId: id, queued: false, duplicate: true, expired: true, jobIds: [] };
     if (Date.parse(envelope.expiresAt) <= now) fail('message_expired', 403);
     const authorization = verifiedMessageAuthorization(principal, envelope, now, this.deliveryUntil);
-    requireAckPath(state, envelope, authorization, this.messagePolicyIds, now, this.canary?.subscriptionId, this.ackSuppressed({ envelope }));
+    requireAckPath(state, envelope, authorization, this.messagePolicyIds, now, this.canary?.subscriptionId);
+    this.attachmentAdmission(state, envelope, principal, now);
     delete state.messagePreparations?.[envelope.id];
     return insert(state, envelope, hash, now, authorization, this.canary ? { maxAttempts: 1 } : undefined, this.routing(envelope, now));
   }
@@ -246,7 +316,9 @@ export class Bridge {
   // attached to it, so a re-read (e.g. after a lost response) is identical and
   // completing the message acknowledges what was presented with it.
   syncBatches(state, message, role, now) {
-    if (!dailyMessage(message.envelope)) return [];
+    // An ACK is terminal: reading it never collects or presents SYNC data, so
+    // handling an ACK can never lead to another (batch) ACK.
+    if (!dailyMessage(message.envelope) || message.envelope.kind === 'ack') return [];
     // Collect only while the message can still be completed in one call.
     if (this.syncEnabled(role) && state.receipts[message.envelope.id]?.state !== 'complete' && attachRoom(state, message) > 0) {
       const batch = cutBatch(state, role, now, { reason: 'read', policyIds: this.messagePolicyIds });
@@ -268,12 +340,18 @@ export class Bridge {
       return { syncBatches: outstandingBatches(state, principal.role, now).map(id => presentBatch(state, id, now)) };
     });
   }
-  // Hourly flush (trigger route): see flushDue. Returns message IDs still to be
+  // Scheduled flush (trigger route): see flushDue. Returns message IDs still to be
   // published for dispatch.
   async flushSync() {
+    const initial = this.syncConfiguration();
+    if (!initial.valid) fail('wake_sync_configuration_invalid', 503);
     return this.store.transaction(state => {
+      // Configuration can change while this call waits for the storage lock.
+      // Judge rollout and rollback at the same locked boundary as the mutation.
+      const config = this.syncConfiguration();
+      if (!config.valid) fail('wake_sync_configuration_invalid', 503);
       const now = this.clock(); retainMessages(state, now);
-      return flushDue(state, now, { policyIds: this.messagePolicyIds, recipients: this.wakeSync?.() || [] });
+      return flushDue(state, now, { policyIds: this.messagePolicyIds, recipients: config.recipients });
     });
   }
   async markSyncDispatched(ids) {
@@ -296,20 +374,26 @@ export class Bridge {
         if (redirect) conflict(redirect.code, redirect.details);
       }
       if (!messageAccessAllowed(state, message, this.messagePolicyIds, now)) fail('message_authorization_inactive', 403);
-      requireAckPath(state, message.envelope, message.authorization, this.messagePolicyIds, now, this.canary?.subscriptionId,
-        this.ackSuppressed(message));
+      const leaseMs = 60000;
+      // A batch's ACK needs a return window that outlasts this lease; a real
+      // message keeps the v1 rule (the return path covers its authority).
+      if (message.syncBatch) requireBatchAckPath(state, message, this.messagePolicyIds, now, leaseMs);
+      else requireAckPath(state, message.envelope, message.authorization, this.messagePolicyIds, now, this.canary?.subscriptionId);
       if (old?.leaseUntil > now) fail('receipt_busy', 409);
       if (message.syncBatch) {
         const busy = batchItemsBusy(state, message, null, now);
         if (busy.length) conflict('sync_batch_item_busy', { itemIds: busy });
       }
-      const claimId = randomUUID(), leaseUntil = now + 60000;
+      const claimId = randomUUID(), leaseUntil = now + leaseMs;
       state.receipts[params.messageId] = { state: 'claimed', owner: principal.principalKey,
         claimId, leaseUntil };
-      const batches = claimAttachedBatches(state, message, principal, claimId, leaseUntil, now);
+      const batches = claimAttachedBatches(state, message, principal, claimId, leaseUntil, now, this.messagePolicyIds);
       return { claimId, leaseUntil: new Date(leaseUntil).toISOString(), completed: false, ...batches };
     });
   }
+  // An ACK means the receiver reports it handled the received data (read it
+  // and ran its own workflow on it). It is not completion of any task the data
+  // asks for, and the hosted IDs are not independent host verification.
   async complete(principal, params) {
     ownKeys(params, ['messageId', 'claimId', 'hostedEventId', 'hostedTurnId', 'syncBatchIds'],
       ['messageId', 'claimId', 'hostedEventId', 'hostedTurnId']);
@@ -323,17 +407,28 @@ export class Bridge {
         fail('invalid_receipt_evidence');
       }
     }
+    // Attached batches this completion may acknowledge: named, presented with
+    // this message, and held by this very claim.
+    const named = (state, message) => ackIds.filter(id => id !== (message.syncBatch ? params.messageId : null) &&
+      (message.syncBatchIds || []).includes(id) && state.messages[id]?.syncBatch?.presentedAt &&
+      state.receipts[id]?.state === 'claimed' && state.receipts[id].claimId === params.claimId &&
+      messageAccessAllowed(state, state.messages[id], this.messagePolicyIds, this.clock()));
     if (this.prepareReceipt) {
+      // Pre-arm native dispatch for EVERY ACK this completion can create (the
+      // message's own, and each named batch's) before anything commits. Each
+      // resolves through its own receipt's ackMessageId, so a lost response or
+      // a failed scheduleJobs cannot strand any of them.
       const prepare = await this.store.transaction(state => {
         const message = incoming(state, principal, params.messageId, this.probeMessageId, this.probeSender);
         if (this.canary) canaryReceipt(state, this.canary, principal, params.messageId);
         const receipt = state.receipts[params.messageId];
         if (receipt?.owner !== principal.principalKey || receipt.claimId !== params.claimId) fail('receipt_claim_required', 409);
-        if (receipt.state === 'complete') return false;
+        if (receipt.state === 'complete') return [];
         if (receipt.leaseUntil <= this.clock() || !messageAccessAllowed(state, message, this.messagePolicyIds, this.clock())) fail('stale_receipt_claim', 409);
-        return dailyMessage(message.envelope) && message.envelope.kind !== 'ack' && !this.ackSuppressed(message);
+        if (!dailyMessage(message.envelope) || message.envelope.kind === 'ack') return [];
+        return [params.messageId, ...named(state, message)];
       });
-      if (prepare) await this.prepareReceipt(params.messageId);
+      for (const id of prepare) await this.prepareReceipt(id);
     }
     return this.store.transaction(state => {
       const now = this.clock(); retainMessages(state, now);
@@ -341,8 +436,11 @@ export class Bridge {
       if (this.canary) canaryReceipt(state, this.canary, principal, params.messageId);
       const receipt = state.receipts[params.messageId];
       if (receipt?.owner !== principal.principalKey) fail('receipt_claim_required', 409);
+      // A retry after a lost response returns what was recorded: no new ACK.
       if (receipt.state === 'complete') return { completed: true, duplicate: true,
-        ackMessageId: receipt.ackMessageId, evidenceStatus: 'reported_requires_independent_host_confirmation' };
+        ackMessageId: receipt.ackMessageId, evidenceStatus: 'reported_requires_independent_host_confirmation',
+        ...(receipt.syncBatchAcks?.length ? { syncBatchesAcked: receipt.syncBatchAcks.map(a => a.batchMessageId),
+          syncBatchAcks: receipt.syncBatchAcks.map(a => ({ ...a })) } : {}) };
       if (!messageAccessAllowed(state, message, this.messagePolicyIds, now)) fail('message_authorization_inactive', 403);
       if (receipt.claimId !== params.claimId || receipt.leaseUntil <= now) fail('stale_receipt_claim', 409);
       // A batch is handled only after its full items were returned by a read.
@@ -356,46 +454,59 @@ export class Bridge {
         if (id === ownBatch) continue;
         if (!(message.syncBatchIds || []).includes(id) || !state.messages[id]?.syncBatch?.presentedAt) fail('sync_batch_not_presented', 409);
         if (state.receipts[id]?.state !== 'claimed' || state.receipts[id].claimId !== params.claimId) fail('sync_batch_not_held', 409);
+        // Its own authority is rechecked now: withdrawn since the claim (policy
+        // rotation, durable denial, expiry) refuses the whole completion, so
+        // nothing commits and no ACK is created for it.
+        if (!messageAccessAllowed(state, state.messages[id], this.messagePolicyIds, now)) {
+          conflict('sync_batch_authorization_inactive', { batchMessageId: id });
+        }
       }
       // A batch is never finalized with an item still under another live claim:
       // refuse the whole completion before anything changes.
       const busyItems = [...new Set([ownBatch, ...ackIds].filter(Boolean)
         .flatMap(id => batchItemsBusy(state, state.messages[id], params.claimId, now)))];
       if (busyItems.length) conflict('sync_batch_item_busy', { itemIds: busyItems });
-      const ackSuppressed = original.kind !== 'ack' && this.ackSuppressed(message);
-      requireAckPath(state, original, message.authorization, this.messagePolicyIds, now, this.canary?.subscriptionId, ackSuppressed);
-      let ackMessageId = null; let jobIds = [];
-      if (original.kind !== 'ack' && !ackSuppressed) {
-        // All ACK creation, receipt completion, and outbound jobs commit together.
-        ackMessageId = randomUUID();
-        const { envelope, hash } = dailyMessage(original) ? validateMessage({ protocol: MESSAGE_PROTOCOL,
-          id: ackMessageId, from: principal.role, to: original.from, kind: 'ack', sentAt: new Date(now).toISOString(),
-          expiresAt: new Date(Math.min(Date.parse(original.expiresAt), now + MESSAGE_TTL_MS)).toISOString(),
-          threadId: original.threadId, route: original.route, correlationId: original.id }, principal, now)
-          : validateEnvelope({ id: ackMessageId, testId: original.testId,
-            from: principal.role, to: original.from, kind: 'ack', sentAt: new Date(now).toISOString(),
-            correlationId: original.id, marker: original.marker }, principal, now);
-        // The canary ACK targets only the pinned return subscription, one attempt.
-        ({ jobIds } = insert(state, envelope, hash, now, verifiedMessageAuthorization(principal, envelope, now, this.deliveryUntil),
-          this.canary ? { subscriptionId: this.canary.subscriptionId, maxAttempts: 1 } : undefined));
-        if (this.canary) state[NAMES.canaryState].ackMessageId = ackMessageId;
+      // Every ACK this completion creates needs its return path now; any
+      // missing one refuses the whole completion before anything changes.
+      const ownUntil = message.syncBatch ? requireBatchAckPath(state, message, this.messagePolicyIds, now, 0) : undefined;
+      if (!message.syncBatch) requireAckPath(state, original, message.authorization, this.messagePolicyIds, now, this.canary?.subscriptionId);
+      const windows = Object.fromEntries(ackIds.filter(id => id !== ownBatch)
+        .map(id => [id, requireBatchAckPath(state, state.messages[id], this.messagePolicyIds, now, 0)]));
+      // All ACK creation, receipt completion, and outbound jobs commit together.
+      let ackMessageId = null; const jobIds = [];
+      if (original.kind !== 'ack' && (!message.syncBatch || batchHasItems(state, message))) {
+        const ack = this.createAck(state, principal, original, now, ownUntil);
+        ackMessageId = ack.ackMessageId; jobIds.push(...ack.jobIds);
       }
       state.receipts[params.messageId] = { ...receipt, state: 'complete', completedAt: now,
         ackMessageId, hostedEventId: params.hostedEventId, hostedTurnId: params.hostedTurnId,
-        evidenceStatus: 'reported_requires_independent_host_confirmation', ...(ackSuppressed ? { ackSuppressed: true } : {}) };
-      // Completing a batch acknowledges it and every item it presented.
-      // Completing a message also acknowledges exactly the named batches it
-      // holds, then releases its other holds so they can be claimed directly.
+        evidenceStatus: 'reported_requires_independent_host_confirmation' };
+      // Completing a batch acknowledges it and every item it presented, under
+      // its one ACK. Completing a message also acknowledges exactly the named
+      // batches it holds, each with its own correlated ACK (never the
+      // message's), then releases its other holds so they can be claimed
+      // directly.
       const evidence = { hostedEventId: params.hostedEventId, hostedTurnId: params.hostedTurnId, claimId: params.claimId };
-      const syncBatchesAcked = [];
-      if (ownBatch && ackBatch(state, ownBatch, principal, now, evidence)) syncBatchesAcked.push(ownBatch);
-      for (const id of ackIds) if (id !== ownBatch && ackBatch(state, id, principal, now, { ...evidence, via: params.messageId })) syncBatchesAcked.push(id);
+      const syncBatchAcks = [];
+      if (ownBatch) ackBatch(state, ownBatch, principal, now, evidence, () => ackMessageId);
+      for (const id of ackIds) {
+        if (id === ownBatch) continue;
+        const batchAck = ackBatch(state, id, principal, now, { ...evidence, via: params.messageId }, () => {
+          if (!batchHasItems(state, state.messages[id])) return null;
+          const ack = this.createAck(state, principal, state.messages[id].envelope, now, windows[id]);
+          jobIds.push(...ack.jobIds);
+          return ack.ackMessageId;
+        });
+        if (batchAck !== false) syncBatchAcks.push({ batchMessageId: id, ackMessageId: batchAck });
+      }
+      if (syncBatchAcks.length) state.receipts[params.messageId].syncBatchAcks = syncBatchAcks.map(a => ({ ...a }));
       for (const id of message.syncBatchIds || []) {
         if (state.receipts[id]?.state === 'claimed' && state.receipts[id].claimId === params.claimId) delete state.receipts[id];
       }
+      const acked = [...(ownBatch && message.syncBatch.ackedAt === now ? [ownBatch] : []), ...syncBatchAcks.map(a => a.batchMessageId)];
       return { completed: true, duplicate: false, ackMessageId, jobIds,
-        evidenceStatus: 'reported_requires_independent_host_confirmation', ...(ackSuppressed ? { ackSuppressed: true } : {}),
-        ...(syncBatchesAcked.length ? { syncBatchesAcked } : {}) };
+        evidenceStatus: 'reported_requires_independent_host_confirmation',
+        ...(acked.length ? { syncBatchesAcked: acked } : {}), ...(syncBatchAcks.length ? { syncBatchAcks } : {}) };
     });
   }
   async status(principal, params) {
@@ -417,6 +528,8 @@ export class Bridge {
           firstTransportOutcome: state.jobs[id].firstTransportOutcome || null,
           lastStatus: state.jobs[id].lastStatus ?? null, lastError: state.jobs[id].lastError ?? null })), receiptCompleted: receipt?.state === 'complete',
         ackMessageId: receipt?.ackMessageId || null,
+        // A SYNC item has no ACK of its own; its batch's ACK covers it.
+        ...(receipt?.batchAckMessageId ? { batchAckMessageId: receipt.batchAckMessageId } : {}),
         evidenceStatus: receipt?.evidenceStatus || 'no_hosted_receipt', wakeVerified: false, ...(canary ? { canary } : {}),
         ...syncStatus(message) };
     });

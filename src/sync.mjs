@@ -6,13 +6,15 @@ import { appendDeliveryJobs } from './events.mjs';
 import { PEER_IDS, counterpart } from './config.mjs';
 
 // WAKE/SYNC delivery classes, default off. Only recipients named in
-// BRIDGE_WAKE_SYNC_RECIPIENTS queue SYNC data and stop receiving ACK wakes.
+// BRIDGE_WAKE_SYNC_RECIPIENTS queue SYNC data. ACKs are unchanged: every
+// handled direct message gets its ACK at completion, and every handled
+// non-empty batch gets one ACK covering all its items.
 // Everything else (and every unclassified message) keeps the v1 WAKE path.
 export const WAKE_SYNC_FLAG = 'BRIDGE_WAKE_SYNC_RECIPIENTS';
 // Maximum elapsed wait for queued SYNC data, measured from when the oldest
 // pending item was queued (not in wall-clock hours, which DST stretches).
 export const WAKE_WINDOW_MS = 2 * 3600000;
-// Hourly scheduled runs (GitHub Actions) can start late. Anything effective,
+// Scheduled runs (QStash or another scheduler) can start late. Anything effective,
 // due or expiring within the 2h wait plus this slack is WAKE, not SYNC.
 export const SCHEDULER_SLACK_MS = 30 * 60000;
 export const SYNC_DEADLINE_MS = WAKE_WINDOW_MS + SCHEDULER_SLACK_MS;
@@ -367,29 +369,36 @@ export function presentBatch(state, batchId, now) {
       text: e.text, threadId: e.threadId, sentAt: e.sentAt, expiresAt: e.expiresAt,
       ...(e.effectiveAt !== undefined ? { effectiveAt: e.effectiveAt } : {}), ...(e.dueAt !== undefined ? { dueAt: e.dueAt } : {}),
       receivedAt: new Date(storedAt).toISOString(), expired: Date.parse(e.expiresAt) <= now,
-      late: !!b.lateItemIds?.includes(e.id), orderUnknown: !!sync?.orderUnknown })) };
+      late: !!b.lateItemIds?.includes(e.id), orderUnknown: !!sync?.orderUnknown,
+      ...(e.attachmentIds ? { attachmentIds: [...e.attachmentIds] } : {}) })) };
 }
 // Acknowledge a presented batch held by evidence.claimId: its receipt plus
 // every item's receipt. The batch receipt must already be complete (direct
 // completion, same transaction) or be a hold of that same claim; a receipt
 // owned by any other claim, for the batch or an item, is never overwritten.
-export function ackBatch(state, batchId, principal, now, evidence) {
+// makeAck() runs only once every check has passed and returns the batch's own
+// correlated ACK message ID (or null for a batch with no items left): the one
+// ACK that covers the batch and all its items. Returns that ID, or false when
+// nothing was acknowledged.
+export function ackBatch(state, batchId, principal, now, evidence, makeAck) {
   const batch = state.messages[batchId], b = batch?.syncBatch, held = state.receipts[batchId];
   if (!b?.presentedAt || b.ackedAt) return false;
   if (held?.state !== 'complete' && !(held?.state === 'claimed' && held.claimId === evidence.claimId)) return false;
   // Never finalize a batch while another live claim holds one of its items.
   if (batchItemsBusy(state, batch, evidence.claimId, now).length) return false;
+  const ackMessageId = makeAck();
   b.ackedAt = now;
-  const receipt = { state: 'complete', owner: principal.principalKey, completedAt: now, ackMessageId: null,
+  const receipt = { state: 'complete', owner: principal.principalKey, completedAt: now,
     hostedEventId: evidence.hostedEventId, hostedTurnId: evidence.hostedTurnId,
-    evidenceStatus: 'reported_requires_independent_host_confirmation', ackSuppressed: true };
-  if (held.state !== 'complete') state.receipts[batchId] = { ...receipt, claimId: evidence.claimId, viaMessage: evidence.via };
+    evidenceStatus: 'reported_requires_independent_host_confirmation' };
+  if (held.state !== 'complete') state.receipts[batchId] = { ...receipt, ackMessageId, claimId: evidence.claimId, viaMessage: evidence.via };
   for (const id of b.itemIds) {
     // Covered already (completed by its own claim) or stale (lapsed lease).
     if (!state.messages[id] || state.receipts[id]?.state === 'complete') continue;
-    state.receipts[id] = { ...receipt, viaBatch: batchId };
+    // No ACK per item: the batch's ACK covers it.
+    state.receipts[id] = { ...receipt, ackMessageId: null, batchAckMessageId: ackMessageId, viaBatch: batchId };
   }
-  return true;
+  return ackMessageId;
 }
 
 // Stranded piggyback batches: carried by another message (no delivery jobs of
@@ -422,11 +431,11 @@ export function attachRoom(state, message) {
 }
 const strandedItems = (state, stranded) => stranded.flatMap(batch => batch.syncBatch.itemIds.map(id => state.messages[id]).filter(Boolean));
 
-// Hourly flush (any hour; the trigger runs at :00 UTC). Per recipient with
+// Scheduled flush (any run; the trigger runs every few minutes). Per recipient with
 // pending items or stranded piggyback batches, flush one batch when:
 //   scheduled - an America/Chicago even-hour boundary has passed since the last
 //               flush with items queued before it (late runs still deliver);
-//   max_wait  - waiting for the next hourly run would push the oldest pending
+//   max_wait  - waiting until the next top of the hour would push the oldest pending
 //               item past WAKE_WINDOW_MS of elapsed time (DST, missed runs);
 //   expiring  - an item expires before the next run plus slack (or already did).
 // Otherwise the run is a no-op; empty queues send nothing. At most

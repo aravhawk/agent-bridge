@@ -5,7 +5,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/aravhawk/agent-inbox-bridge.git"
+    "url": "git+https://github.com/aravhawk/jarvis-friday-bridge.git"
   },
   "type": "module",
   "engines": {
@@ -17,13 +17,15 @@
     "package:plugin": "python3 scripts/package_plugin.py"
   },
   "dependencies": {
-    "@vercel/queue": "0.8.0",
+    "@vercel/blob": "2.8.2",
+    "@vercel/queue": "0.10.0",
     "ipaddr.js": "2.5.0",
-    "jose": "6.2.12",
+    "jose": "6.2.13",
     "pg": "8.23.1",
     "standardwebhooks": "1.1.1"
   },
   "overrides": {
-    "zod": "4.6.7"
+    "zod": "4.6.7",
+    "minimatch": "^11.0.3"
   }
 }
