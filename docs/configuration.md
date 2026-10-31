@@ -14,7 +14,7 @@ Read once when the function starts. An invalid value stops startup with a
 |---|---|---|
 | `BRIDGE_PUBLIC_ORIGIN` | *(required)* | Public HTTPS origin, e.g. `https://bridge.example.com`. No path, port or trailing slash. Only this origin accepts MCP and resource-metadata requests; other aliases (such as a default `*.vercel.app` domain) serve public health only. |
 | `BRIDGE_PEERS` | *(required)* | Exactly two peers: `<id>:events,<id>:webhook`. IDs are lowercase letters, digits and inner hyphens (max 32). |
-| `BRIDGE_SERVICE_NAME` | `Agent Inbox Bridge` | Name in `/health` and resource metadata. |
+| `BRIDGE_SERVICE_NAME` | `Agent Inbox Bridge` | Display label in `/`, `/health`, OAuth resource metadata and the armed canary text (1-64 printable ASCII characters). It does not rename MCP server identity, peers, routes, audiences, scopes, receiver IDs or protocol IDs. Read at startup; changing it requires a new deployment/function instance. |
 | `BRIDGE_MESSAGE_PROTOCOL` | `agent-inbox/1` | Protocol ID stored and advertised. `agent-inbox/1` and `jarvis-friday/1` are both accepted on input and normalized to this value. |
 | `BRIDGE_RECEIVER_ID` | `agent-inbox-bridge` | Receiver ID the webhook peer's attestation must match. |
 | `BRIDGE_QUEUE_TOPIC` | `jarvis-friday-bridge-v1` | Vercel Queue topic. **Must equal** the trigger topic in `vercel.json`. The default is historical; change both together if you rename it. |
@@ -51,6 +51,9 @@ the `bridge_friday_webhook_diagnostic` tool, the `friday*` readiness keys, the
 `friday_*` error codes and the `fridayWebhookDiagnostic`/`fridayCanary` state
 keys. In generic mode these become `bridge_webhook_diagnostic`, `webhook*` and
 `webhook_*`. New deployments should always set `BRIDGE_PUBLIC_ORIGIN`.
+They may set `BRIDGE_SERVICE_NAME` to their own display label. Leaving it unset
+uses `Agent Inbox Bridge` in generic mode; compatibility mode deliberately keeps
+`Jarvis Friday Bridge`, so the original deployment needs no new variable.
 
 ## OAuth provider and identity
 
@@ -95,13 +98,17 @@ Every gate defaults to closed. A flag is an operator attestation, not evidence.
 | `BRIDGE_RECEIVER_POLICY=inbox-v1` | Attests that both receivers enforce the [inbox contract](inbox-policy.md). |
 | `BRIDGE_DELIVERY_ENABLED=true` | Message send, receipts and queue delivery, only if every other gate is also satisfied. |
 
-`bridge_health` reports each gate under `readiness`. With both optional features
-off, delivery flags never change the legacy catalog: the events peer sees seven
-tools (eight with the send scope after attestation, including the diagnostic),
-and the webhook peer sees six. Batching adds `bridge_inbox_read` for each enabled
-recipient and reports `readiness.wakeSync`. Setting the [private attachments](attachments.md)
-flag reports `readiness.attachments`; only a valid enabled configuration adds
-the attachment tools.
+`bridge_health` reports each gate under `readiness`. The v1 runtime, with batching
+and attachments off, retains the legacy catalog: the events peer sees seven tools
+(eight with the send scope after attestation, including the diagnostic), and the
+webhook peer sees six. The public API entrypoint separately attempts to add three
+`bridge_task_*` tools on a fresh instance when ordinary OAuth and delivery
+readiness are open; a `task_*` construction error selects a sticky v1-only
+fallback. See [the task runtime contract](task-activation.md). Batching adds
+`bridge_inbox_read` for each enabled recipient and reports `readiness.wakeSync`.
+Setting the [private attachments](attachments.md) flag reports
+`readiness.attachments`; only a valid enabled configuration adds the attachment
+tools.
 
 ## Webhook peer
 
@@ -546,7 +553,9 @@ python3 scripts/check_v1.py --origin https://bridge.example.com --peers alice,bo
 
 `scripts/package_plugin.py` renders the MCP plugin template in `plugin/` for
 one peer into the ignored `.reports/` directory. It never uploads or installs
-anything:
+anything. Its `jarvis`/`friday` defaults exist only for compatibility; generic
+deployments must pass the actual `--peer` and `--counterpart` from
+`BRIDGE_PEERS` explicitly:
 
 ```sh
 python3 scripts/package_plugin.py --origin https://bridge.example.com --peer alice \

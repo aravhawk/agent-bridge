@@ -160,7 +160,8 @@ The full reference, including the diagnostic and canary procedures, is in
 | `BRIDGE_WAKE_SYNC_RECIPIENTS` | no | Recipients with WAKE/SYNC batching (default off); see below |
 | `QSTASH_CURRENT_SIGNING_KEY`, `QSTASH_NEXT_SIGNING_KEY`, `BRIDGE_QSTASH_DESTINATION_URL` | for the scheduled tick | Verify signed QStash deliveries to `/api/cron`; see [scheduler](docs/scheduler.md) |
 | `CRON_SECRET` | optional | Bearer secret for any other scheduler calling `/api/cron` |
-| `BRIDGE_SERVICE_NAME`, `BRIDGE_MESSAGE_PROTOCOL`, `BRIDGE_RECEIVER_ID`, `BRIDGE_QUEUE_TOPIC`, `BRIDGE_QUEUE_REGION`, `BRIDGE_REQUIRE_ISSUER_UNDER_ORIGIN`, `BRIDGE_DATABASE_HOST_SUFFIX` | no | Naming and optional hardening |
+| `BRIDGE_SERVICE_NAME` | no | Display label in public health and OAuth resource metadata (`Agent Inbox Bridge` for new deployments); changing it does not rename peers, routes, audiences, MCP identity or protocol IDs |
+| `BRIDGE_MESSAGE_PROTOCOL`, `BRIDGE_RECEIVER_ID`, `BRIDGE_QUEUE_TOPIC`, `BRIDGE_QUEUE_REGION`, `BRIDGE_REQUIRE_ISSUER_UNDER_ORIGIN`, `BRIDGE_DATABASE_HOST_SUFFIX` | no | Protocol/storage identity and optional hardening |
 
 **Compatibility mode.** This project began as a private deployment between two
 assistants named `jarvis` and `friday`. With `BRIDGE_PUBLIC_ORIGIN` unset, the
@@ -169,6 +170,9 @@ the `jarvis-friday/1` protocol ID, the original tool, readiness and error
 names, and the `FRIDAY_*` environment variables. Existing installs therefore
 keep working with no change. New deployments should always set
 `BRIDGE_PUBLIC_ORIGIN`. Both protocol IDs are accepted on input in every mode.
+Set `BRIDGE_SERVICE_NAME` before deploying if you want a custom display label;
+the setting is read at startup and requires a new deployment/function instance
+to appear. See [deployment identity](docs/configuration.md#deployment-identity).
 
 ## MCP surface
 

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { writeFileSync, readFileSync, rmSync, truncateSync, statSync, openSync, writeSync, closeSync, readdirSync, mkdtempSync, existsSync } from 'node:fs';
+import { writeFileSync, readFileSync, rmSync, truncateSync, statSync, openSync, readSync, writeSync, closeSync, readdirSync, mkdtempSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { presignUrl as realPresignUrl } from '@vercel/blob';
@@ -332,7 +332,9 @@ test('integrity: a wrong-size object is rejected (store stays valid); same-size 
 
 test('client: a changed source fails closed (source_changed) and records nothing', async () => {
   const f = await fixture(), u = await f.prepare();
-  const fd = openSync(u.src, 'r+'); writeSync(fd, Buffer.from('X'), 0, 1, 5); closeSync(fd);
+  const fd = openSync(u.src, 'r+'), changed = Buffer.alloc(1);
+  readSync(fd, changed, 0, 1, 5); changed[0] ^= 0xff;
+  writeSync(fd, changed, 0, 1, 5); closeSync(fd);
   await rejects(f.run(u), 'source_changed');
   const cp = JSON.parse(readFileSync(u.cp, 'utf8'));
   assert.deepEqual(cp.parts.map(p => p.etag), [null, null, null]);

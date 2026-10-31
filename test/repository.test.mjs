@@ -47,10 +47,13 @@ test('packaging fixture stays temporary and preserves any prepared release artif
     assert.equal(existsSync(output), true);
     const rendered = JSON.parse(execFileSync('python3', ['-c',
       'import sys,zipfile;print(zipfile.ZipFile(sys.argv[1]).read("agent-inbox-bridge/mcp.json").decode())', output]));
+    const packagedLicense = execFileSync('python3', ['-c',
+      'import sys,zipfile;sys.stdout.buffer.write(zipfile.ZipFile(sys.argv[1]).read("agent-inbox-bridge/LICENSE"))', output]);
     const server = rendered.mcpServers['agent-inbox-bridge'], auth = server.extensions['com.openai'].auth;
     assert.equal(server.url, resourceFor('jarvis')); assert.equal(auth.resource, resourceFor('jarvis'));
     assert.equal(auth.authorizationServerBase, ISSUER); assert.equal(auth.client.clientId, 'FIXTURE_PUBLIC_CLIENT');
     assert.deepEqual(auth.baseScopes, [SCOPES.jarvis.ack, SCOPES.jarvis.probe, 'offline_access']);
+    assert.deepEqual(packagedLicense, readFileSync(new URL('../LICENSE', import.meta.url)));
   } finally {
     rmSync(temporary, { recursive: true, force: true });
   }

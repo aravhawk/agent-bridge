@@ -19,6 +19,25 @@ test('a generic deployment routes configured peers end to end: derived scopes, a
   assert.match(result.stdout, /generic deployment scenario passed/);
 });
 
+test('display branding is independently configurable without renaming security or protocol identities', () => {
+  const scenarios = [
+    { name: 'Private Assistant Link', expectedMode: 'compat' },
+    { name: 'Studio Agent Relay', expectedMode: 'generic' },
+  ];
+  for (const { name, expectedMode } of scenarios) {
+    const extra = expectedMode === 'generic' ? {
+      BRIDGE_PUBLIC_ORIGIN: 'https://bridge.example.com', BRIDGE_PEERS: 'alice:events,bob:webhook',
+    } : {};
+    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('BRIDGE_')));
+    const result = spawnSync(process.execPath,
+      [fileURLToPath(new URL('./fixtures/display-branding.mjs', import.meta.url))], {
+        env: { ...env, ...extra, BRIDGE_SERVICE_NAME: name, EXPECTED_MODE: expectedMode,
+          EXPECTED_SERVICE_NAME: name }, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    assert.match(result.stdout, /display branding scenario passed/);
+  }
+});
+
 test('this test process runs in compatibility mode', () => {
   assert.equal(CONFIG.compat, true);
   assert.deepEqual(loadConfig({}), CONFIG);

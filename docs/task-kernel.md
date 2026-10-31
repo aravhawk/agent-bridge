@@ -1,14 +1,16 @@
-# Task data and local integration prototype — not enabled
+# Task data and runtime integration
 
 `src/tasks.mjs` stores coordination data independently of expiring messages.
 `src/task-notices.mjs` can atomically stage a task command, an existing v1 notice
 and a bounded notice-to-task link. `src/task-integration.mjs` connects those
-transactions to the complete v1 message path in a local prototype. MCP has three
-task handlers behind an explicitly injected, default-off capability. The
-runtime hook defaults off; the exported production instance supplies no task
-option. Only a trusted constructor opt-in can assemble it; no environment or
-request flag can activate it. No events, receivers, timers, migrations, credentials or production
-workflows change.
+transactions to the complete v1 message path. MCP has three task handlers behind
+an explicitly injected constructor capability. The exported core runtime used by
+the queue and cron supplies no task option. The public API entrypoint instead
+attempts a trusted task-enabled runtime on its first MCP request once ordinary
+OAuth and delivery readiness are open; a `task_*` construction error selects a
+sticky v1-only fallback for that instance. No environment or request flag alone
+can activate tasks. No events, receivers, timers, migrations, credentials or
+production workflows change.
 
 ## Data access and execution authority
 
@@ -18,8 +20,9 @@ with `task_authorization_unavailable`. The local release factory supplies the
 server-bound callback from
 `src/task-access.mjs`, using trusted configured issuer/pin/current role policy,
 ACK reads and ACK+SEND commands. The current locked transaction state is a private
-fourth callback argument for denial checks. Runtime assembly is implemented but
-the exported production instance stays off. No work-grant registry or execution adapter exists. Tests use only
+fourth callback argument for denial checks. The public API uses this assembly
+only when ordinary readiness is already open; queue and cron remain task-disabled.
+No work-grant registry or execution adapter exists. Tests use only
 synthetic issuer/key/owner fixtures, not native approval or external permission.
 Unsupported async callbacks are rejected and their promise
 rejections observed without logging callback data.
@@ -173,7 +176,8 @@ store needs no UUIDv7 helper because identity records are never forgotten.
 
 The earlier `TaskKernel({retention: {...}})` collector remains an isolated synthetic
 prototype. Direct experimental integration must explicitly opt into purge; it
-cannot be enabled through the release factory or current production runtime.
+cannot be enabled through the release factory, and none of the checked-in
+entrypoints supplies that destructive retention configuration.
 Its tests preserve optional UUIDv7/clock fences and legacy compact tombstones;
 previously written identity markers remain enforced even when GC is disabled.
 Those destructive-retention settings are excluded from the live proposal.
@@ -181,7 +185,7 @@ Those destructive-retention settings are excluded from the live proposal.
 For the exact purge-off owner/scope/retention/receiver/rollback contract, see
 [task activation contract](task-activation.md).
 
-## Prototype surface and remaining activation boundary
+## Runtime surface and remaining deployment boundary
 
 Only explicit trusted `createRuntime({taskData: {enabled: true, leaseMs,
 linkRetentionMs, purgeEnabled: false}, ...})` or direct injected test capability exposes
@@ -189,8 +193,9 @@ the three tools: `bridge_task_command`, `bridge_task_get`,
 `bridge_task_from_notice`. Default-off and health-only catalogs omit all three;
 direct calls are refused. Enabled construction requires a trusted synchronous
 data-admission callback and the same store as the bridge. The local release
-factory, scope adapter and lazy runtime assembly exist; the default production
-assembly remains v1-only. Every call still passes the existing MCP verifier
+factory, scope adapter and lazy runtime assembly exist. The public API attempts
+that assembly only when ordinary readiness is open; queue and cron remain
+v1-only. Every call still passes the existing MCP verifier
 and the kernel's fresh injected admission; a new notice additionally passes v1
 send-scope admission. Production scopes/grants and verification are unchanged.
 
@@ -208,7 +213,9 @@ server-bound owner/scope adapter, inactive purge-off settings, native receiver
 steps, rollout, rollback and acceptance. Both verifiers use the same configured
 pin; the adapter derives a common key without equating role-specific principals.
 No new identity registry or grant is needed. Local runtime wiring is complete;
-external activation remains unperformed. Actual verifier/grant/receiver settings are unchanged.
+the checked-in public entrypoint conditionally attempts it as described above.
+Actual verifier/grant/receiver behavior remains to be qualified on a controlled
+live target.
 
 Execution still requires the assistant workflow's independent authority. The
 bridge does not create host run controls, guarantee on-time execution or recover

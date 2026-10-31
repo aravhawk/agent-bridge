@@ -53,4 +53,5 @@ out.parent.mkdir(parents=True, exist_ok=True)
 with zipfile.ZipFile(out, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
     for name, value in files.items():
         archive.writestr(manifest['name'] + '/' + name, json.dumps(value, indent=2) + '\n')
+    archive.writestr(manifest['name'] + '/LICENSE', (root / 'LICENSE').read_bytes())
 print(out)

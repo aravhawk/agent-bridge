@@ -1,4 +1,4 @@
-# Task-data release candidate and staged activation contract
+# Task-data runtime and qualification contract
 
 The adapter, purge-disabled capability and default-off runtime hook are released.
 The core `runtime = createRuntime()` still passes no task option. The activation
@@ -10,9 +10,11 @@ ordinary authenticated health/read/receipt/unsubscribe when task readiness is
 unavailable, without changing either verifier. Unexpected errors retain503.
 The fallback is sticky until a fresh instance/deployment; it never silently
 enables task tools later. The queue entry uses the unchanged core runtime.
-Enable activation only after independent review and both native receiver
-preparations are complete; coordinate acceptance separately. Credentials,
-OAuth grants and security configuration are unchanged and outside this release.
+The checked-in entrypoint therefore has no separate task environment flag:
+opening ordinary OAuth and delivery readiness can make task tools available on
+a fresh instance. Treat live receiver and run-lifecycle behavior as unqualified
+until the controlled acceptance below succeeds. Credentials, OAuth grants and
+security configuration are unchanged and outside this release.
 
 Task reads include the authenticated caller's role and next command sequence.
 Optional read `commandId` recovers only that caller's bounded cached receipt;
@@ -100,19 +102,19 @@ A claim is a coordination mutex, never authorization for external work.
 
 ## Purge off and finite capacity
 
-The release candidate never automatically deletes full task records or task-link
+The checked-in task runtime never automatically deletes full task records or task-link
 metadata. Expired links return `task_notice_not_found` but remain stored. Terminal
 results and the latest checkpoint remain available by known task ID; bounded
 replay metadata remains stored. Existing ordinary
 v1 content cleanup and receipt rules stay unchanged; this is not a change to the
 v1 24-hour content/seven-day message-ID lifecycle.
 
-Proposed first-activation settings, still inactive:
+Checked-in public-entrypoint settings:
 
 | Setting | Value/behavior |
 |---|---|
-| Public task capability | Explicitly off until the activation bundle is approved |
-| Permanent task/link purge | Off separately; candidate factory refuses activation |
+| Public task capability | Attempted on a fresh public API instance only when ordinary OAuth and delivery readiness are open; `task_*` construction failure selects sticky v1 fallback |
+| Permanent task/link purge | Off separately; the capability factory rejects purge configuration |
 | Workflow coordination deadline | 24-hour default supplied by workflow, immutable; does not grant execution authority |
 | Coordination mutex | Explicit 60 seconds, capped by task deadline |
 | Exact-notice lookup lifetime | Explicit 48 hours; logical expiry, metadata retained |
@@ -135,12 +137,12 @@ remains synthetic-test-only and is not part of the live activation bundle.
 
 ## Remaining receiver/catalog dependencies
 
-Runtime wiring is complete and locally tested in both modes/directions. After
-approval, deliberately opt in through the trusted production assembly. Refresh the
-actual host catalogs for the three existing candidate task tools;
-make no new event schema. The unchanged production assembly still exposes ordinary
-v1 only. Local catalog tests do not verify native discovery. Before claiming
-native integration, verify the actual webhook receiver's
+Runtime wiring is complete and locally tested in both modes/directions. The
+public API already supplies the trusted task options, so a fresh instance whose
+ordinary readiness is open can expose the three task tools; a task construction
+failure remains v1-only for that instance. Refresh the actual host catalogs;
+make no new event schema. Local catalog tests do not verify native discovery.
+Before claiming native integration, verify the actual webhook receiver's
 supported payload-to-context mapping and run identity/start/completion evidence.
 
 Receiver workflow: on the existing event, resolve that exact message ID once with
@@ -166,18 +168,19 @@ For a non-task event, use the ordinary known-ID v1 workflow. Expired task links
 stop the task-notice branch; known canonical task IDs remain readable under fresh
 access. Never claim/complete expired v1 receipts; ACKs stay terminal. No inbox
 polling, ACK-response loop, scheduler or automatic external-work permission is
-introduced. These native catalog/workflow changes remain unperformed.
+introduced. Actual native receiver/catalog behavior remains unqualified here.
 
 ## Concise rollout, rollback and acceptance
 
-1. Use the corrected, reviewed/fingerprinted
-   combined candidate, rebased/tested against current main, through the
-   normal reviewed pull request, green CI, merge and deployment. Verify the
-   deployed source/alias while the task runtime gate stays off.
+1. Use the corrected, reviewed/fingerprinted release through the normal reviewed
+   pull request, green CI, merge and deployment. Verify the deployed source and
+   alias while ordinary delivery readiness remains closed so the first instance
+   stays on the v1 fallback during setup.
 2. Confirm trusted configuration matches the existing verifiers without exposing
-   pin/token values. Deliberately supply the runtime's trusted `taskData` options,
-   with purge off. Open the approved verification window, opt in, then refresh the actual
-   catalogs/workflows and run bounded acceptance. Disable it if acceptance fails.
+   pin/token values. Open the approved verification window, then restart on a
+   fresh instance with ordinary readiness open and refresh the actual catalogs
+   and workflows for bounded acceptance. Close ordinary delivery readiness if
+   acceptance fails; there is no separate task environment switch.
 3. Acceptance separates task/notice storage, native event emission, exact ID in
    actual host context, hosted execution, current claim/checkpoint/result
    and terminal v1 receipt behavior. Include work exceeding the mutex and resolve
@@ -185,17 +188,16 @@ introduced. These native catalog/workflow changes remain unperformed.
    insufficient. Local tests cover denial races, crossed roles/owners, stale
    policy/expiry, replay, wrong recipient, capacity and crash/delay behavior;
    do not force live failures or broaden traffic as a test.
-4. Roll back by disabling task capability on all instances first. Preserve all
-   collaboration data, markers, fences and newer v1 writes; do not restore a stale
-   database snapshot or purge records. Revert to the recorded known-good release
-   with task handlers disabled if needed. Reconcile already-started external work
-   separately; API disable/cancellation does not undo external effects.
+4. Roll back by closing ordinary delivery readiness on all instances first,
+   which also pauses ordinary delivery. Preserve all collaboration data, markers,
+   fences and newer v1 writes; do not restore a stale database snapshot or purge
+   records. Deploy the recorded known-good task-disabled release before reopening
+   readiness. Reconcile already-started external work separately; closing the API
+   gate or deploying older handlers does not undo external effects.
 
-Owner identity derivation, row locking and batching are implementation details;
-they do not need separate repeated permission questions. The authorized release
-adopts the new task-data scope meanings, public tool/native workflow exposure,
-release and bounded live acceptance. Permanent deletion is excluded.
-Runtime wiring is implemented; production opt-in and native catalog/workflow
-changes remain unperformed. Actual supported receiver mapping and run-lifecycle evidence
-remain unverified platform dependencies. No code here guarantees host scheduler
-timeliness, execution or success.
+Owner identity derivation, row locking and batching are implementation details.
+The runtime adopts the task-data scope meanings and conditionally exposes the
+public tools as described above. Permanent deletion is excluded. Native catalog,
+receiver mapping and run-lifecycle evidence remain unverified platform
+dependencies. No code here guarantees host scheduler timeliness, execution or
+success.
