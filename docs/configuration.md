@@ -95,11 +95,13 @@ Every gate defaults to closed. A flag is an operator attestation, not evidence.
 | `BRIDGE_RECEIVER_POLICY=inbox-v1` | Attests that both receivers enforce the [inbox contract](inbox-policy.md). |
 | `BRIDGE_DELIVERY_ENABLED=true` | Message send, receipts and queue delivery, only if every other gate is also satisfied. |
 
-`bridge_health` reports each gate under `readiness`. Delivery flags never
-change the tool catalog: the events peer sees seven tools (eight with the send
-scope after attestation, including the diagnostic), the webhook peer six. The
-one exception is `BRIDGE_WAKE_SYNC_RECIPIENTS` (below): an enabled recipient
-also sees `bridge_inbox_read`, and `readiness.wakeSync` appears once it is set.
+`bridge_health` reports each gate under `readiness`. With both optional features
+off, delivery flags never change the legacy catalog: the events peer sees seven
+tools (eight with the send scope after attestation, including the diagnostic),
+and the webhook peer sees six. Batching adds `bridge_inbox_read` for each enabled
+recipient and reports `readiness.wakeSync`. Setting the [private attachments](attachments.md)
+flag reports `readiness.attachments`; only a valid enabled configuration adds
+the attachment tools.
 
 ## Webhook peer
 

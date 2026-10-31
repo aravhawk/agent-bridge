@@ -318,7 +318,8 @@ export class Bridge {
   syncBatches(state, message, role, now) {
     // An ACK is terminal: reading it never collects or presents SYNC data, so
     // handling an ACK can never lead to another (batch) ACK.
-    if (!dailyMessage(message.envelope) || message.envelope.kind === 'ack') return [];
+    if (!dailyMessage(message.envelope) || message.envelope.kind === 'ack' ||
+        !messageAccessAllowed(state, message, this.messagePolicyIds, now)) return [];
     // Collect only while the message can still be completed in one call.
     if (this.syncEnabled(role) && state.receipts[message.envelope.id]?.state !== 'complete' && attachRoom(state, message) > 0) {
       const batch = cutBatch(state, role, now, { reason: 'read', policyIds: this.messagePolicyIds });

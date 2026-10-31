@@ -638,6 +638,64 @@ test('bridge_read drains pending SYNC into a batch attached to an open message o
   await assert.rejects(f.bridge.inboxRead(jarvis), /wake_sync_not_enabled/);
 });
 
+test('bridge_read cannot strand pending SYNC on a carrier whose authorization has expired', async () => {
+  const f = await fixture();
+  const wake = f.message(); await f.send(wake);
+  const pending = f.sync(); await f.send(pending);
+  f.set(noon + 5000); // The WAKE authorization has expired; the SYNC item remains live and due.
+
+  const read = await f.bridge.read(friday, { messageId: wake.id });
+  assert.equal(read.expired, true);
+  assert.equal('syncBatches' in read, false, 'an inactive carrier cannot collect pending data');
+  assert.equal(batchesIn(f.snapshot()).length, 0, 'read does not create a presented-but-unclaimable batch');
+  await assert.rejects(f.bridge.claim(friday, { messageId: wake.id }), /message_authorization_inactive/);
+
+  const flushed = await f.bridge.flushSync();
+  assert.deepEqual(flushed.results, [{ recipient: 'friday', outcome: 'flushed', reason: 'scheduled', items: 1 }]);
+  assert.equal(flushed.dispatch.length, 1);
+  const batch = f.snapshot().messages[flushed.dispatch[0]];
+  assert.deepEqual(batch.syncBatch.itemIds, [pending.id], 'the still-pending item remains available to scheduled recovery');
+});
+
+test('bridge_read cannot present and strand an attached batch on an expired carrier', async () => {
+  const f = await fixture();
+  const pending = f.sync(); await f.send(pending);
+  const wake = f.message(); await f.send(wake);
+  const batchId = f.snapshot().messages[wake.id].syncBatchIds[0];
+  assert.ok(batchId);
+  assert.equal(f.snapshot().messages[batchId].syncBatch.presentedAt, undefined);
+  f.set(noon + 5000);
+
+  const read = await f.bridge.read(friday, { messageId: wake.id });
+  assert.equal(read.expired, true);
+  assert.equal('syncBatches' in read, false, 'an inactive carrier cannot present its attached batch');
+  assert.equal(f.snapshot().messages[batchId].syncBatch.presentedAt, undefined);
+  await assert.rejects(f.bridge.claim(friday, { messageId: wake.id }), /message_authorization_inactive/);
+
+  const flushed = await f.bridge.flushSync();
+  assert.deepEqual(flushed.dispatch, [batchId], 'the unpresented batch is recovered by the scheduled flush');
+  assert.deepEqual(flushed.results,
+    [{ recipient: 'friday', outcome: 'flushed', reason: 'scheduled', items: 0, rehomedBatches: 1 }]);
+});
+
+test('bridge_read cannot present an attached batch while its carrier policy is withdrawn', async () => {
+  const f = await fixture();
+  const pending = f.sync(); await f.send(pending);
+  const wake = f.message(); await f.send(wake);
+  const batchId = f.snapshot().messages[wake.id].syncBatchIds[0];
+  f.bridge.messagePolicyIds.jarvis = 'd'.repeat(64);
+
+  const read = await f.bridge.read(friday, { messageId: wake.id });
+  assert.equal('syncBatches' in read, false);
+  assert.equal(f.snapshot().messages[batchId].syncBatch.presentedAt, undefined);
+  await assert.rejects(f.bridge.claim(friday, { messageId: wake.id }), /message_authorization_inactive/);
+
+  f.bridge.messagePolicyIds.jarvis = policy;
+  f.set(noon + 5000);
+  assert.deepEqual((await f.bridge.flushSync()).dispatch, [batchId],
+    'restoring the policy leaves the unpresented batch recoverable');
+});
+
 test('ACKs are not suppressed: an enabled recipient\'s direct messages get an immediate correlated ACK at completion', async () => {
   const f = await fixture({ recipients: ['friday'] });
   const fromFriday = f.message('friday'); await f.send(fromFriday);
