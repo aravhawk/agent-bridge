@@ -147,6 +147,7 @@ test('inbox read survives a lost response: unacknowledged batches replay until t
   const again = await f.bridge.inboxRead(friday);
   assert.deepEqual(again, lost, 're-read returns the same batch and items');
   assert.equal(batchesIn(f.snapshot()).length, 1, 'no second cut');
+  f.advance(1000); // distinct cut times, so the replay order below is creation order
   const b = f.sync(); await f.send(b);
   const both = await f.bridge.inboxRead(friday);
   assert.deepEqual(ids(both.syncBatches), [[a.id], [b.id]]);
@@ -756,6 +757,135 @@ test('reclaim keeps the newest same-subject update when successive batches both 
   g.advance(13 * HOUR);
   assert.deepEqual((await g.bridge.inboxRead(friday)).syncBatches, []);
   assert.equal((await g.bridge.status(jarvis, { messageId: o1.id })).sync.supersededBy, o2.id);
+});
+
+// Same-millisecond admissions: storedAt ties, so order must come from the
+// durable admission sequence (or, for data admitted before it existed, never
+// replay an older-or-equal update over one that is handled or still live).
+const unstamp = f => f.store.transaction(s => { for (const m of Object.values(s.messages)) delete m.syncSeq; delete s.syncAdmissionSeq; });
+// Postgres JSONB does not keep object key order. Rewrite every keyed map the
+// SYNC logic iterates in the given key order (sorted or reverse-sorted), as a
+// round trip through JSONB may, so results cannot depend on insertion order.
+const reorder = (f, reverse) => f.store.transaction(s => {
+  const rekey = obj => Object.fromEntries(Object.entries(obj).sort(([a], [b]) => (a < b ? -1 : 1) * (reverse ? -1 : 1)));
+  s.messages = rekey(s.messages); s.receipts = rekey(s.receipts); s.jobs = rekey(s.jobs);
+  for (const q of Object.values(s.syncQueues || {})) q.pending = rekey(q.pending);
+});
+test('same-millisecond updates: a newer acknowledged batch keeps the older one from replaying', async () => {
+  for (const [legacy, reverse] of [[false, false], [false, true], [true, false], [true, true]]) {
+    const f = await fixture();
+    const v1 = f.sync('jarvis', { subject: 'same-ms', text: 'v1' }); await f.send(v1);
+    await f.bridge.inboxRead(friday);
+    const v2 = f.sync('jarvis', { subject: 'same-ms', text: 'v2' }); await f.send(v2); // no clock advance
+    const both = (await f.bridge.inboxRead(friday)).syncBatches;
+    // Two batches cut in the same millisecond: display order is by ID only.
+    assert.deepEqual(ids(both).sort(), [[v1.id], [v2.id]].sort());
+    assert.equal(f.snapshot().messages[v1.id].storedAt, f.snapshot().messages[v2.id].storedAt);
+    if (legacy) await unstamp(f); // snapshot written before admission order was recorded
+    const b2 = both.find(b => b.items[0].messageId === v2.id).messageId;
+    assert.deepEqual((await f.receive(b2)).syncBatchesAcked, [b2]);
+    await reorder(f, reverse);
+    f.advance(13 * HOUR);
+    const replay = (await f.bridge.inboxRead(friday)).syncBatches;
+    if (!legacy) {
+      assert.deepEqual(replay, [], `sequenced, ${reverse ? 'reversed' : 'sorted'} keys`);
+      assert.equal((await f.bridge.status(jarvis, { messageId: v1.id })).sync.supersededBy, v2.id);
+    } else {
+      // No recorded order: v1 may be the newest, so it is kept (flagged), not discarded.
+      assert.deepEqual(replay.map(b => b.items.map(i => [i.messageId, i.orderUnknown])), [[[v1.id, true]]]);
+    }
+  }
+});
+
+test('same-millisecond updates: a newer update in a still-live batch supersedes the reclaimed older one', async () => {
+  for (const [legacy, reverse] of [[false, false], [false, true], [true, false]]) {
+    const f = await fixture();
+    const v1 = f.sync('jarvis', { subject: 'same-ms' }); await f.send(v1);
+    await f.bridge.inboxRead(friday);                    // B1 at t0 carries v1
+    const v2 = f.sync('jarvis', { subject: 'same-ms' }); await f.send(v2); // same millisecond, stays pending
+    if (legacy) await unstamp(f);
+    f.advance(HOUR);
+    const b2 = (await f.bridge.inboxRead(friday)).syncBatches.find(b => b.items.some(i => i.messageId === v2.id)).messageId;
+    await reorder(f, reverse);
+    f.advance(SYNC_BATCH_TTL_MS - HOUR);                 // B1 expired, B2 still live
+    const replay = (await f.bridge.inboxRead(friday)).syncBatches;
+    if (!legacy) {
+      assert.deepEqual(replay.map(b => b.messageId), [b2], `sequenced, ${reverse ? 'reversed' : 'sorted'} keys`);
+      assert.equal((await f.bridge.status(jarvis, { messageId: v1.id })).sync.supersededBy, v2.id);
+    } else {
+      // Unknown order: both survive; v1 is re-sent flagged, v2 stays in its live batch.
+      assert.equal(replay.length, 2); assert.equal(replay[0].messageId, b2);
+      assert.deepEqual(replay[1].items.map(i => [i.messageId, i.orderUnknown]), [[v1.id, true]]);
+    }
+  }
+});
+
+test('same-millisecond updates: a WAKE with the same subject is the newer update', async () => {
+  const f = await fixture();
+  const v1 = f.sync('jarvis', { subject: 'same-ms' }); await f.send(v1);
+  await f.bridge.inboxRead(friday);
+  const wake = f.message('jarvis', { subject: 'same-ms', text: 'decided' }); await f.send(wake);
+  await f.handle(friday, wake.id);
+  f.advance(13 * HOUR);
+  assert.deepEqual((await f.bridge.inboxRead(friday)).syncBatches, []);
+  assert.equal((await f.bridge.status(jarvis, { messageId: v1.id })).sync.supersededBy, wake.id);
+  // A sequenced WAKE admitted before a same-millisecond SYNC update does not hide it.
+  const g = await fixture();
+  const first = g.message('jarvis', { subject: 'same-ms' }); await g.send(first);
+  const later = g.sync('jarvis', { subject: 'same-ms' }); await g.send(later);
+  await g.bridge.inboxRead(friday);
+  g.advance(13 * HOUR);
+  assert.deepEqual(ids((await g.bridge.inboxRead(friday)).syncBatches), [[later.id]]);
+});
+
+test('same-millisecond updates: native recovery keeps only the newest of tied re-sends', async () => {
+  for (const legacy of [false, true]) {
+    const f = await fixture();
+    const v1 = f.sync('jarvis', { subject: 'same-ms', text: 'v1' }), v2 = f.sync('jarvis', { subject: 'same-ms', text: 'v2' });
+    await f.send(v1, who('jarvis', start + 60000));
+    // v1 is still pending when v2 arrives, so v2 supersedes it at admission; recover v2 only.
+    await f.send(v2, who('jarvis', start + 60000));
+    if (legacy) await unstamp(f);
+    f.enabled.recipients = [];
+    assert.deepEqual((await f.bridge.flushSync()).results, [{ recipient: 'friday', outcome: 'native', items: 1 }]);
+    f.advance(2 * 60000);
+    const out = await f.bridge.flushSync();
+    const batch = batchesIn(f.snapshot()).find(b => out.dispatch.includes(b.envelope.id));
+    assert.deepEqual(batch.syncBatch.itemIds, [v2.id]);
+    assert.equal(f.snapshot().messages[v1.id].sync.state, 'superseded');
+  }
+});
+
+test('same-millisecond legacy ties with no recorded order keep both updates, whatever the key order', async () => {
+  for (const reverse of [false, true]) {
+    const f = await fixture();
+    const v1 = f.sync('jarvis', { subject: 'same-ms' }); await f.send(v1);
+    await f.bridge.inboxRead(friday);
+    const v2 = f.sync('jarvis', { subject: 'same-ms' }); await f.send(v2);
+    await f.bridge.inboxRead(friday);
+    await unstamp(f); await reorder(f, reverse);
+    f.advance(13 * HOUR);
+    const replay = (await f.bridge.inboxRead(friday)).syncBatches;
+    assert.equal(replay.length, 1, 'one new batch');
+    const got = replay[0].items.map(i => [i.messageId, i.orderUnknown]).sort();
+    assert.deepEqual(got, [[v1.id, true], [v2.id, true]].sort(), `neither is discarded (${reverse ? 'reversed' : 'sorted'} keys)`);
+    for (const id of [v1.id, v2.id]) assert.equal(f.snapshot().messages[id].sync.state, 'delivered');
+  }
+});
+
+test('sequenced same-millisecond updates resolve identically under any key order, both batches expired', async () => {
+  for (const reverse of [false, true]) {
+    const f = await fixture();
+    const v1 = f.sync('jarvis', { subject: 'same-ms' }); await f.send(v1);
+    await f.bridge.inboxRead(friday);
+    const v2 = f.sync('jarvis', { subject: 'same-ms' }); await f.send(v2);
+    await f.bridge.inboxRead(friday);
+    await reorder(f, reverse);
+    f.advance(13 * HOUR);
+    const replay = (await f.bridge.inboxRead(friday)).syncBatches;
+    assert.deepEqual(replay.map(b => b.items.map(i => [i.messageId, i.orderUnknown])), [[[v2.id, false]]]);
+    assert.equal(f.snapshot().messages[v1.id].sync.supersededBy, v2.id);
+  }
 });
 
 test('rollback native delivery is recovered into a batch when its v1 authority lapses before completion', async () => {

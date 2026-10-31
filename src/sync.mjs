@@ -109,22 +109,30 @@ export function classify(envelope, now) {
 // batch: its own claim is refused with a redirect (see syncItemClaimRedirect).
 const queueOf = (state, recipient) => state.syncQueues?.[recipient];
 const queueFor = (state, recipient) => (state.syncQueues ||= {})[recipient] ||= { pending: {} };
+// queue.pending is keyed by slot: normally the subject key; an item whose
+// order against a queued same-subject item is unknown keeps its own 'id:' slot.
+const slotOf = sync => sync.slot ?? sync.key;
 export function enqueueSync(state, message, now) {
   const { envelope } = message, queue = queueFor(state, envelope.to);
   const key = subjectKey(envelope.subject) ?? 'id:' + envelope.id;
-  supersede(state, queue, key, envelope.id, now);
+  supersedePending(state, queue, key, envelope.id, now);
   queue.pending[key] = envelope.id;
   message.sync = { state: 'pending', key, queuedAt: now };
 }
-function supersede(state, queue, key, byId, now) {
-  const prior = state.messages[queue.pending[key]];
-  if (prior?.sync?.state === 'pending') Object.assign(prior.sync, { state: 'superseded', supersededBy: byId, supersededAt: now });
-  delete queue.pending[key];
+// A new admission is the newest update for its subject: every queued item
+// with that subject (in any slot) is superseded.
+function supersedePending(state, queue, key, byId, now, olderThan = null) {
+  for (const [slot, id] of Object.entries(queue.pending)) {
+    const prior = state.messages[id];
+    if (prior?.sync?.state !== 'pending' || prior.sync.key !== key || (olderThan && admittedAfter(prior, olderThan) !== false)) continue;
+    Object.assign(prior.sync, { state: 'superseded', supersededBy: byId, supersededAt: now });
+    delete queue.pending[slot];
+  }
 }
 // A WAKE with a subject is the newest update for that subject.
 export function supersedeBySubject(state, envelope, now) {
   const queue = queueOf(state, envelope.to), key = subjectKey(envelope.subject);
-  if (queue && key && queue.pending[key]) supersede(state, queue, key, envelope.id, now);
+  if (queue && key) supersedePending(state, queue, key, envelope.id, now);
 }
 // Data admitted by a verified sender under the current policy and not
 // withdrawn by durable denial. Unlike messageAccessAllowed this does not end at
@@ -136,34 +144,68 @@ function itemAllowed(state, message, policyIds) {
     /^[a-f0-9]{64}$/.test(policyIds?.[e.from] || '') && a.policyId === policyIds[e.from] &&
     a.resource === resourceFor(e.from) && a.scope === messageScope(e.from, e.kind) && !resourceDenied(state, a.owner);
 }
+// Display/processing order only. Object key order is not durable (Postgres
+// JSONB reorders keys), so ties are broken by ID here, and no supersede
+// decision depends on this order.
+const byId = (a, b) => (a.envelope.id < b.envelope.id ? -1 : a.envelope.id > b.envelope.id ? 1 : 0);
 const batches = (state, recipient) => Object.values(state.messages)
-  .filter(m => m.syncBatch?.recipient === recipient).sort((a, b) => a.syncBatch.createdAt - b.syncBatch.createdAt);
-// The newest later update for the same subject addressed to this recipient: a
-// queued, batched, natively sent or WAKE message accepted after this item and
-// not itself superseded or withdrawn. Unsubjected items have no successor.
-function newerUpdate(state, item) {
+  .filter(m => m.syncBatch?.recipient === recipient)
+  .sort((a, b) => a.syncBatch.createdAt - b.syncBatch.createdAt || byId(a, b));
+// Durable admission order. Every SYNC item and every subjected WAKE admitted
+// for an enabled recipient gets the next value of one stored counter, in the
+// same transaction that stores it, so two admissions in the same millisecond
+// still have a strict order. (Unsubjected WAKEs never compete for a subject
+// and keep the exact v1 record.)
+export function stampAdmission(state, message) {
+  message.syncSeq = state.syncAdmissionSeq = (Number.isSafeInteger(state.syncAdmissionSeq) ? state.syncAdmissionSeq : 0) + 1;
+}
+const stamped = m => Number.isSafeInteger(m.syncSeq);
+// true: m was admitted after item; false: before; null: unknown. Only stored
+// numbers are compared (acceptance time, then the admission sequence), never
+// object key order. Unknown means the same millisecond with neither stamped:
+// data admitted before the sequence existed, whose true order is not recorded
+// anywhere and cannot be reconstructed.
+function admittedAfter(m, item) {
+  if (m.storedAt !== item.storedAt) return m.storedAt > item.storedAt;
+  if (stamped(m) && stamped(item)) return m.syncSeq > item.syncSeq;
+  return stamped(m) !== stamped(item) ? stamped(m) : null;
+}
+// Same-subject updates addressed to this recipient, other than item, that are
+// not superseded or withdrawn: the newest one admitted after item, and whether
+// any has an unknown order relative to it.
+function orderAmong(state, item) {
   const { key } = item.sync;
-  if (!key?.startsWith('s:')) return null;
-  let newest = null;
+  let newer = null, ambiguous = false;
+  if (!key?.startsWith('s:')) return { newer, ambiguous };
   for (const m of Object.values(state.messages)) {
     if (m === item || m.syncBatch || m.envelope.to !== item.envelope.to || m.envelope.kind === 'ack' ||
-        !(m.storedAt > item.storedAt) || ['superseded', 'withdrawn'].includes(m.sync?.state) ||
-        (m.sync?.key ?? subjectKey(m.envelope.subject)) !== key) continue;
-    if (!newest || m.storedAt > newest.storedAt) newest = m;
+        ['superseded', 'withdrawn'].includes(m.sync?.state) || (m.sync?.key ?? subjectKey(m.envelope.subject)) !== key) continue;
+    const after = admittedAfter(m, item);
+    if (after === null) ambiguous = true;
+    else if (after && (!newer || admittedAfter(m, newer) === true)) newer = m;
   }
-  return newest;
+  return { newer, ambiguous };
 }
 // Put an undelivered or unhandled item back in the queue, unless a newer
-// same-subject update exists (then it is superseded). Ordering is by the time
-// the bridge accepted each message, never by the order of recovery.
+// same-subject update exists (then it is superseded). Queued items it is newer
+// than are superseded. Ordering is by admission, never by recovery or key
+// order. When the order against another update is unknown (legacy tie), both
+// are kept and flagged orderUnknown rather than guessing and discarding one.
 function requeue(state, recipient, item, now, extra = {}) {
-  const queue = queueFor(state, recipient), { key } = item.sync, newer = newerUpdate(state, item);
+  const queue = queueFor(state, recipient), { key } = item.sync, { newer, ambiguous } = orderAmong(state, item);
   if (newer) { item.sync = { ...item.sync, state: 'superseded', supersededBy: newer.envelope.id, supersededAt: now }; return; }
-  const queued = state.messages[queue.pending[key]];
-  if (queued?.sync?.state === 'pending') Object.assign(queued.sync, { state: 'superseded', supersededBy: item.envelope.id, supersededAt: now });
-  queue.pending[key] = item.envelope.id;
-  item.sync = { state: 'pending', key, queuedAt: now, redeliveries: (item.sync.redeliveries || 0) + 1,
-    ...(item.sync.nativeFailed ? { nativeFailed: true } : {}), ...extra };
+  supersedePending(state, queue, key, item.envelope.id, now, item);
+  if (ambiguous) {
+    for (const id of Object.values(queue.pending)) {
+      const peer = state.messages[id];
+      if (peer?.sync?.state === 'pending' && peer.sync.key === key && admittedAfter(peer, item) === null) peer.sync.orderUnknown = true;
+    }
+  }
+  const slot = queue.pending[key] ? 'id:' + item.envelope.id : key;
+  queue.pending[slot] = item.envelope.id;
+  item.sync = { state: 'pending', key, ...(slot !== key ? { slot } : {}), queuedAt: now,
+    redeliveries: (item.sync.redeliveries || 0) + 1, ...(item.sync.nativeFailed ? { nativeFailed: true } : {}),
+    ...(ambiguous || item.sync.orderUnknown ? { orderUnknown: true } : {}), ...extra };
 }
 // Unacknowledged batches whose replay lifetime is over: their unhandled items
 // go back to the queue (a newer same-subject update supersedes them).
@@ -228,7 +270,7 @@ function livePending(state, recipient, policyIds, now) {
     }
     live.push(message);
   }
-  return live.sort((a, b) => a.storedAt - b.storedAt);
+  return live.sort((a, b) => a.storedAt - b.storedAt || (a.syncSeq ?? 0) - (b.syncSeq ?? 0) || byId(a, b));
 }
 export function pendingCount(state, recipient) {
   return Object.keys(queueOf(state, recipient)?.pending || {}).length;
@@ -303,8 +345,9 @@ export function cutBatch(state, recipient, now, { reason, policyIds, deliver = f
   state.messageIds[id] = { hash, kind: 'status', until: now + IDEMPOTENCY_RETENTION_MS };
   const queue = queueOf(state, recipient);
   for (const message of items) {
+    delete queue.pending[slotOf(message.sync)];
     Object.assign(message.sync, { state: 'delivered', batchId: id, deliveredAt: now, via: reason });
-    delete queue.pending[message.sync.key];
+    delete message.sync.slot;
   }
   return state.messages[id];
 }
@@ -315,12 +358,12 @@ export function presentBatch(state, batchId, now) {
   if (!b) return null;
   b.presentedAt ??= now;
   return { messageId: batchId, reason: b.reason, createdAt: new Date(b.createdAt).toISOString(), acknowledged: !!b.ackedAt,
-    items: b.itemIds.map(id => state.messages[id]).filter(Boolean).map(({ envelope: e, storedAt }) => ({
+    items: b.itemIds.map(id => state.messages[id]).filter(Boolean).map(({ envelope: e, storedAt, sync }) => ({
       messageId: e.id, kind: e.kind, class: 'sync', ...(e.subject !== undefined ? { subject: e.subject } : {}),
       text: e.text, threadId: e.threadId, sentAt: e.sentAt, expiresAt: e.expiresAt,
       ...(e.effectiveAt !== undefined ? { effectiveAt: e.effectiveAt } : {}), ...(e.dueAt !== undefined ? { dueAt: e.dueAt } : {}),
       receivedAt: new Date(storedAt).toISOString(), expired: Date.parse(e.expiresAt) <= now,
-      late: !!b.lateItemIds?.includes(e.id) })) };
+      late: !!b.lateItemIds?.includes(e.id), orderUnknown: !!sync?.orderUnknown })) };
 }
 // Acknowledge a presented batch held by evidence.claimId: its receipt plus
 // every item's receipt. The batch receipt must already be complete (direct
@@ -372,8 +415,9 @@ export function flushDue(state, now, { policyIds, recipients = [] }) {
         const jobIds = appendDeliveryJobs(state, item.envelope, now);
         if (!jobIds.length) continue;
         item.jobIds = jobIds; native.push(item.envelope.id);
+        delete queue.pending[slotOf(item.sync)];
         Object.assign(item.sync, { state: 'delivered', via: 'native', deliveredAt: now });
-        delete queue.pending[item.sync.key];
+        delete item.sync.slot;
       }
       if (native.length) { (queue.undispatched ||= []).push(...native); results.push({ recipient, outcome: 'native', items: native.length }); }
       live = live.filter(item => !native.includes(item.envelope.id));

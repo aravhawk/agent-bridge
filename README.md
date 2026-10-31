@@ -209,8 +209,12 @@ by clearing it), that recipient gets:
 - **One batch, not one wake per item.** Pending SYNC items are coalesced (delta
   only, deduplicated by subject) into a batch: with the next WAKE, on the
   recipient's next `bridge_read`/`bridge_inbox_read`, or as a single webhook at
-  the next even hour in America/Chicago (00:00, 02:00, … 22:00), and never more
-  than 2 elapsed hours after the oldest item was queued (DST included). At most
+  the next even hour in America/Chicago (00:00, 02:00, … 22:00). The
+  requirement is that the oldest item waits no more than 2 elapsed hours (DST
+  included); every hourly run flushes on that basis, but the hourly GitHub
+  schedule can be delayed or skipped, so it is not yet a proven guarantee (an
+  [owner rollout blocker](docs/configuration.md#owner-rollout-blockers-unresolved),
+  together with the receiver-policy exceptions the contract needs). At most
   12 batch wakes per day (13 on the 25-hour fall-back day), none for an empty
   window. A batch is an ordinary `status` message, so its wake payload is
   unchanged; `bridge_read` adds a `syncBatches` field with each item.

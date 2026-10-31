@@ -53,12 +53,21 @@ status, logged decisions, owner changes, reminders further out. The server
 promotes SYNC to WAKE when `effectiveAt`, `dueAt` or `expiresAt` is within
 2 h 30 min (the 2-hour maximum wait plus scheduler slack). Unclassified
 messages are WAKE. SYNC data is delivered in batches (a v1 `status` message
-from the counterpart), at most 2 elapsed hours after it was queued, and a
-batch repeats until the recipient acknowledges it. Receipts addressed to an
+from the counterpart); the requirement is delivery no more than 2 elapsed
+hours after it was queued (an unresolved owner rollout blocker while the
+hourly trigger can be delayed or skipped), and a batch repeats until the
+recipient acknowledges it. Receipts addressed to an
 enabled recipient no longer produce an ACK message or wake. See
 [configuration](configuration.md#wakesync-delivery-classes-default-off).
 
 ### Flagged receiver contract
+
+This contract describes what a flagged receiver would have to do. Handling
+batches, start-of-turn `bridge_inbox_read` calls and accepting expired or late
+items are exceptions to the receiver policy below that the owner has not
+approved; see
+[owner rollout blockers](configuration.md#owner-rollout-blockers-unresolved).
+Nothing here changes the receiver policy.
 
 With the flag unset, the receiver policy below is unchanged and sufficient:
 every wake names the native message ID, and nothing needs polling. A receiver
@@ -89,13 +98,19 @@ nor completed while one of its items still holds a live claim made before this
 rule existed (`sync_batch_item_busy` with `itemIds`); the batch then stays
 outstanding and replays until that claim completes or its 60-second lease
 lapses, and is never acknowledged with an item left uncovered. Items re-sent
-under their own message ID after a rollback, and every message while the flag
-is unset, are claimed exactly as before.
+under their own message ID after a rollback are claimed directly, like any v1
+message. Messages sent while the flag is unset carry no SYNC metadata and are
+claimed exactly as before. SYNC items queued or batched while the flag was set
+keep this rule after a rollback: an item still in an outstanding batch is
+handled through that batch, and a queued one is re-sent on the next run
+(natively where its v1 authority allows, otherwise in a batch).
 
 1. **Read.** On every wake, `bridge_read` the event's `messageId`. Validate the
    envelope as in the policy below and keep, from *this* read, every
    `syncBatches[].messageId` and its `items[]` (full text, `messageId`,
-   `subject`, times, `expired`/`late` flags). The envelope of a batch is only a
+   `subject`, times, `expired`/`late`/`orderUnknown` flags; `orderUnknown`
+   marks a same-subject update whose order against another one could not be
+   determined, so neither was treated as the newest). The envelope of a batch is only a
    digest; the items are authoritative. Do not act on anything yet. Another
    reader of the same message may be shown more batches than you; only your
    own read counts for you.

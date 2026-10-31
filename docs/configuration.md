@@ -218,9 +218,12 @@ For an enabled recipient:
   `sync`), `subject`, `effectiveAt` and `dueAt`. A message with no class is
   WAKE, unchanged. SYNC is promoted to WAKE when its `effectiveAt`, `dueAt` or
   `expiresAt` is at or before now + 2 h 30 min: the 2-hour maximum wait plus
-  30 minutes of scheduler slack, so queued data always arrives before it takes
-  effect, is due or expires. Only `class: sync` may set `expiresAt` up to 12 h
-  after `sentAt`; everything else keeps 1 h.
+  30 minutes of scheduler slack. That margin covers a trigger run that is
+  somewhat late; it does not make on-time delivery certain if the hourly
+  trigger is delayed further or skipped (see
+  [owner rollout blockers](#owner-rollout-blockers-unresolved)). Only
+  `class: sync` may set `expiresAt` up to 12 h after `sentAt`; everything else
+  keeps 1 h.
 - **Batching.** Pending SYNC items coalesce per recipient: delta only, and a
   later item with the same `subject` (case and spacing ignored) replaces the
   earlier pending one, as does a WAKE with that subject. Pending data is cut
@@ -259,8 +262,16 @@ For an enabled recipient:
   change or a durable access denial withdraws queued data (`bridge_status`
   then shows `sync.state: "withdrawn"`). When items are re-queued (an expired,
   unacknowledged batch, or a failed native re-send), the newest update per
-  `subject`, by the time the bridge accepted it, wins; an older one is marked
-  superseded and never replaces a newer one.
+  `subject` wins, by admission order: acceptance time, then a durable admission
+  sequence stored on each message in the same transaction (so two updates
+  accepted in the same millisecond, including a WAKE with that subject, still
+  have a strict order). Only these stored numbers are compared, never object
+  key order, which the database does not preserve. An older update is marked
+  superseded and never replaces a newer one. Same-millisecond updates stored
+  before the sequence existed have no recorded order, and their true order
+  cannot be reconstructed: the bridge then supersedes neither and delivers
+  each again with `orderUnknown: true`, rather than guessing and discarding
+  what may be the newest.
 - **One fence per item.** A queued or batch-carried SYNC item is handled only
   through its batch: claiming the item itself is refused with
   `sync_item_in_batch` (plus `batchMessageId`), `sync_item_not_delivered` or
@@ -303,14 +314,17 @@ pending SYNC data and flushes one batch when:
    has (re-queued data).
 
 Otherwise the run is a `200` no-op (`flushed: 0`) and empty queues send
-nothing. Each recipient is flushed at most once per boundary, so duplicate
+nothing. These rules meet the 2-hour requirement only while the hourly runs
+happen on time; a delayed or skipped run delays delivery past it (see
+[owner rollout blockers](#owner-rollout-blockers-unresolved)). Each recipient is flushed at most once per boundary, so duplicate
 runs send nothing new. The maximum is elapsed time, not wall-clock hours: on
 the fall-back day (e.g. 1 November 2026) 00:00 CDT to 02:00 CST is three real
 hours, so data queued after midnight is flushed by the 01:00 CST run instead;
 on the spring-forward day (e.g. 8 March 2026) the nonexistent 02:00 is flushed
 at 03:00 CDT. The daily cap is `ceil(hours in the Chicago day / 2)`: 12 batch
 wakes normally and on the 23-hour spring-forward day, 13 on the 25-hour
-fall-back day, which can need one more to keep every item within 2 hours. A
+fall-back day, which can need one more to keep every item within 2 hours
+when runs are on time. A
 capped recipient's items stay pending (held, delivered with the next WAKE,
 inbox read or the next day's first run). Batches are published to the queue
 after the flush commits; anything unpublished is re-offered by the next run.
@@ -318,9 +332,33 @@ Queued SYNC items stay deliverable after the sender's access token expires
 (a FYI must survive until it is flushed), but a policy change or durable
 denial still withdraws them.
 
+### Owner rollout blockers (unresolved)
+
+This branch implements the mechanism; it does not settle the following, which
+the owner must resolve before `BRIDGE_WAKE_SYNC_RECIPIENTS` is set for anyone:
+
+- **The 2-hour maximum is a requirement, not yet a proven guarantee.** The
+  requested rule is delivery of SYNC data no more than 2 elapsed hours after it
+  was queued. The bridge flushes on that basis at every run of its hourly
+  trigger, but that trigger is a nominal GitHub Actions schedule, which GitHub
+  can delay or skip. The current code therefore does not prove the guarantee.
+  The scheduling or service decision (for example a different scheduler, or an
+  accepted, documented exception) must be made before enabling. The 30-minute
+  slack in SYNC promotion only covers modest lateness.
+- **Receiver policy exceptions are required and not adopted here.** The
+  [flagged receiver contract](inbox-policy.md#flagged-receiver-contract)
+  needs the receiver to (1) handle SYNC batches and their items, (2) call
+  `bridge_inbox_read` at the start of a turn, which departs from the current
+  no-polling rule, and (3) accept and report expired or `late` items, which
+  departs from the current rule to reject expired content. Each needs an
+  owner-approved exception to the receiver policy before rollout. This
+  documentation describes the contract; it does not adopt those exceptions or
+  change any receiver policy.
+
 ### Rollout and rollback
 
-Rollout (in this order; nothing here is set by the repository):
+Rollout (in this order; nothing here is set by the repository; do not start
+until the owner rollout blockers above are resolved):
 
 1. Generate one random secret of 16+ characters, e.g. `openssl rand -hex 32`.
 2. In Vercel (Production environment), set `CRON_SECRET` to that value and

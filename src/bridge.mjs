@@ -8,7 +8,7 @@ import { diagnosticReadCandidate, diagnosticReadStatus, observeDiagnosticRead,
 import { canaryEnvelope, reserveCanary, canaryReceipt } from './canary.mjs';
 import { EVENTS_PEER, NAMES } from './config.mjs';
 import { classify, enqueueSync, supersedeBySubject, cutBatch, presentBatch, ackBatch, outstandingBatches, flushDue, markDispatched,
-  reconcileSync, syncItemClaimRedirect, batchItemsBusy } from './sync.mjs';
+  reconcileSync, syncItemClaimRedirect, batchItemsBusy, stampAdmission } from './sync.mjs';
 
 const fail = (code, status = 400) => { throw new BridgeError(code, status); };
 // A conflict that names the IDs to use instead (batch or blocking items only).
@@ -64,6 +64,7 @@ function insert(state, envelope, hash, now, authorization, jobOptions, routing) 
   const message = state.messages[envelope.id] = { envelope, hash, storedAt: now, jobIds, authorization, ...(retainUntil ? { retainUntil } : {}) };
   if (!routing) return { messageId: envelope.id, queued: true, duplicate: false, jobIds };
   const routed = { class: routing.class, ...(routing.promoted ? { promoted: routing.promoted } : {}) };
+  if (queued || envelope.subject !== undefined) stampAdmission(state, message);
   if (queued) {
     enqueueSync(state, message, now);
     return { messageId: envelope.id, queued: true, duplicate: false, jobIds, ...routed, delivery: 'batched' };
