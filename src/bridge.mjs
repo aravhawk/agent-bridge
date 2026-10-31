@@ -8,7 +8,7 @@ import { diagnosticReadCandidate, diagnosticReadStatus, observeDiagnosticRead,
 import { canaryEnvelope, reserveCanary, canaryReceipt } from './canary.mjs';
 import { EVENTS_PEER, NAMES } from './config.mjs';
 import { classify, enqueueSync, supersedeBySubject, cutBatch, presentBatch, ackBatch, outstandingBatches, flushDue, markDispatched,
-  reconcileSync, syncItemClaimRedirect, batchItemsBusy, stampAdmission } from './sync.mjs';
+  reconcileSync, syncItemClaimRedirect, batchItemsBusy, stampAdmission, attachRoom, MAX_SYNC_BATCH_IDS } from './sync.mjs';
 
 const fail = (code, status = 400) => { throw new BridgeError(code, status); };
 // A conflict that names the IDs to use instead (batch or blocking items only).
@@ -87,17 +87,23 @@ function insert(state, envelope, hash, now, authorization, jobOptions, routing) 
 // nothing new.
 function claimAttachedBatches(state, message, principal, claimId, leaseUntil, now) {
   if (!message.syncBatchIds?.length) return {};
-  const held = [], heldElsewhere = [];
+  // A claim holds no more than one completion can acknowledge (its own ID
+  // counts when the message is a batch). Further attached batches, possible
+  // only in state written before this limit, are deferred: not held, so they
+  // stay claimable directly and are replayed by bridge_inbox_read.
+  const limit = MAX_SYNC_BATCH_IDS - (message.syncBatch ? 1 : 0);
+  const held = [], heldElsewhere = [], deferred = [];
   for (const id of message.syncBatchIds) {
     const b = state.messages[id]?.syncBatch, receipt = state.receipts[id];
     if (!b?.presentedAt || b.ackedAt || b.reclaimedAt || receipt?.state === 'complete') continue;
     // Held by another claim of the batch, or one of its items still has a
     // live independent claim (pre-fence): not this claim's to handle.
     if (receipt?.leaseUntil > now || batchItemsBusy(state, state.messages[id], claimId, now).length) { heldElsewhere.push(id); continue; }
+    if (held.length >= limit) { deferred.push(id); continue; }
     state.receipts[id] = { state: 'claimed', owner: principal.principalKey, claimId, leaseUntil, viaMessage: message.envelope.id };
     held.push(id);
   }
-  return { syncBatchIds: held, syncBatchesHeldElsewhere: heldElsewhere };
+  return { syncBatchIds: held, syncBatchesHeldElsewhere: heldElsewhere, ...(deferred.length ? { syncBatchesDeferred: deferred } : {}) };
 }
 
 // Additive status for wake/sync messages only; v1 messages report nothing new.
@@ -241,7 +247,8 @@ export class Bridge {
   // completing the message acknowledges what was presented with it.
   syncBatches(state, message, role, now) {
     if (!dailyMessage(message.envelope)) return [];
-    if (this.syncEnabled(role) && state.receipts[message.envelope.id]?.state !== 'complete') {
+    // Collect only while the message can still be completed in one call.
+    if (this.syncEnabled(role) && state.receipts[message.envelope.id]?.state !== 'complete' && attachRoom(state, message) > 0) {
       const batch = cutBatch(state, role, now, { reason: 'read', policyIds: this.messagePolicyIds });
       if (batch) (message.syncBatchIds ||= []).push(batch.envelope.id);
     }
@@ -309,7 +316,7 @@ export class Bridge {
     // Optional: the batch IDs this receiver saw with the message (from its own
     // read) and has handled. Only these are acknowledged; omitted means none.
     const ackIds = params.syncBatchIds ?? [];
-    if (!Array.isArray(ackIds) || ackIds.length > 32 || new Set(ackIds).size !== ackIds.length ||
+    if (!Array.isArray(ackIds) || ackIds.length > MAX_SYNC_BATCH_IDS || new Set(ackIds).size !== ackIds.length ||
         ackIds.some(id => typeof id !== 'string' || !uuid.test(id))) fail('invalid_params');
     for (const field of ['hostedEventId', 'hostedTurnId']) {
       if (params[field] !== null && (typeof params[field] !== 'string' || !/^[A-Za-z0-9_.:-]{1,160}$/.test(params[field]))) {

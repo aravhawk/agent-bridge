@@ -4,6 +4,7 @@ import { MESSAGE_PROTOCOL } from './messages.mjs';
 import { BridgeError, SCOPES } from './policy.mjs';
 import { ownKeys, authorizeRecipient } from './events.mjs';
 import { TASK_TOOLS } from './task-integration.mjs';
+import { MAX_SYNC_BATCH_IDS } from './sync.mjs';
 
 const idSchema = { type: 'string', format: 'uuid' };
 const object = properties => ({ type: 'object', properties, required: Object.keys(properties), additionalProperties: false });
@@ -11,7 +12,7 @@ const tool = (name, description, inputSchema, readOnly = false) => ({ name, desc
   annotations: { readOnlyHint: readOnly, destructiveHint: false, idempotentHint: true, openWorldHint: false } });
 const completeSchema = object({ messageId: idSchema, claimId: idSchema, hostedEventId: { type: ['string', 'null'], maxLength: 160 },
   hostedTurnId: { type: ['string', 'null'], maxLength: 160 } });
-completeSchema.properties.syncBatchIds = { type: 'array', items: idSchema, maxItems: 32, uniqueItems: true,
+completeSchema.properties.syncBatchIds = { type: 'array', items: idSchema, maxItems: MAX_SYNC_BATCH_IDS, uniqueItems: true,
   description: 'Batch messageIds you handled: this batch itself (direct completion; also implied) and attached batches your read returned and your claim holds. Omit to acknowledge no attached batch.' };
 const tools = [
   tool('bridge_health', 'Check authenticated bridge configuration without reading messages, storing state or sending events.', object({}), true),

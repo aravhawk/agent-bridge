@@ -22,6 +22,10 @@ export const SYNC_BATCH_TTL_MS = 12 * 3600000;
 // Normal-day cap; see dailyFlushCap for the 25-hour fall-back day.
 export const SYNC_DAILY_FLUSH_CAP = 12;
 export const SYNC_TIME_ZONE = 'America/Chicago';
+// bridge_receipt_complete accepts at most this many syncBatchIds. Every way a
+// batch is attached to, or held by, one message stays within it, so the
+// documented read -> claim -> complete flow always fits one completion.
+export const MAX_SYNC_BATCH_IDS = 32;
 const HOUR = 3600000;
 
 // Unset or empty: off. Any unknown peer ID closes the whole flag (v1 behavior)
@@ -406,6 +410,16 @@ function strandedBatches(state, recipient, policyIds, now) {
       !messageAccessAllowed(state, carrier, policyIds, now);
   });
 }
+// How many more batches a message may carry: the completion limit less its own
+// ID (when it is itself a batch) and its attached batches still awaiting
+// acknowledgement. Acknowledged or reclaimed attachments no longer count.
+export function attachRoom(state, message) {
+  const open = (message.syncBatchIds || []).filter(id => {
+    const b = state.messages[id]?.syncBatch;
+    return b && !b.ackedAt && !b.reclaimedAt;
+  }).length;
+  return MAX_SYNC_BATCH_IDS - (message.syncBatch ? 1 : 0) - open;
+}
 const strandedItems = (state, stranded) => stranded.flatMap(batch => batch.syncBatch.itemIds.map(id => state.messages[id]).filter(Boolean));
 
 // Hourly flush (any hour; the trigger runs at :00 UTC). Per recipient with
@@ -467,17 +481,21 @@ export function flushDue(state, now, { policyIds, recipients = [] }) {
     }
     // No active destination: keep items pending (held past retention) and retry next run.
     if (!batch) { results.push({ recipient, outcome: 'no_destination' }); continue; }
-    for (const other of carried) {
+    // Attach only what fits one completion, oldest first. The rest stay
+    // stranded, unchanged and unmarked, and are due again at the next run.
+    const fitting = carried.slice(0, Math.max(0, attachRoom(state, batch)));
+    for (const other of fitting) {
       (batch.syncBatchIds ||= []).push(other.envelope.id);
       Object.assign(other.syncBatch, { rehomedTo: batch.envelope.id, rehomedAt: now });
     }
+    const rehomed = fitting.length + (batch === stranded[0] ? 1 : 0);
     if (batch === stranded[0]) Object.assign(batch.syncBatch, { rehomedTo: batch.envelope.id, rehomedAt: now });
     batch.syncBatch.trigger = reason;
     queue.lastFlushBoundary = boundary;
     if (reason !== 'rollback') queue.flushCount++;
     (queue.undispatched ||= []).push(batch.envelope.id);
     results.push({ recipient, outcome: 'flushed', reason, items: live.length ? batch.syncBatch.itemIds.length : 0,
-      ...(stranded.length ? { rehomedBatches: stranded.length } : {}) });
+      ...(rehomed ? { rehomedBatches: rehomed } : {}) });
   }
   const dispatch = PEER_IDS.flatMap(recipient => {
     const queue = queueOf(state, recipient);

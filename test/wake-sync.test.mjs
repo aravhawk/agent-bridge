@@ -1439,3 +1439,138 @@ test('carrier loss after rollback: a stranded batch is delivered on the next run
   await f.bridge.read(friday, { messageId: batch });
   assert.deepEqual((await f.handle(friday, batch)).syncBatchesAcked, [batch]);
 });
+
+// --- Completion capacity: at most 32 syncBatchIds per completion ------------
+// n stranded piggyback batches: each loop sends a unique-subject SYNC, then a
+// WAKE whose authority lapses 30 s later (so it carries and strands one batch).
+async function strandMany(f, n) {
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const x = f.sync('jarvis', { subject: `s${i}` }); await f.send(x);
+    const w = f.message(); await f.send(w, who('jarvis', f.clock() + 30000));
+    out.push({ x, w, batch: f.snapshot().messages[w.id].syncBatchIds[0] });
+    f.advance(60000); // stays under the 10-per-minute admission limit
+  }
+  return out;
+}
+test('completion capacity (repro): 33 stranded batches re-homed at one run stay completable with the documented flow', async () => {
+  const f = await fixture();
+  await strandMany(f, 33);
+  assert.equal(Object.keys(f.snapshot().messages).length, 99);
+  f.set(noon + 5000);
+  const out = await f.bridge.flushSync();
+  assert.equal(out.dispatch.length, 1, 'one carrier');
+  const done = await f.receive(out.dispatch[0]); // read -> claim -> complete with the read's held IDs
+  assert.ok(done.syncBatchesAcked.length <= 32);
+});
+
+// The carrier holds at most 32 IDs: its own (when it is a batch, as both a
+// stranded carrier and a fresh flush batch are) plus 31 attached. The rest
+// stay stranded with unchanged IDs and go out at the next due run, oldest first.
+for (const [n, withNew] of [[31, false], [32, false], [33, false], [31, true], [32, true]]) {
+  test(`completion capacity: ${n} stranded batches${withNew ? ' plus new data' : ''} -> carrier fits 32, overflow follows`, async () => {
+    const f = await fixture();
+    const stranded = await strandMany(f, n);
+    if (withNew) await f.send(f.sync('jarvis', { subject: 'new' }));
+    f.set(noon + 5000);
+    const out = await f.bridge.flushSync();
+    assert.equal(out.dispatch.length, 1);
+    const carrier = out.dispatch[0];
+    await f.bridge.markSyncDispatched(out.dispatch); // as the trigger route does after publishing
+    const attachedCount = withNew ? Math.min(n, 31) : Math.min(n - 1, 31);
+    const overflow = n - attachedCount - (withNew ? 0 : 1);
+    assert.equal(f.snapshot().messages[carrier].syncBatchIds?.length ?? 0, attachedCount);
+    assert.equal(out.results[0].rehomedBatches, n - overflow);
+    const done = await f.receive(carrier);
+    assert.equal(done.syncBatchesAcked.length, attachedCount + 1);
+    const left = stranded.filter(t => !f.snapshot().messages[t.batch].syncBatch.ackedAt);
+    assert.equal(left.length, overflow);
+    for (const t of left) {
+      const b = f.snapshot().messages[t.batch];
+      assert.deepEqual([b.jobIds, b.syncBatch.rehomedTo], [[], undefined], 'overflow is not marked re-homed or handled');
+      assert.equal(f.snapshot().receipts[t.x.id], undefined);
+    }
+    // Next hourly run: the overflow goes out (oldest first) and is completable.
+    f.set(noon + HOUR + 5000);
+    const next = await f.bridge.flushSync();
+    if (!overflow) { assert.deepEqual(next.dispatch, []); return; }
+    assert.deepEqual(next.dispatch, [left[0].batch]);
+    assert.deepEqual((await f.receive(left[0].batch)).syncBatchesAcked, [left[0].batch]);
+    for (const t of stranded) assert.equal(f.snapshot().receipts[t.x.id].state, 'complete');
+    assert.equal(f.snapshot().syncQueues.friday.flushCount, 2);
+  });
+}
+
+test('completion capacity: data arriving between flush and read is not collected into a full carrier', async () => {
+  const f = await fixture();
+  await strandMany(f, 32);
+  f.set(noon + 5000);
+  const carrier = (await f.bridge.flushSync()).dispatch[0];
+  const z = f.sync('jarvis', { subject: 'late' }); await f.send(z);
+  const read = await f.bridge.read(friday, { messageId: carrier });
+  assert.equal(read.syncBatches.length, 32, 'own + 31 attached; nothing collected');
+  assert.equal(f.snapshot().messages[z.id].sync.state, 'pending');
+  assert.equal((await f.receive(carrier)).syncBatchesAcked.length, 32);
+  assert.deepEqual(ids((await f.bridge.inboxRead(friday)).syncBatches), [[z.id]]);
+});
+
+test('completion capacity: repeated reads of one message stop collecting at 32 batches', async () => {
+  const f = await fixture();
+  const w = f.message(); await f.send(w);
+  for (let i = 0; i < 34; i++) {
+    await f.send(f.sync('jarvis', { subject: `r${i}` }));
+    await f.bridge.read(friday, { messageId: w.id });
+    f.advance(30000);
+  }
+  assert.equal(f.snapshot().messages[w.id].syncBatchIds.length, 32);
+  assert.equal(Object.values(f.snapshot().messages).filter(m => m.sync?.state === 'pending').length, 2);
+  const done = await f.receive(w.id);
+  assert.equal(done.syncBatchesAcked.length, 32);
+});
+
+test('completion capacity: concurrent and retried flushes leave the overflow for exactly one later run', async () => {
+  const f = await fixture();
+  const stranded = await strandMany(f, 33);
+  f.set(noon + 5000);
+  const runs = [...await Promise.all([f.bridge.flushSync(), f.bridge.flushSync()]), await f.bridge.flushSync()];
+  assert.equal(runs.flatMap(r => r.results).length, 1, 'scheduled once');
+  const carrier = runs[0].dispatch[0];
+  for (const r of runs) assert.deepEqual(r.dispatch, [carrier]);
+  await f.bridge.markSyncDispatched([carrier]);
+  assert.equal(f.snapshot().syncQueues.friday.flushCount, 1);
+  const overflow = stranded.at(-1).batch;
+  assert.equal(f.snapshot().messages[overflow].syncBatch.rehomedTo, undefined);
+  f.set(noon + HOUR + 5000);
+  const next = [...await Promise.all([f.bridge.flushSync(), f.bridge.flushSync()])];
+  assert.equal(next.flatMap(r => r.results).length, 1);
+  for (const r of next) assert.deepEqual(r.dispatch, [overflow]);
+  assert.equal(f.snapshot().syncQueues.friday.flushCount, 2);
+});
+
+test('completion capacity: an oversized existing carrier holds 32 and defers the rest, which stay claimable directly', async () => {
+  const f = await fixture();
+  const stranded = await strandMany(f, 33);
+  f.set(noon + 5000);
+  const carrier = (await f.bridge.flushSync()).dispatch[0];
+  const overflow = stranded.at(-1).batch;
+  // A snapshot written before the limit existed: all 33 attached to the carrier.
+  await f.store.transaction(s => {
+    s.messages[carrier].syncBatchIds.push(overflow);
+    Object.assign(s.messages[overflow].syncBatch, { rehomedTo: carrier, rehomedAt: noon + 5000 });
+  });
+  const read = await f.bridge.read(friday, { messageId: carrier });
+  assert.equal(read.syncBatches.length, 33, 'everything stays readable');
+  const claim = await f.bridge.claim(friday, { messageId: carrier });
+  assert.equal(claim.syncBatchIds.length, 31); assert.deepEqual(claim.syncBatchesDeferred, [overflow]);
+  // The deferred batch is not held by the carrier: it can be claimed directly at the same time.
+  const direct = await f.bridge.claim(friday, { messageId: overflow });
+  await assert.rejects(f.bridge.complete(friday, { messageId: carrier, claimId: claim.claimId, hostedEventId: null,
+    hostedTurnId: null, syncBatchIds: [carrier, overflow] }), /sync_batch_not_held/);
+  const done = await f.bridge.complete(friday, { messageId: carrier, claimId: claim.claimId, hostedEventId: null,
+    hostedTurnId: null, syncBatchIds: [carrier, ...claim.syncBatchIds] });
+  assert.equal(done.syncBatchesAcked.length, 32);
+  assert.equal(f.snapshot().receipts[stranded.at(-1).x.id], undefined, 'deferred items not handled by the carrier');
+  assert.deepEqual((await f.bridge.complete(friday, { messageId: overflow, claimId: direct.claimId, hostedEventId: null,
+    hostedTurnId: null, syncBatchIds: [overflow] })).syncBatchesAcked, [overflow]);
+  for (const t of stranded) assert.equal(f.snapshot().receipts[t.x.id].state, 'complete');
+});

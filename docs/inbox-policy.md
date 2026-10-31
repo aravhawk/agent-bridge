@@ -120,7 +120,11 @@ handled through that batch, and a queued one is re-sent on the next run
    For a message with attached batches the result also lists `syncBatchIds`
    (attached batches this claim now holds) and `syncBatchesHeldElsewhere`
    (held by another claim: do not handle those; they stay with that claim or
-   are replayed). The claim lease is 60 seconds and covers the held batches;
+   are replayed). A claim never holds more batches than one completion can
+   acknowledge (32 `syncBatchIds`, the message's own ID included when it is a
+   batch); any further attached batch is listed in `syncBatchesDeferred`, is
+   not held, and is handled later as a direct batch (`bridge_inbox_read`
+   replays it). The claim lease is 60 seconds and covers the held batches;
    slow handling can lose the completion opportunity.
 3. **Handle** the envelope and only the batches you may handle: the batch
    itself when you claimed a batch directly, otherwise the attached batches in

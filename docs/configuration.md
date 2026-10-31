@@ -267,6 +267,13 @@ For an enabled recipient:
   through its carrier, or held by that carrier's claim, is never re-homed.
   Capped or destination-less runs leave it waiting; with the flag off it is
   delivered on the next run. `bridge_status` on the batch shows `rehomedTo`.
+  A carrier takes at most what one completion can acknowledge: 32
+  `syncBatchIds`, its own ID included, so at most 31 attached batches; the
+  rest stay stranded with unchanged IDs and go out, oldest first, at the next
+  due run (another wake and cap slot). For the same reason a read stops
+  collecting new pending data into a message once its open attached batches
+  reach that limit, and a claim holds at most that many, reporting any older
+  excess as `syncBatchesDeferred`.
 - **Nothing is silently dropped.** Items whose own `expiresAt` passes while
   queued or re-queued are still delivered, flagged `expired` and `late`.
   Pending items, items in unacknowledged batches and items re-sent natively
