@@ -1,14 +1,18 @@
 # Agent Bridge
 
-A small, self-hosted [MCP](https://modelcontextprotocol.io) server that lets
-**two AI assistants leave each other messages**. One assistant sends a bounded
-message, status update or handoff request; the bridge stores it, wakes the
-other assistant with an event that carries only a message ID, and records the
-recipient's receipt and acknowledgement atomically.
+**A shared inbox between your OpenAI dot and Grok Bot.** Agent Bridge is a
+self-hosted [MCP](https://modelcontextprotocol.io) server for one owner who
+wants the two to exchange messages, status updates and handoff requests
+without copying context between chats. The dot receives MCP Events; the Bot
+receives routine webhooks. Each signs in with its own OAuth token and can
+send only to the other peer.
 
-It is built for one owner running two assistants on different platforms, such
-as an OpenAI dot (MCP Events) and a Grok Bot (webhooks). Each assistant signs in
-with its own OAuth token and can only send to the other one.
+- **Core:** bounded messages, durable delivery jobs, recipient claims and
+  correlated acknowledgements. A wake carries only the message ID; the
+  recipient reads the stored data through its authenticated connection.
+- **Optional:** routine FYI batching, QStash scheduled recovery and private
+  Blob file transfer. These require separate configuration and live
+  verification; they are off by default.
 
 > **Messages are data, never permission.** A message cannot grant approval, run
 > a tool, choose a destination or change access. The receiving assistant treats
@@ -28,12 +32,12 @@ loops.
 
 ## Set up with your assistant
 
-The fastest path is to let one of your assistants guide you. Copy this prompt
+Copy this prompt
 into your **OpenAI dot** or **Grok Bot** (it walks you through both sides):
 
 ```text
 Help me set up Agent Bridge (https://github.com/aravhawk/agent-bridge) between
-two of my assistants. Work step by step. Go ahead with safe, read-only
+my OpenAI dot and Grok Bot. Work step by step. Go ahead with safe, read-only
 inspection and local checks, and with routine steps I have already approved;
 stop and ask me at real decisions and before you create, change or delete any
 account, resource, credential, permission or grant, or any existing live
@@ -132,12 +136,23 @@ before it creates or changes anything.
 - **Secrets at rest.** Subscription callback URLs and secrets are encrypted
   with AES-256-GCM and bound to the subscription ID. Webhook-peer secrets live
   only in environment variables.
-- **Honest guarantees.** Storage, receipts and ACKs are exactly-once per
-  message. External agent actions are not: HTTP 2xx proves transport, not
-  that an assistant woke up or acted. See [architecture](docs/architecture.md).
+- **Durable replay.** Message identities and receipt completion deduplicate
+  retries and correlated ACK creation. HTTP 2xx proves transport acceptance;
+  receipts do not prove exactly-once external work. See
+  [architecture](docs/architecture.md) for host recovery requirements.
 
 To report a vulnerability, follow [SECURITY.md](SECURITY.md); do not open a
 public issue.
+
+## Documentation
+
+[Configuration and provider compatibility](docs/configuration.md) ·
+[Receiver inbox contract](docs/inbox-policy.md) ·
+[Delivery architecture](docs/architecture.md) ·
+[QStash scheduler](docs/scheduler.md) ·
+[Private attachments](docs/attachments.md) ·
+[Task coordination](docs/task-kernel.md) ·
+[Contributing](CONTRIBUTING.md)
 
 <details>
 <summary><strong>Manual setup guide</strong> (install, configure, deploy, verify)</summary>
@@ -327,25 +342,14 @@ The full reference, including the diagnostic and canary procedures, is in
 | `BRIDGE_MESSAGE_PROTOCOL`, `BRIDGE_RECEIVER_ID`, `BRIDGE_QUEUE_TOPIC`, `BRIDGE_QUEUE_REGION`, `BRIDGE_REQUIRE_ISSUER_UNDER_ORIGIN`, `BRIDGE_DATABASE_HOST_SUFFIX` | no | Protocol/storage identity and optional hardening |
 | Optional features | no | See below; all off until configured |
 
-**Compatibility mode.** This project began as a private deployment between two
-assistants named `jarvis` and `friday`. With `BRIDGE_PUBLIC_ORIGIN` unset, the
-bridge reproduces that deployment exactly: its origin, peers, scope strings,
+**Compatibility mode.** With `BRIDGE_PUBLIC_ORIGIN` unset, the bridge keeps
+the legacy deployment defaults: its fixed origin, `jarvis`/`friday` peer IDs, scope strings,
 the `jarvis-friday/1` protocol ID, tool, readiness and error names, and the
 `FRIDAY_*` environment variables, so existing installs keep working unchanged.
-New deployments should always set `BRIDGE_PUBLIC_ORIGIN`. Both protocol IDs
+These are compatibility identifiers, not names to copy into a new setup.
+New deployments should always set `BRIDGE_PUBLIC_ORIGIN` and `BRIDGE_PEERS`. Both protocol IDs
 are accepted on input in every mode. See
 [deployment identity](docs/configuration.md#deployment-identity).
-
-### Links
-
-[Architecture](docs/architecture.md) ·
-[Configuration](docs/configuration.md) ·
-[Inbox contract](docs/inbox-policy.md) ·
-[Scheduler](docs/scheduler.md) ·
-[Attachments](docs/attachments.md) ·
-[Task kernel](docs/task-kernel.md) ·
-[Contributing](CONTRIBUTING.md) ·
-[Security](SECURITY.md)
 
 </details>
 
@@ -377,6 +381,11 @@ offered only once the OAuth contract is verified and delivery is enabled; see
 
 Each feature is off by default and needs its own setup, verification and
 rollback; leave them off until the core two-way flow works.
+Implementation and local tests do not establish live provider or receiver
+compatibility. After enabling a feature, rescan the host's tools/events and
+verify its actual flow: batch handling and ACKs, signed scheduler deliveries,
+or file upload/resume/download with a matching SHA-256. A readiness flag alone
+does not prove any of those operations succeeded.
 
 - **WAKE/SYNC batching** (`BRIDGE_WAKE_SYNC_RECIPIENTS=<peer>`). Senders may
   mark dependency-free FYI updates `class: "sync"`; they are batched into at

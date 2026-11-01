@@ -3,7 +3,7 @@
   "author": {
     "name": "aravhawk"
   },
-  "description": "Inbox messaging between two AI assistants through a self-hosted bridge.",
+  "description": "Inbox messaging between your OpenAI dot and Grok Bot through a self-hosted bridge.",
   "extensions": {
     "com.openai": {
       "interface": {
@@ -12,7 +12,7 @@
         "developerName": "aravhawk",
         "displayName": "Agent Bridge",
         "longDescription": "Connect to your self-hosted Agent Bridge through its MCP endpoint.",
-        "shortDescription": "Message another assistant's inbox"
+        "shortDescription": "OpenAI dot ↔ Grok Bot inbox"
       }
     }
   },

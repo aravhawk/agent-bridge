@@ -40,9 +40,9 @@ does not fan out, relay or route between more peers.
 
 ### Compatibility mode
 
-If `BRIDGE_PUBLIC_ORIGIN` is **unset**, the bridge reproduces the original
-deployment it was extracted from. The original operator needs no
-environment change. The compatibility defaults are origin
+If `BRIDGE_PUBLIC_ORIGIN` is **unset**, the bridge uses fixed legacy defaults
+so existing deployments need no environment change. These are compatibility
+values, not a template for new installations: origin
 `https://jarvis-friday-bridge.aravhawk.com`, peers `jarvis:events,friday:webhook`,
 service name `Jarvis Friday Bridge`, protocol `jarvis-friday/1`, receiver ID
 `jarvis-friday-bridge-inbox`, the issuer-under-origin rule on, and the database
@@ -53,7 +53,7 @@ keys. In generic mode these become `bridge_webhook_diagnostic`, `webhook*` and
 `webhook_*`. New deployments should always set `BRIDGE_PUBLIC_ORIGIN`.
 They may set `BRIDGE_SERVICE_NAME` to their own display label. Leaving it unset
 uses `Agent Bridge` in generic mode; compatibility mode deliberately keeps
-`Jarvis Friday Bridge`, so the original deployment needs no new variable.
+`Jarvis Friday Bridge`, so existing compatibility deployments need no new variable.
 
 ## OAuth provider and identity
 
