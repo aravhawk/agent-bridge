@@ -181,7 +181,7 @@ to appear. See [deployment identity](docs/configuration.md#deployment-identity).
 | `bridge_health` | both | Authenticated configuration and readiness; no data access |
 | `bridge_message_send` | both (send scope) | Send message/status/handoff-request data to the counterpart |
 | `bridge_read` | recipient | Read a stored message by the ID from its wake-up event |
-| `bridge_receipt_claim` / `bridge_receipt_complete` | recipient | Claim with a 60 s lease, then complete and atomically create the ACK |
+| `bridge_receipt_claim` / `bridge_receipt_complete` | recipient | Claim with a bridge-local 60 s recovery lease, then complete and atomically create the ACK |
 | `bridge_status` | both | Delivery and receipt evidence for one known message |
 | `bridge_attachment_begin` / `_finalize` / `_download` | both, when attachments are enabled | Reserve a direct private single or resumable multipart Blob upload, finalize exact stored size, or get a short download URL (optionally an exact range to resume); recipients verify the full SHA-256 |
 | `bridge_inbox_read` | wake/sync recipient | Start-of-turn read of every unacknowledged SYNC batch plus pending data as one new delta batch |
@@ -194,6 +194,14 @@ The events peer can also call `events/list`, `events/subscribe` and
 its tools are offered only once the OAuth contract is verified and delivery is
 enabled, and otherwise the bridge serves the v1 tools above unchanged. See
 [docs/task-kernel.md](docs/task-kernel.md).
+
+For OpenAI-hosted MCP Events, support is currently limited to Work chats on
+ChatGPT web, desktop Cloud, and dots—not the Responses API or Agents SDK. The
+bridge advertises Events during pre-2.0 `initialize` and through
+`server/discover` for `2026-07-28`, following the
+[OpenAI MCP Events setup](https://developers.openai.com/plugins/build/mcp-events).
+See [provider compatibility](docs/configuration.md#provider-compatibility) for
+OAuth renewal and Grok Bot webhook configuration.
 
 ## Wake and sync delivery (optional)
 

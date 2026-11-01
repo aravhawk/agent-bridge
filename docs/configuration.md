@@ -70,6 +70,38 @@ as audience and the configured issuer. Both peer clients are public OAuth
 clients (PKCE S256, token auth `none`) registered in the provider. The bridge
 never issues, stores or logs tokens and needs no provider admin secret.
 
+### Provider compatibility
+
+OpenAI's hosted MCP Events support currently covers Work chats on ChatGPT web,
+desktop Cloud, and dots; it does not cover the Responses API or Agents SDK.
+For pre-2.0 Streamable HTTP protocol versions the bridge advertises `events`
+during `initialize`; for `2026-07-28` it advertises them through
+`server/discover`. Only the configured events peer with its ACK scope sees the
+capability. Follow the official [MCP Events setup and rescan flow](https://developers.openai.com/plugins/build/mcp-events)
+and [OAuth guidance](https://developers.openai.com/plugins/build/auth). The
+resource-level OAuth metadata is the default security scheme for every tool;
+the bridge does not add per-tool schemes that would broaden or contradict its
+two enforced directional scopes.
+
+Event subscriptions are finite and capped by the verified JWT expiry. Renew
+before `refreshBefore` by calling `events/subscribe` again with a current OAuth
+token; a token replay cannot extend authority beyond that token's expiry, and
+a replacement token expiring earlier than the saved authority is rejected as
+`stale_authorization` rather than shortening it.
+Event replay is unsupported (`cursor` remains `null`). `events/unsubscribe` is
+terminal for that subscription identity: its tombstone survives retries and a
+later subscription needs a new identity, such as a new callback URL.
+These lease, stale-authority, no-replay and tombstone rules are bridge-local
+authorization policies, not OpenAI or Grok requirements.
+
+A [Grok Bot routine webhook](https://docs.x.ai/grok-bot/skills-routines-and-automations)
+uses a Bearer key and reports acceptance with HTTP 200. For that endpoint set
+`BRIDGE_PEER_<ID>_WEBHOOK_AUTH=bearer`; a per-peer secret otherwise defaults to
+`standard-webhooks`. This is different from
+[Grok Automations webhooks](https://docs.x.ai/grok/automations/webhooks), which
+use Standard Webhooks signatures and HTTP 202. Compatibility mode preserves
+the existing `FRIDAY_WEBHOOK_KEY` Bearer behavior.
+
 **Bootstrap.** Once the issuer and subject pin are set, each peer can call an
 authenticated `bridge_health` even while `BRIDGE_OAUTH_CONTRACT_VERIFIED=false`.
 Health still verifies signature, issuer, audience, subject and scopes; it reads
@@ -140,6 +172,8 @@ spec. Verify it with any Standard Webhooks library. In `bearer` mode it carries
 `Authorization: Bearer <secret>`. The body never contains message text; the
 receiver reads the message through its own authenticated MCP session. The
 response body is never read, and a 2xx status is transport evidence only.
+The bridge's 60-second receipt claim is its own recovery and concurrency
+policy; neither OpenAI nor Grok requires that lease duration.
 
 ## One-time webhook diagnostic
 

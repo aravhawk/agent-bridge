@@ -67,6 +67,12 @@ const attachmentToolsFor = maxBytes => [
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true } },
 ];
 const subscriptionStatusTool = tool('bridge_subscription_status', 'Inspect your event subscription activity and renewal timestamps. No callback URL or secret is returned.', object({}), true);
+const INITIALIZE_PROTOCOLS = Object.freeze(['2025-03-26', '2025-06-18', '2025-11-25', '2026-07-28']);
+function mcpCapabilities(principal, healthOnly, advertiseEvents) {
+  const events = advertiseEvents && !healthOnly && principal.role === EVENTS_PEER &&
+    principal.scopes.includes(SCOPES[EVENTS_PEER].ack);
+  return { tools: {}, ...(events ? { events: {} } : {}) };
+}
 function allowedTools(principal, health, dailyEnabled, healthOnly, diagnostic, tasks, wakeSync, attachments) {
   const syncRecipient = dailyEnabled && typeof wakeSync === 'function' && wakeSync().includes(principal.role);
   const attached = dailyEnabled && attachments?.enabled?.() === true;
@@ -153,12 +159,13 @@ export function createMcpHandler({ enabled = false, verify, bridge, events, sche
         case 'server/discover':
           ownKeys(params, [], []);
           result = { resultType: 'complete', supportedVersions: ['2026-07-28'],
-            capabilities: { tools: {}, ...(!healthOnly && principal.role === EVENTS_PEER && principal.scopes.includes(SCOPES[EVENTS_PEER].ack) ? { events: {} } : {}) } };
+            capabilities: mcpCapabilities(principal, healthOnly, true) };
           break;
         case 'initialize':
           ownKeys(params, ['protocolVersion', 'capabilities', 'clientInfo']);
-          if (!['2025-03-26', '2025-06-18', '2025-11-25', '2026-07-28'].includes(params.protocolVersion)) throw new BridgeError('unsupported_protocol', 400);
-          result = { protocolVersion: params.protocolVersion, capabilities: { tools: {} },
+          if (!INITIALIZE_PROTOCOLS.includes(params.protocolVersion)) throw new BridgeError('unsupported_protocol', 400);
+          result = { protocolVersion: params.protocolVersion,
+            capabilities: mcpCapabilities(principal, healthOnly, params.protocolVersion !== '2026-07-28'),
             serverInfo: { name: SERVER_NAME, version: VERSION } };
           break;
         case 'ping': ownKeys(params, [], []); result = {}; break;

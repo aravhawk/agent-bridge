@@ -29,6 +29,33 @@ function fixture() {
   return { jarvis, friday, params, events, bridge, store, clock, expiry, advance: ms => { now += ms; } };
 }
 
+test('MCP Event capabilities follow protocol discovery, role, scope and health-only fences', async () => {
+  const f = fixture();
+  const rpc = async (principal, method, params = {}, healthOnly = false) => {
+    const handler = createMcpHandler({ enabled: true, healthOnly, verify: async () => principal,
+      bridge: {}, events: {}, scheduleJobs: async () => {} });
+    const response = await handler(new Request(resourceFor(principal.role), { method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) }));
+    assert.equal(response.status, 200);
+    return (await response.json()).result;
+  };
+  const pre2 = ['2025-03-26', '2025-06-18', '2025-11-25'];
+  for (const protocolVersion of pre2) {
+    const params = { protocolVersion, capabilities: {}, clientInfo: { name: 'fixture', version: '1' } };
+    assert.deepEqual((await rpc(f.jarvis, 'initialize', params)).capabilities, { tools: {}, events: {} });
+    assert.deepEqual((await rpc({ ...f.jarvis, scopes: [SCOPES.jarvis.probe] }, 'initialize', params)).capabilities, { tools: {} });
+    assert.deepEqual((await rpc(f.friday, 'initialize', params)).capabilities, { tools: {} });
+    assert.deepEqual((await rpc(f.jarvis, 'initialize', params, true)).capabilities, { tools: {} });
+  }
+  const v2 = { protocolVersion: '2026-07-28', capabilities: {}, clientInfo: { name: 'fixture', version: '1' } };
+  assert.deepEqual((await rpc(f.jarvis, 'initialize', v2)).capabilities, { tools: {} });
+  assert.deepEqual((await rpc(f.jarvis, 'server/discover')).capabilities, { tools: {}, events: {} });
+  assert.deepEqual((await rpc({ ...f.jarvis, scopes: [SCOPES.jarvis.probe] }, 'server/discover')).capabilities, { tools: {} });
+  assert.deepEqual((await rpc(f.friday, 'server/discover')).capabilities, { tools: {} });
+  assert.deepEqual((await rpc(f.jarvis, 'server/discover', {}, true)).capabilities, { tools: {} });
+});
+
 test('contract: repeated subscribe re-grants TTL within the unchanged verified-token expiry', async () => {
   const f = fixture(), first = await f.events.subscribe(f.jarvis, f.params);
   f.advance(5000);

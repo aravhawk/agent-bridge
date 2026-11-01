@@ -89,6 +89,9 @@ test('existing FRIDAY_* variables keep driving the webhook peer with bearer auth
     BRIDGE_PEER_FRIDAY_WEBHOOK_SECRET: 'whsec_x' });
   assert.equal(override.url, 'https://new.example.test/hook'); assert.equal(override.secret, 'whsec_x');
   assert.equal(override.auth, 'standard-webhooks'); assert.equal(override.receiverId, legacy.FRIDAY_RECEIVER_ID);
+  const routine = webhookPeerSettings({ BRIDGE_PEER_FRIDAY_WEBHOOK_URL: 'https://routine.example.test/hook',
+    BRIDGE_PEER_FRIDAY_WEBHOOK_SECRET: 'routine-shared-key', BRIDGE_PEER_FRIDAY_WEBHOOK_AUTH: 'bearer' });
+  assert.equal(routine.auth, 'bearer'); assert.equal(routine.secret, 'routine-shared-key');
 
   const posts = [], messageId = randomUUID(), eventId = 'evt_' + digest(JSON.stringify([messageId, 'friday']));
   const settings = webhookPeerSettings(legacy);
