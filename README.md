@@ -81,7 +81,7 @@ works), and a domain for the bridge.
 
 1. **Get the code and run the tests.**
    ```sh
-   git clone https://github.com/aravhawk/jarvis-friday-bridge.git && cd jarvis-friday-bridge
+   git clone https://github.com/aravhawk/agent-bridge.git && cd agent-bridge
    npm ci && npm test
    ```
 2. **Choose your two peers.** For example, `BRIDGE_PEERS=alice:events,bob:webhook`.

@@ -5,7 +5,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/aravhawk/jarvis-friday-bridge.git"
+    "url": "git+https://github.com/aravhawk/agent-bridge.git"
   },
   "type": "module",
   "engines": {

@@ -10,16 +10,16 @@ import { MESSAGE_PROTOCOL, validateMessage } from '../src/messages.mjs';
 import { formatRepoReferences, parseRepoReferences, REPO_REFS_HEADER, MAX_REPO_REFS, MAX_REPO_PATHS } from '../src/repo-refs.mjs';
 
 const SHA1 = 'a'.repeat(40), SHA256 = 'b'.repeat(64);
-const ref = { repository: 'aravhawk/jarvis-friday-bridge', commit: SHA1,
+const ref = { repository: 'aravhawk/agent-bridge', commit: SHA1,
   paths: [{ path: 'src/bridge.mjs', lines: { start: 10, end: 42 } }, 'docs/attachments.md'] };
 
 test('repo refs: format and parse round-trip; full commit SHA, selected paths and line ranges', () => {
   const text = formatRepoReferences({ text: 'Please review the ACK change.', refs: [ref, { host: 'git.example.test', repository: 'team/tool', commit: SHA256 }] });
   assert.equal(text, ['Please review the ACK change.', '', REPO_REFS_HEADER,
-    `- github.com/aravhawk/jarvis-friday-bridge@${SHA1}`, '  - src/bridge.mjs#L10-L42', '  - docs/attachments.md',
+    `- github.com/aravhawk/agent-bridge@${SHA1}`, '  - src/bridge.mjs#L10-L42', '  - docs/attachments.md',
     `- git.example.test/team/tool@${SHA256}`].join('\n'));
   assert.deepEqual(parseRepoReferences(text), [
-    { host: 'github.com', repository: 'aravhawk/jarvis-friday-bridge', commit: SHA1,
+    { host: 'github.com', repository: 'aravhawk/agent-bridge', commit: SHA1,
       paths: [{ path: 'src/bridge.mjs', lines: { start: 10, end: 42 } }, { path: 'docs/attachments.md' }] },
     { host: 'git.example.test', repository: 'team/tool', commit: SHA256, paths: [] }]);
   assert.deepEqual(parseRepoReferences(text + '\n\n'), parseRepoReferences(text));
