@@ -80,9 +80,14 @@ Ground rules:
 6. Connect each assistant to its MCP URL with the redirect URLs its host shows:
    - OpenAI: hosted MCP Events work in Work chats on ChatGPT web, desktop Cloud
      and dots. The Responses API and Agents SDK do not support them.
+     Follow the manual guide below to render the plugin ZIP with approved
+     public OAuth metadata, install/connect it as a plugin, verify tools AND
+     events, and ask the host what to monitor and how to handle each event.
    - Grok: a Grok Bot routine webhook uses a Bearer key and answers HTTP 200,
      so set BRIDGE_PEER_<ID>_WEBHOOK_AUTH=bearer. Grok Automations webhooks
      are different: Standard Webhooks signatures and HTTP 202.
+     Bind the routine to the receiver workflow in docs/inbox-policy.md;
+     configuring a URL and key alone does not implement message handling.
    Have each assistant call bridge_health and compare its `caller` field
    (role, scopes, tools) with what the host shows.
 7. Open the readiness gates one at a time, redeploying and checking
@@ -220,7 +225,33 @@ python3 scripts/check_v1.py --origin https://bridge.example.com --peers alice,bo
 
 ### 5. Connect and open the gates
 
-Connect each assistant to its MCP URL, then call `bridge_health` from each.
+For the OpenAI events peer, render the plugin using only your approved public
+origin, issuer and that peer's public OAuth client ID (replace the example
+values and peer IDs):
+
+```sh
+python3 scripts/package_plugin.py --origin https://bridge.example.com --peer alice \
+  --counterpart bob --issuer https://auth.example.com --client-id YOUR_PUBLIC_CLIENT_ID
+```
+
+The script writes `.reports/plugin-<version>.zip` locally; it does not upload
+or install anything. Follow OpenAI's [connect and test guide](https://developers.openai.com/plugins/deploy/connect-chatgpt)
+to install the packaged plugin from a local marketplace, or connect your
+custom MCP server as a plugin. Public marketplace publication is not required.
+Sign in with the configured OAuth client and verify the discovered tools.
+Once subscriptions are enabled below, check that `bridge.message.received`
+appears alongside tools on the plugin page; rescan after tools or events
+change. In a Work chat (web, or desktop with Cloud selected) or a dot, tell
+the host to monitor this peer's inbox and follow
+[the receiver contract](docs/inbox-policy.md) when an event arrives. Confirm
+the subscription succeeds; a tool-only connection does not establish monitoring.
+
+For Grok Bot, create a webhook-triggered routine whose instructions implement
+the same receiver contract: read the message ID, claim, handle and complete,
+with terminal ACK handling. Bind its actual URL and Bearer key to the bridge.
+The URL and key configure transport; the routine supplies the receiver workflow.
+
+Call `bridge_health` from each assistant through its MCP connection.
 Its `caller` field shows the verified role, scopes and offered tools; compare
 it with what the host displays. Then open the gates in order, redeploying and
 rechecking `bridge_health` after each:
