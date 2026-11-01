@@ -26,7 +26,7 @@ const COMPAT = Object.freeze({
   databaseHostSuffix: '.neon.tech',
 });
 const GENERIC = Object.freeze({
-  serviceName: 'Agent Inbox Bridge',
+  serviceName: 'Agent Bridge',
   serverName: 'agent-inbox-bridge',
   protocol: GENERIC_PROTOCOL,
   receiverId: 'agent-inbox-bridge',

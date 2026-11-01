@@ -15,7 +15,12 @@ test('portable template is neutral, versioned and has no live origin, issuer or 
   const read = name => JSON.parse(readFileSync(new URL('../plugin/' + name, import.meta.url)));
   const manifest = read('plugin.json'), codex = read('.codex-plugin/plugin.json');
   assert.equal(manifest.name, 'agent-inbox-bridge'); assert.equal(manifest.version, VERSION);
-  assert.equal(manifest.extensions['com.openai'].interface.displayName, 'Agent Inbox Bridge');
+  assert.equal(manifest.extensions['com.openai'].interface.displayName, 'Agent Bridge');
+  assert.equal(manifest.extensions['com.openai'].interface.longDescription,
+    'Connect to your self-hosted Agent Bridge through its MCP endpoint.');
+  assert.equal(codex.interface.displayName, 'Agent Bridge');
+  assert.equal(codex.interface.longDescription,
+    'Connect to your self-hosted Agent Bridge through its MCP endpoint.');
   assert.equal(manifest.author.name, 'aravhawk'); assert.equal(codex.author.name, 'aravhawk');
   assert.equal(codex.interface.developerName, 'aravhawk'); assert.equal(codex.version, VERSION);
   const server = read('mcp.template.json').mcpServers['agent-inbox-bridge'];

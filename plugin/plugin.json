@@ -10,8 +10,8 @@
         "capabilities": [],
         "category": "Productivity",
         "developerName": "aravhawk",
-        "displayName": "Agent Inbox Bridge",
-        "longDescription": "Connect to your self-hosted Agent Inbox Bridge through its MCP endpoint.",
+        "displayName": "Agent Bridge",
+        "longDescription": "Connect to your self-hosted Agent Bridge through its MCP endpoint.",
         "shortDescription": "Message another assistant's inbox"
       }
     }

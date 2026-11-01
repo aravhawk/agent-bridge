@@ -14,7 +14,7 @@ Read once when the function starts. An invalid value stops startup with a
 |---|---|---|
 | `BRIDGE_PUBLIC_ORIGIN` | *(required)* | Public HTTPS origin, e.g. `https://bridge.example.com`. No path, port or trailing slash. Only this origin accepts MCP and resource-metadata requests; other aliases (such as a default `*.vercel.app` domain) serve public health only. |
 | `BRIDGE_PEERS` | *(required)* | Exactly two peers: `<id>:events,<id>:webhook`. IDs are lowercase letters, digits and inner hyphens (max 32). |
-| `BRIDGE_SERVICE_NAME` | `Agent Inbox Bridge` | Display label in `/`, `/health`, OAuth resource metadata and the armed canary text (1-64 printable ASCII characters). It does not rename MCP server identity, peers, routes, audiences, scopes, receiver IDs or protocol IDs. Read at startup; changing it requires a new deployment/function instance. |
+| `BRIDGE_SERVICE_NAME` | `Agent Bridge` | Display label in `/`, `/health`, OAuth resource metadata and the armed canary text (1-64 printable ASCII characters). It does not rename MCP server identity, peers, routes, audiences, scopes, receiver IDs or protocol IDs. Read at startup; changing it requires a new deployment/function instance. |
 | `BRIDGE_MESSAGE_PROTOCOL` | `agent-inbox/1` | Protocol ID stored and advertised. `agent-inbox/1` and `jarvis-friday/1` are both accepted on input and normalized to this value. |
 | `BRIDGE_RECEIVER_ID` | `agent-inbox-bridge` | Receiver ID the webhook peer's attestation must match. |
 | `BRIDGE_QUEUE_TOPIC` | `jarvis-friday-bridge-v1` | Vercel Queue topic. **Must equal** the trigger topic in `vercel.json`. The default is historical; change both together if you rename it. |
@@ -52,7 +52,7 @@ the `bridge_friday_webhook_diagnostic` tool, the `friday*` readiness keys, the
 keys. In generic mode these become `bridge_webhook_diagnostic`, `webhook*` and
 `webhook_*`. New deployments should always set `BRIDGE_PUBLIC_ORIGIN`.
 They may set `BRIDGE_SERVICE_NAME` to their own display label. Leaving it unset
-uses `Agent Inbox Bridge` in generic mode; compatibility mode deliberately keeps
+uses `Agent Bridge` in generic mode; compatibility mode deliberately keeps
 `Jarvis Friday Bridge`, so the original deployment needs no new variable.
 
 ## OAuth provider and identity

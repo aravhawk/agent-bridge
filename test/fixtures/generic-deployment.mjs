@@ -34,10 +34,10 @@ for (const unsafe of ['http://auth.example', 'https://127.0.0.1', 'https://auth.
 // Public routing follows the configured origin and peers only.
 const router = createResourceRouter({ getHandler: () => () => Response.json({}), getProvider: () => providerConfiguration(ISSUER) });
 assert.deepEqual(await (await router(new Request(ORIGIN + '/health'))).json(),
-  { status: 'ok', service: 'Agent Inbox Bridge', version: '1.0.0', authenticationRequired: true });
+  { status: 'ok', service: 'Agent Bridge', version: '1.0.0', authenticationRequired: true });
 assert.deepEqual(await (await router(new Request(ORIGIN + '/.well-known/oauth-protected-resource/bridge/alice/mcp'))).json(), {
   resource: ORIGIN + '/bridge/alice/mcp', authorization_servers: [ISSUER], bearer_methods_supported: ['header'],
-  scopes_supported: ['bridge:send:bob', 'bridge:ack:alice'], resource_name: 'Agent Inbox Bridge — alice' });
+  scopes_supported: ['bridge:send:bob', 'bridge:ack:alice'], resource_name: 'Agent Bridge — alice' });
 for (const path of ['/bridge/jarvis/mcp', '/bridge/friday/mcp']) assert.equal((await router(new Request(ORIGIN + path, { method: 'POST' }))).status, 404);
 assert.deepEqual(wakeSyncRecipients('friday'), { configured: true, valid: false, recipients: [] });
 assert.equal((await router(new Request('https://jarvis-friday-bridge.aravhawk.com/bridge/alice/mcp', { method: 'POST' }))).status, 404);

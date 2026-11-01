@@ -1,4 +1,4 @@
--- Agent Inbox Bridge v1.0.0 schema. Apply once to a NEW, empty, dedicated database.
+-- Agent Bridge v1.0.0 schema. Apply once to a NEW, empty, dedicated database.
 -- Preparation only; this source does not migrate or mutate a live database.
 -- Existing applications and databases are outside this scope.
 -- A single locked aggregate provides atomic message/outbox/receipt transitions
