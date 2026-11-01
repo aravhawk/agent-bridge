@@ -60,7 +60,7 @@ Construction also requires both bridge delivery-policy IDs to match and the
 existing native prearm callback to be configured. Callback presence alone is not
 proof of provider readiness, delivery or hosted execution.
 
-Repository evidence: `src/runtime.mjs` supplies both access verifiers and role
+Repository evidence: `src/runtime.ts` supplies both access verifiers and role
 policy IDs from the same configured provider issuer and subject pin.
 `createAccessVerifier` checks that pin; its audience/role-specific principal keys
 intentionally differ. No live subject pin, token, endpoint, message or deployment

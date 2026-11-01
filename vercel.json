@@ -2,12 +2,12 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "regions": ["iad1"],
   "functions": {
-    "api/queue.mjs": {
+    "api/queue.ts": {
       "maxDuration": 60,
       "experimentalTriggers": [{ "type": "queue/v2beta", "topic": "jarvis-friday-bridge-v1", "maxDeliveries": 20 }]
     },
-    "api/index.mjs": { "maxDuration": 60 },
-    "api/cron.mjs": { "maxDuration": 60 }
+    "api/index.ts": { "maxDuration": 60 },
+    "api/cron.ts": { "maxDuration": 60 }
   },
   "rewrites": [
     { "source": "/((?!api/queue|api/cron).*)", "destination": "/api/index" }

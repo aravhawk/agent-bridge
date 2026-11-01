@@ -12,7 +12,9 @@
     "node": ">=24.22.1 <25"
   },
   "scripts": {
-    "test": "node --test test/*.test.mjs",
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json",
+    "compile:check": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json && node scripts/check-emitted.ts dist",
     "check:remote": "python3 scripts/check_v1.py",
     "package:plugin": "python3 scripts/package_plugin.py"
   },
@@ -27,5 +29,10 @@
   "overrides": {
     "zod": "4.6.7",
     "minimatch": "^11.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "@types/pg": "8.23.1",
+    "typescript": "6.0.3"
   }
 }

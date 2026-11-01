@@ -15,6 +15,10 @@ jobs:
           node-version: '24.22.1'
           cache: npm
       - run: npm ci --ignore-scripts
+      # Vercel compiles api/*.ts without type checking (noCheck), so the strict
+      # typecheck and a clean emitted-JavaScript compile/load check gate here.
+      - run: npm run typecheck
+      - run: npm run compile:check
       - run: npm test
       - run: npm audit --audit-level=moderate
       - run: python3 scripts/audit_repo.py

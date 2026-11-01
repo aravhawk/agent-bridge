@@ -58,7 +58,8 @@ def inspect(path, data, source):
     for match in DB_URI.finditer(data):
         # The existing unit fixture is deliberately fake and has no authority.
         fixture_prefix = b'postgresql:' + b'//fixture:' + b'fixture@fixture.neon.tech/'
-        if path == 'test/runtime.test.mjs' and match.group().startswith(fixture_prefix):
+        # Same fixture before (.mjs, still in history) and after the TypeScript migration.
+        if path in ('test/runtime.test.mjs', 'test/runtime.test.ts') and match.group().startswith(fixture_prefix):
             continue
         findings.append({'source': source, 'path': path, 'rule': 'database-credential-url'})
     if p.name == '.env.example':

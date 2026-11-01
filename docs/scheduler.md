@@ -57,8 +57,11 @@ Responses:
 ## Proposed schedule (dry run only)
 
 ```sh
-node scripts/qstash-schedule-plan.mjs --dry-run --destination https://<host>/api/cron
+node scripts/qstash-schedule-plan.ts --dry-run --destination https://<host>/api/cron
 ```
+
+(`scripts/qstash-schedule-plan.mjs` remains as a compatibility entry point for
+the same script.)
 
 prints the exact request and a `curl` template, and never sends anything (the
 script has no network code, reads no token or key, and refuses to run without

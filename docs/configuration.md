@@ -498,7 +498,7 @@ until the pre-rollout requirements above are resolved):
    `https://<your-bridge-host>/api/cron` next to the existing QStash signing
    keys, and redeploy.
 2. Review and create the 5-minute schedule from
-   `node scripts/qstash-schedule-plan.mjs --dry-run --destination <url>`.
+   `node scripts/qstash-schedule-plan.ts --dry-run --destination <url>`.
    The first ticks should answer `"status":"ok"` with `"flushed":0`;
    `503 scheduler_not_configured` means a key or the destination is missing,
    `489` means a signature, destination or body mismatch (not retried).

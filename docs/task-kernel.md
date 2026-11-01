@@ -1,8 +1,8 @@
 # Task data and runtime integration
 
-`src/tasks.mjs` stores coordination data independently of expiring messages.
-`src/task-notices.mjs` can atomically stage a task command, an existing v1 notice
-and a bounded notice-to-task link. `src/task-integration.mjs` connects those
+`src/tasks.ts` stores coordination data independently of expiring messages.
+`src/task-notices.ts` can atomically stage a task command, an existing v1 notice
+and a bounded notice-to-task link. `src/task-integration.ts` connects those
 transactions to the complete v1 message path. MCP has three task handlers behind
 an explicitly injected constructor capability. The exported core runtime used by
 the queue and cron supplies no task option. The public API entrypoint instead
@@ -18,7 +18,7 @@ production workflows change.
 `dataAllowed`, `ownerKey`, `role` and `coordinate`. Without it, operations fail
 with `task_authorization_unavailable`. The local release factory supplies the
 server-bound callback from
-`src/task-access.mjs`, using trusted configured issuer/pin/current role policy,
+`src/task-access.ts`, using trusted configured issuer/pin/current role policy,
 ACK reads and ACK+SEND commands. The current locked transaction state is a private
 fourth callback argument for denial checks. The public API uses this assembly
 only when ordinary readiness is already open; queue and cron remain task-disabled.
@@ -221,7 +221,7 @@ Execution still requires the assistant workflow's independent authority. The
 bridge does not create host run controls, guarantee on-time execution or recover
 external side effects merely because a coordination mutex expired.
 
-`src/webhook-sender.mjs` is a provider-neutral HTTPS adapter (Standard Webhooks
+`src/webhook-sender.ts` is a provider-neutral HTTPS adapter (Standard Webhooks
 signatures or a legacy bearer key) with a fixed event body. Supported evidence
 for each actual host's payload-to-context mapping, run start/completion and
 duplicate-launch handling remains necessary; bridge code cannot guarantee either
@@ -232,7 +232,7 @@ host's scheduler.
 With the repository's Node 24.22.1 toolchain:
 
 ```sh
-node --test test/task*.test.mjs
+node --test test/task*.test.ts
 npm test
 ```
 

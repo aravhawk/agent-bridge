@@ -7,13 +7,20 @@ service, so changes favor explicit checks and tests over features.
 
 ```sh
 npm ci --ignore-scripts
+npm run typecheck              # strict TypeScript (tests and fixtures included)
+npm run compile:check          # clean emit to dist/ and load the emitted entry points
 npm test                       # all tests are offline: no network, credentials or database
 npm audit
 python3 scripts/audit_repo.py  # secret/identifier audit of the index and Git history
 ```
 
 Node.js 24.22.1 or newer within major 24 is required (see `engines` in
-`package.json`). If you have
+`package.json`). The source is TypeScript that Node 24 runs directly (type
+stripping, so only erasable syntax: no enums, namespaces or parameter
+properties) and Vercel compiles at deploy time; there is no build step to
+run before deploying. Vercel does not type-check, so `npm run typecheck` (also
+run in CI) is the gate: keep `strict` and the other compiler checks on, and
+do not add `any`, `@ts-ignore` or `@ts-expect-error`. If you have
 [Gitleaks](https://github.com/gitleaks/gitleaks), also run `gitleaks git .`.
 
 ## Pull requests
@@ -26,9 +33,9 @@ Node.js 24.22.1 or newer within major 24 is required (see `engines` in
   rather than guess a default, and no request value may select an issuer,
   destination, secret, peer or permission.
 - **Compatibility mode** (`BRIDGE_PUBLIC_ORIGIN` unset) must keep producing the
-  original deployment's exact wire contract; `test/compat-contract.test.mjs`
+  original deployment's exact wire contract; `test/compat-contract.test.ts`
   pins it. Generic deployments are exercised by
-  `test/generic-deployment.test.mjs` in a child process, because deployment
+  `test/generic-deployment.test.ts` in a child process, because deployment
   identity is read once at startup.
 - Keep dependencies minimal and pinned to exact versions.
 - The CodeQL workflow is skipped while the repository is private (code

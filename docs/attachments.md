@@ -244,13 +244,13 @@ store makes existing records fail closed with
 
 ## Repository references
 
-`src/repo-refs.mjs` formats and parses immutable references in normal message
+`src/repo-refs.ts` formats and parses immutable references in normal message
 text:
 
 ```text
 Repository references (immutable; resolve with your own authorized Git access):
 - github.com/owner/repo@<40 or 64 hex commit>
-  - src/file.mjs#L10-L42
+  - src/file.ts#L10-L42
   - docs/README.md
 ```
 
@@ -286,7 +286,7 @@ Official references: [Vercel Blob](https://vercel.com/docs/vercel-blob),
 
 ## Local verification scope
 
-Tests use `test/fixtures/fake-blob.mjs`, fake store IDs, isolated temporary
+Tests use `test/fixtures/fake-blob.ts`, fake store IDs, isolated temporary
 files and no live credentials or provider requests. They cover signed URL
 shape against the real pinned SDK locally, 1,000,000,000-byte bounded-memory
 single and multipart transfers, checkpoint ownership and durable retries,
