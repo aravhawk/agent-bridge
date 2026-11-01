@@ -246,12 +246,16 @@ For an enabled recipient:
   (policy, durable denial, expiry) at claim and again at completion.
 - **Two classes.** `bridge_message_send` takes optional `class` (`wake` or
   `sync`), `subject`, `effectiveAt` and `dueAt`. A message with no class is
-  WAKE, unchanged. SYNC is promoted to WAKE when its `effectiveAt`, `dueAt` or
+  WAKE, unchanged. SYNC is only for dependency-free, nonblocking routine FYI;
+  any action, decision, blocker, awaited reply, workflow dependency or
+  uncertainty is WAKE, and `handoff_request` always routes WAKE even if
+  mislabeled SYNC. SYNC is promoted to WAKE when its `effectiveAt`, `dueAt` or
   `expiresAt` is at or before now + 2 h 30 min: the 2-hour maximum wait plus
   30 minutes of scheduler slack. That margin covers a trigger run that is
   somewhat late; it does not make on-time delivery certain if the scheduled
   trigger is delayed further or skipped (see
-  [pre-rollout requirements](#pre-rollout-requirements)). Only
+  [pre-rollout requirements](#pre-rollout-requirements)). This time check is a
+  safety floor, not proof arbitrary text is safe to delay. Only
   `class: sync` may set `expiresAt` up to 12 h after `sentAt`; everything else
   keeps 1 h.
 - **Batching.** Pending SYNC items coalesce per recipient: delta only, and a
@@ -425,6 +429,13 @@ denial still withdraws them.
 
 The implementation does not settle the following. Resolve them before setting
 `BRIDGE_WAKE_SYNC_RECIPIENTS` for a recipient:
+
+- **Sender classification must not affect workflow.** Enable batching only
+  after every sender uses SYNC solely for dependency-free, nonblocking FYI and
+  treats uncertainty as WAKE. Arbitrary text cannot reliably reveal every
+  dependency; the server only forces the known workflow kind
+  `handoff_request` to WAKE and applies the time-field safety floor. Inbox reads
+  or late-item recovery do not make workflow-dependent content safe to delay.
 
 - **The 2-hour maximum is a requirement, not yet a proven guarantee.** The
   requested rule is delivery of SYNC data no more than 2 elapsed hours after it

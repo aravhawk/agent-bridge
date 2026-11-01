@@ -94,6 +94,28 @@ test('classification: promotion covers the 2h maximum wait plus scheduler slack,
   assert.deepEqual(classify({ ...base, expiresAt: iso(noon + 1000) }, now), { class: 'wake', promoted: 'expires_before_sync_deadline' });
 });
 
+test('workflow safety: handoff requests are always WAKE even when mislabeled SYNC, both directions', async () => {
+  const base = { kind: 'handoff_request', class: 'sync', expiresAt: iso(start + 6 * HOUR) };
+  assert.deepEqual(classify(base, start), { class: 'wake', promoted: 'handoff_requires_wake' });
+  assert.deepEqual(classify({ ...base, effectiveAt: iso(start + 5 * HOUR), dueAt: iso(start + 5 * HOUR) }, start),
+    { class: 'wake', promoted: 'handoff_requires_wake' });
+  for (const [from, recipient] of [['jarvis', 'friday'], ['friday', 'jarvis']]) {
+    const f = await fixture({ recipients: [recipient] });
+    const handoff = f.sync(from, { kind: 'handoff_request', subject: 'Workflow handoff',
+      text: 'Receiver decision and workflow transition required.', effectiveAt: iso(start + 5 * HOUR), dueAt: iso(start + 5 * HOUR) });
+    const first = await f.send(handoff), hash = f.snapshot().messageIds[handoff.id].hash;
+    assert.equal(first.class, 'wake'); assert.equal(first.promoted, 'handoff_requires_wake');
+    assert.equal(first.jobIds.length, 1); assert.equal(first.delivery, 'immediate');
+    assert.equal(f.snapshot().messages[handoff.id].envelope.class, 'sync', 'canonical envelope remains sender-authored');
+    const duplicate = await f.send(handoff);
+    assert.equal(duplicate.duplicate, true); assert.equal(f.snapshot().messageIds[handoff.id].hash, hash);
+    assert.equal(jobsFor(f.snapshot(), handoff.id).length, 1);
+  }
+  const off = await fixture({ wakeSync: false });
+  const legacy = off.sync('jarvis', { kind: 'handoff_request' }), sent = await off.send(legacy);
+  assert.equal(sent.jobIds.length, 1); assert.equal(off.snapshot().syncQueues, undefined);
+});
+
 test('validation: optional class fields are bounded; only sync may outlive one hour (max 12h); ACK-free v1 envelope is unchanged', () => {
   const m = { protocol: MESSAGE_PROTOCOL, id: randomUUID(), from: 'jarvis', to: 'friday', kind: 'status', sentAt: iso(start),
     expiresAt: iso(start + HOUR), threadId: randomUUID(), route: 'inbox', text: 'Fixture.' };

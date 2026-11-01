@@ -211,12 +211,14 @@ by clearing it), that recipient gets:
 
   | Field | Meaning |
   |---|---|
-  | `class` | `wake` (default; needs action, a decision, a blocker, urgent, an awaited reply, or effect within 2 h) or `sync` (routine FYI: status, logged decisions, owner changes, later reminders) |
+  | `class` | `wake` (default; needs action, a decision, a blocker, urgency, an awaited reply, any workflow dependency or uncertainty, or effect within 2 h) or `sync` (dependency-free, nonblocking routine FYI only: status, logged decisions, owner changes, later reminders). A `handoff_request` always routes WAKE even if mislabeled `sync` |
   | `subject` | Topic key (≤ 200 chars). A newer pending item with the same subject replaces the older one |
   | `effectiveAt` / `dueAt` | ISO 8601 times. Either within 2 h 30 min (the 2 h maximum wait plus scheduler slack) promotes `sync` to `wake` |
   | `expiresAt` | Up to 12 h for `sync` (1 h otherwise). A `sync` item expiring within 2 h 30 min is sent as `wake` |
 
-  Messages without `class` behave exactly as before.
+  Messages without `class` behave exactly as before. The time-field promotion
+  is a safety floor, not evidence that arbitrary content is safe to delay:
+  uncertainty means WAKE, and token savings never justify workflow impact.
 - **One batch, not one wake per item.** Pending SYNC items are coalesced (delta
   only, deduplicated by subject) into a batch: with the next WAKE, on the
   recipient's next `bridge_read`/`bridge_inbox_read`, or as a single webhook at
@@ -229,7 +231,7 @@ by clearing it), that recipient gets:
   12 batch wakes per day (13 on the 25-hour fall-back day), none for an empty
   window. A batch is an ordinary `status` message, so its wake payload is
   unchanged; `bridge_read` adds a `syncBatches` field with each item.
-- **Nothing lost, nothing handled twice.** A batch is replayed by
+- **Durable replay and shared receipt fencing.** A batch is replayed by
   `bridge_inbox_read` until the recipient acknowledges it after its items were
   presented: directly, by claiming and completing the batch (naming its own ID
   in `syncBatchIds`), or by completing the WAKE it came with while naming the
@@ -240,7 +242,10 @@ by clearing it), that recipient gets:
   cannot be claimed on its own (the refusal names the batch to use), so a
   batch is acknowledged only with every item covered. Expired items are still
   delivered, flagged late. Receivers read, claim, handle, then complete; see the
-  [receiver contract](docs/inbox-policy.md#flagged-receiver-contract).
+  [receiver contract](docs/inbox-policy.md#flagged-receiver-contract). Only one
+  live receipt claim holds a batch at a time, but a claim can expire and be
+  reclaimed; the receiver must reconcile any existing host run before acting
+  again. Receipt fencing does not guarantee exactly-once external execution.
 
 The flush is driven by an external scheduled tick to `/api/cron`; the
 selected scheduler is Upstash QStash (signed deliveries, verified against the

@@ -90,11 +90,15 @@ export const dailyFlushCap = date => Math.max(SYNC_DAILY_FLUSH_CAP, Math.ceil(ch
 
 // --- Classification ----------------------------------------------------------
 // The sender chooses the class; an absent class is WAKE (v1 compatibility).
+// A handoff request is a workflow transition and is always WAKE even if a
+// sender labels it SYNC. Text is never guessed: every other uncertainty stays
+// the sender's responsibility and should be classified WAKE.
 // SYNC is promoted to WAKE when its effectiveAt, dueAt or expiresAt falls at or
 // before now + SYNC_DEADLINE_MS (the 2h maximum wait plus scheduler slack), so
 // queued data is always delivered before it takes effect, is due or expires.
 export function classify(envelope, now) {
   if (envelope.class !== 'sync') return { class: 'wake' };
+  if (envelope.kind === 'handoff_request') return { class: 'wake', promoted: 'handoff_requires_wake' };
   const deadline = now + SYNC_DEADLINE_MS;
   for (const [field, reason] of [['effectiveAt', 'effective_before_sync_deadline'], ['dueAt', 'due_before_sync_deadline'],
     ['expiresAt', 'expires_before_sync_deadline']]) {

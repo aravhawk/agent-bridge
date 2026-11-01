@@ -48,11 +48,15 @@ read or acted on it. Only the durable recipient receipt proves handling.
 With `BRIDGE_WAKE_SYNC_RECIPIENTS` naming a recipient, senders may add
 `class` (`wake`/`sync`), `subject`, `effectiveAt` and `dueAt`. Use WAKE for
 anything needing action, a decision, a blocker, urgency, a reply someone is
-waiting on, or an effect within the next two hours. Use SYNC for routine FYIs:
-status, logged decisions, owner changes, reminders further out. The server
+waiting on, any workflow dependency or uncertainty, or an effect within the
+next two hours. Use SYNC only for dependency-free, nonblocking routine FYIs:
+status, logged decisions, owner changes, reminders further out. A
+`handoff_request` always routes WAKE even if a sender labels it SYNC. The server
 promotes SYNC to WAKE when `effectiveAt`, `dueAt` or `expiresAt` is within
 2 h 30 min (the 2-hour maximum wait plus scheduler slack). Unclassified
-messages are WAKE. SYNC data is delivered in batches (a v1 `status` message
+messages are WAKE. Those time checks are a safety floor, not proof that message
+text is safe to delay; senders must choose WAKE whenever unsure. SYNC data is
+delivered in batches (a v1 `status` message
 from the counterpart); the requirement is delivery no more than 2 elapsed
 hours after it was queued (an unresolved pre-rollout requirement while it
 depends on the external scheduler), and a batch repeats until the
