@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { MemoryStore } from '../src/store.mjs';
 import { NativeEvents, EVENT_NAME } from '../src/events.mjs';
 import { Bridge } from '../src/bridge.mjs';
-import { BridgeError, SCOPES, VERIFIED_AUTHORIZATION } from '../src/policy.mjs';
+import { SCOPES, VERIFIED_AUTHORIZATION } from '../src/policy.mjs';
 import { createProtector } from '../src/webhook.mjs';
 import { createWebhookDiagnostic } from '../src/webhook-diagnostic.mjs';
 import { denyResourceAccess } from '../src/access.mjs';

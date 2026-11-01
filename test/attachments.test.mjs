@@ -443,7 +443,7 @@ test('revocation, policy change or disabling during an await returns no URL and 
     f.hooks.put = () => change(f);
     await assert.rejects(f.att().begin(jarvis, d), /attachment_authorization_inactive|attachments_not_enabled|attachment_namespace_mismatch/, name);
   }
-  for (const [name, change, code] of [
+  for (const [, change, code] of [
     ['recipient denied', f => f.store.transaction(s => { s.resourceDenials = { [friday.principalKey]: {} }; }), 'attachment_authorization_inactive'],
     ['sender denied', f => f.store.transaction(s => { s.resourceDenials = { [jarvis.principalKey]: {} }; }), 'message_authorization_inactive'],
   ]) {

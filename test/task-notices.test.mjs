@@ -9,7 +9,7 @@ import { NativeEvents, appendDeliveryJobs } from '../src/events.mjs';
 import { createProtector } from '../src/webhook.mjs';
 import { validateMessage, reserveMessage, retainMessages, CONTENT_RETENTION_MS } from '../src/messages.mjs';
 import { verifiedMessageAuthorization } from '../src/access.mjs';
-import { VERIFIED_AUTHORIZATION, SCOPES, BridgeError } from '../src/policy.mjs';
+import { VERIFIED_AUTHORIZATION, SCOPES } from '../src/policy.mjs';
 import { Bridge } from '../src/bridge.mjs';
 
 // Fictional access contexts and v1 principals only. stageNotice is a local
