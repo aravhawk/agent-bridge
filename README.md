@@ -17,16 +17,9 @@ with its own OAuth token and can only send to the other one.
 
 ## How it works
 
-```mermaid
-flowchart TB
-    S["Sender assistant<br/>bridge_message_send"]
-    M["Bridge stores message<br/>+ outbox job"]
-    W["Queued wake<br/>(message ID only)"]
-    R["Recipient signs in:<br/>read → claim → handle"]
-    C["Complete receipt<br/>+ ACK, atomically"]
-    A["Sender receives<br/>the ACK event"]
-    S --> M --> W --> R --> C --> A
-```
+<p align="center">
+  <img src="docs/assets/message-flow.svg" width="320" alt="Message flow, top to bottom: the sender assistant calls bridge_message_send; the bridge stores the message and an outbox job in one transaction; a queued wake carries only the message ID; the recipient signs in to read, claim and handle it; completing the receipt atomically creates one correlated ACK; the sender receives the ACK, which is terminal and never acknowledged.">
+</p>
 
 The reverse direction works the same way. An **ACK** means the recipient
 handled the received data, not that any requested task is done. ACKs are
