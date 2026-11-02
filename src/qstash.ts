@@ -30,6 +30,62 @@ const KEY = /^[\x21-\x7e]{16,256}$/;
 const JWS = /^[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]{2,}$/;
 const JTI = /^[A-Za-z0-9_.:-]{1,128}$/;
 const BODY_HASH = /^[A-Za-z0-9_-]{43}=?$/;
+type FailureStage = 'body_read' | 'signature_shape' | 'jose_verification' | 'claim_bounds' | 'body_validation';
+type ClaimName = 'iss' | 'sub' | 'exp' | 'nbf' | 'iat' | 'jti' | 'body';
+type FailureCategory = 'not_attempted' | 'verified' | 'signature_mismatch' | 'subject_invalid' | 'issuer_invalid' |
+  'required_claim_missing' | 'time_invalid' | 'expired' | 'claim_invalid' | 'algorithm_disallowed' | 'token_invalid' |
+  'unknown' | 'claim_bounds_invalid' | 'token_lifetime_exceeded' | 'body_mismatch';
+type Slot = 'current' | 'next';
+type SlotDiagnostic = { category: FailureCategory; claim: ClaimName | null };
+export const MAX_DIAGNOSTIC_BYTES = 512;
+
+// Read only own data properties: no getters, prototypes, toJSON, message,
+// stack, cause or payload. Even proxy descriptor traps are contained.
+function ownData(error: unknown, key: string): unknown {
+  try {
+    if (!error || (typeof error !== 'object' && typeof error !== 'function')) return undefined;
+    return Object.getOwnPropertyDescriptor(error, key)?.value;
+  } catch { return undefined; }
+}
+function claimName(value: unknown): ClaimName | null {
+  switch (value) {
+    case 'iss': case 'sub': case 'exp': case 'nbf': case 'iat': case 'jti': case 'body': return value;
+    default: return null;
+  }
+}
+export function projectQStashJoseFailure(error: unknown): SlotDiagnostic {
+  const claim = claimName(ownData(error, 'claim'));
+  switch (ownData(error, 'code')) {
+    case 'ERR_JWS_SIGNATURE_VERIFICATION_FAILED': return { category: 'signature_mismatch', claim: null };
+    case 'ERR_JWT_EXPIRED': return { category: 'expired', claim };
+    case 'ERR_JOSE_ALG_NOT_ALLOWED': return { category: 'algorithm_disallowed', claim: null };
+    case 'ERR_JWT_INVALID': case 'ERR_JWS_INVALID': return { category: 'token_invalid', claim: null };
+    case 'ERR_JWT_CLAIM_VALIDATION_FAILED':
+      return { category: ownData(error, 'reason') === 'missing' ? 'required_claim_missing' : claim === 'sub' ? 'subject_invalid'
+        : claim === 'iss' ? 'issuer_invalid' : claim === 'exp' || claim === 'nbf' || claim === 'iat' ? 'time_invalid' : 'claim_invalid', claim };
+    default: return { category: 'unknown', claim: null };
+  }
+}
+export function createQStashFailureDiagnostic(write: (line: string) => void = line => console.warn(line)) {
+  const event = { event: 'bridge.qstash_verification_failed', stage: 'body_read' as FailureStage,
+    current: { category: 'not_attempted', claim: null } as SlotDiagnostic,
+    next: { category: 'not_attempted', claim: null } as SlotDiagnostic };
+  let emitted = false, verifiedSlot: Slot | undefined;
+  return {
+    stage(stage: FailureStage) { event.stage = stage; },
+    failed(slot: Slot, error: unknown) { event[slot] = projectQStashJoseFailure(error); },
+    verified(slot: Slot) { verifiedSlot = slot; event[slot] = { category: 'verified', claim: null }; },
+    bound(claim: ClaimName, category: 'claim_bounds_invalid' | 'time_invalid' | 'token_lifetime_exceeded' | 'body_mismatch') {
+      if (verifiedSlot) event[verifiedSlot] = { category, claim };
+    },
+    emit() {
+      if (emitted) return;
+      emitted = true;
+      try { const line = JSON.stringify(event); if (Buffer.byteLength(line) <= MAX_DIAGNOSTIC_BYTES) write(line); } catch { /* Logging cannot change authentication or its response. */ }
+    },
+  };
+}
+type FailureDiagnostic = ReturnType<typeof createQStashFailureDiagnostic>;
 // Explicitly typed so a bare reject(...) statement narrows control flow.
 const reject: (code: string) => never = code => { throw new BridgeError(code, 401); };
 
@@ -57,35 +113,49 @@ const int = (value: unknown): value is number => Number.isSafeInteger(value) && 
 // { key, jti, expiresAt } (key: the signing key that verified, to recheck
 // after any later await). Throws BridgeError 401 on any failure; never
 // touches storage.
-export async function verifyQStashTick({ config, signature, body, now }:
-  { config: QStashConfig | null | undefined; signature: unknown; body: unknown; now: Millis }): Promise<VerifiedTick> {
+export async function verifyQStashTick({ config, signature, body, now, diagnostic }:
+  { config: QStashConfig | null | undefined; signature: unknown; body: unknown; now: Millis; diagnostic?: FailureDiagnostic }): Promise<VerifiedTick> {
   if (!config?.valid) throw new BridgeError('scheduler_not_configured', 503);
+  diagnostic?.stage('signature_shape');
   if (typeof signature !== 'string' || Buffer.byteLength(signature) > MAX_SIGNATURE_BYTES || !JWS.test(signature)) {
     reject('scheduler_signature_invalid');
   }
+  diagnostic?.stage('body_validation');
   if (!Buffer.isBuffer(body) || body.length > MAX_TICK_BODY_BYTES) reject('scheduler_body_invalid');
   let payload: JWTPayload | null = null, key: string | null = null;
+  diagnostic?.stage('jose_verification');
   // config.valid was checked first.
-  for (const candidate of [(config as QStashConfig & { valid: true }).current, (config as QStashConfig & { valid: true }).next]) {
+  for (const slot of ['current', 'next'] as const) {
+    const candidate = config[slot];
     try {
       ({ payload } = await jwtVerify(signature, new TextEncoder().encode(candidate), {
         algorithms: ['HS256'], issuer: 'Upstash', subject: (config as QStashConfig & { valid: true }).destination, clockTolerance: CLOCK_TOLERANCE_S,
         requiredClaims: ['iss', 'sub', 'exp', 'nbf', 'iat', 'jti', 'body'], currentDate: new Date(now) }));
-      key = candidate; break;
-    } catch { /* try the next key */ }
+      diagnostic?.verified(slot); key = candidate; break;
+    } catch (error) { diagnostic?.failed(slot, error); /* try the next key */ }
   }
   if (!payload) reject('scheduler_signature_invalid');
   // payload is non-null here (refused above otherwise).
-  const seconds = Math.floor(now / 1000), { iat, nbf, exp, jti } = payload as JWTPayload;
-  if (!int(iat) || !int(nbf) || !int(exp) || exp <= nbf || nbf < iat - CLOCK_TOLERANCE_S ||
-      exp - iat > MAX_TOKEN_LIFETIME_S || iat > seconds + CLOCK_TOLERANCE_S ||
-      typeof jti !== 'string' || !JTI.test(jti) || typeof (payload as JWTPayload).body !== 'string' || !BODY_HASH.test((payload as JWTPayload).body as string)) {
-    reject('scheduler_signature_invalid');
-  }
+  const verifiedPayload = payload as JWTPayload;
+  const seconds = Math.floor(now / 1000), { iat, nbf, exp, jti } = verifiedPayload;
+  diagnostic?.stage('claim_bounds');
+  const bound: (claim: ClaimName, category?: 'claim_bounds_invalid' | 'time_invalid' | 'token_lifetime_exceeded') => never =
+    (claim, category = 'claim_bounds_invalid') => { diagnostic?.bound(claim, category); return reject('scheduler_signature_invalid'); };
+  if (!int(iat)) bound('iat');
+  if (!int(nbf)) bound('nbf');
+  if (!int(exp)) bound('exp');
+  if (exp <= nbf) bound('exp', 'time_invalid');
+  if (nbf < iat - CLOCK_TOLERANCE_S) bound('nbf', 'time_invalid');
+  if (exp - iat > MAX_TOKEN_LIFETIME_S) bound('exp', 'token_lifetime_exceeded');
+  if (iat > seconds + CLOCK_TOLERANCE_S) bound('iat', 'time_invalid');
+  if (typeof jti !== 'string' || !JTI.test(jti)) bound('jti');
+  if (typeof verifiedPayload.body !== 'string' || !BODY_HASH.test(verifiedPayload.body)) bound('body');
   // Every claim and the body were type-checked above.
   const digest = base64url(createHash('sha256').update(body as Buffer).digest());
-  if (((payload as JWTPayload).body as string).replace(/=+$/, '') !== digest) reject('scheduler_body_invalid');
-  if ((body as Buffer).toString('utf8') !== QSTASH_TICK_BODY) reject('scheduler_body_invalid');
+  diagnostic?.stage('body_validation');
+  if (((payload as JWTPayload).body as string).replace(/=+$/, '') !== digest || (body as Buffer).toString('utf8') !== QSTASH_TICK_BODY) {
+    diagnostic?.bound('body', 'body_mismatch'); reject('scheduler_body_invalid');
+  }
   return { key: key as string, jti: jti as string, expiresAt: (exp as number) * 1000 };
 }
 

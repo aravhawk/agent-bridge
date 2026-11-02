@@ -12,7 +12,8 @@ import { createRuntime, OUTBOX_RECONCILE_GRACE_MS } from '../src/runtime.ts';
 import { resourceFor } from '../src/resource.ts';
 import { TOPIC } from '../src/queue.ts';
 import { ISSUER } from './fixtures/provider.ts';
-import { qstashConfig, verifyQStashTick, boundedBody, tickSeen, recordTick, QSTASH_TICK_BODY, MAX_TICK_BODY_BYTES } from '../src/qstash.ts';
+import { qstashConfig, verifyQStashTick, boundedBody, tickSeen, recordTick, QSTASH_TICK_BODY, MAX_TICK_BODY_BYTES,
+  createQStashFailureDiagnostic, projectQStashJoseFailure, MAX_DIAGNOSTIC_BYTES } from '../src/qstash.ts';
 import type { BridgeError } from '../src/policy.ts';
 import type { RuntimePoolConstructor, RuntimeQueueClient } from '../src/runtime.ts';
 import type { QueueClient } from '../src/queue.ts';
@@ -374,4 +375,90 @@ test('schedule plan: a shell-active destination is refused; the template single-
   assert.ok(lines.length > 10);
   for (const line of lines.slice(0, -1)) assert.match(line, / \\$/);
   for (const line of lines.slice(1)) assert.match(line, /^  \S/);
+});
+
+test('qstash diagnostics: only literal categories/claims survive untrusted errors, getters and proxies; one bounded deterministic event', () => {
+  const poison = 'SYNTHETIC_PRIVATE_ERROR_URL_HEADER_PAYLOAD_MUST_NOT_APPEAR';
+  for (const [error, category, claim] of [
+    [{code:'ERR_JWS_SIGNATURE_VERIFICATION_FAILED',message:poison},'signature_mismatch',null],
+    [{code:'ERR_JWT_EXPIRED',claim:'exp',cause:poison},'expired','exp'],
+    [{code:'ERR_JWT_CLAIM_VALIDATION_FAILED',claim:'sub',reason:'check_failed',payload:{secret:poison}},'subject_invalid','sub'],
+    [{code:'ERR_JWT_CLAIM_VALIDATION_FAILED',claim:'iat',reason:'missing',stack:poison},'required_claim_missing','iat'],
+    [{code:'ERR_JWT_CLAIM_VALIDATION_FAILED',claim:'nbf'},'time_invalid','nbf'],
+    [{code:'ERR_JWT_CLAIM_VALIDATION_FAILED',claim:'iss'},'issuer_invalid','iss'],
+    [{code:'ERR_JOSE_ALG_NOT_ALLOWED',claim:poison},'algorithm_disallowed',null],
+    [{code:'ERR_JWS_INVALID',claim:poison},'token_invalid',null],
+    [{code:'ERR_JWT_CLAIM_VALIDATION_FAILED',claim:poison,reason:poison},'claim_invalid',null],
+    [{code:poison,claim:'exp',message:poison},'unknown',null],
+    [null,'unknown',null],
+    [Object.create({code:'ERR_JWT_EXPIRED',claim:'exp'}),'unknown',null],
+    [new Proxy({}, {getOwnPropertyDescriptor(){throw Error(poison);}}),'unknown',null],
+  ] as [unknown,string,string|null][]) {
+    assert.deepEqual(projectQStashJoseFailure(error),{category,claim});
+    const lines:string[]=[]; const d=createQStashFailureDiagnostic(line=>lines.push(line));
+    d.stage('jose_verification'); d.failed('current',error); d.failed('next',error); d.emit(); d.emit();
+    assert.equal(lines.length,1); assert.ok(Buffer.byteLength(lines[0]!)<=MAX_DIAGNOSTIC_BYTES);
+    assert.equal(lines[0]!.includes(poison),false);
+    const second:string[]=[]; const e=createQStashFailureDiagnostic(line=>second.push(line));
+    e.stage('jose_verification'); e.failed('current',error); e.failed('next',error); e.emit();
+    assert.equal(lines[0],second[0]);
+    assert.deepEqual(Object.keys(JSON.parse(lines[0]!)),['event','stage','current','next']);
+  }
+  let getters=0;
+  const evil=Object.defineProperties({toJSON(){throw Error(poison);}},Object.fromEntries(
+    ['code','claim','reason','message','stack','cause','payload'].map(k=>[k,{get(){getters++;throw Error(poison);}}])));
+  assert.deepEqual(projectQStashJoseFailure(evil),{category:'unknown',claim:null}); assert.equal(getters,0);
+});
+
+test('qstash diagnostics: real synthetic JWT outcomes/next-key fallback unchanged; claim and lifetime categories are precise', async () => {
+  const inspect = async (signature:string,body=QSTASH_TICK_BODY) => {
+    const lines:string[]=[];const diagnostic=createQStashFailureDiagnostic(line=>lines.push(line));
+    let code:string|null=null;
+    try { await verifyQStashTick({config:qstashConfig(QSTASH),signature,body:Buffer.from(body),now:start,diagnostic}); }
+    catch(error){code=(error as BridgeError).code;diagnostic.emit();diagnostic.emit();}
+    return {code,lines,event:lines.length?JSON.parse(lines[0]!):null};
+  };
+  for (const key of [CURRENT,NEXT]) assert.deepEqual((await inspect(await sign({at:start,key}))).lines,[]);
+  const subject=await inspect(await sign({at:start,claims:{sub:'https://other.example.test/api/cron'}}));
+  assert.equal(subject.code,'scheduler_signature_invalid'); assert.equal(subject.event.current.category,'subject_invalid');
+  assert.equal(subject.event.current.claim,'sub'); assert.equal(subject.event.next.category,'signature_mismatch');
+  const missing=await inspect(await sign({at:start,omit:['iat']}));
+  assert.equal(missing.event.current.category,'required_claim_missing'); assert.equal(missing.event.current.claim,'iat');
+  const future=await inspect(await sign({at:start,claims:{nbf:Math.floor(start/1000)+60}}));
+  assert.equal(future.event.current.category,'time_invalid'); assert.equal(future.event.current.claim,'nbf');
+  const expired=await inspect(await sign({at:start,claims:{exp:Math.floor(start/1000)-60}}));
+  assert.equal(expired.event.current.category,'expired');
+  const lifetime=await inspect(await sign({at:start,claims:{exp:Math.floor(start/1000)+901}}));
+  assert.equal(lifetime.code,'scheduler_signature_invalid'); assert.equal(lifetime.event.stage,'claim_bounds');
+  assert.deepEqual(lifetime.event.current,{category:'token_lifetime_exceeded',claim:'exp'});
+  const shape=await inspect('not-a-JWT'); assert.equal(shape.event.stage,'signature_shape');
+  const body=await inspect(await sign({at:start}),QSTASH_TICK_BODY+' ');
+  assert.equal(body.code,'scheduler_body_invalid'); assert.equal(body.event.stage,'body_validation');
+  assert.deepEqual(body.event.current,{category:'body_mismatch',claim:'body'});
+  for(const output of [subject,missing,future,expired,lifetime,shape,body]) {
+    assert.equal(output.lines.length,1);assert.ok(Buffer.byteLength(output.lines[0]!)<=512);
+    assert.equal(output.lines[0]!.includes(DEST),false);assert.equal(output.lines[0]!.includes(CURRENT),false);
+    assert.equal(output.lines[0]!.includes(NEXT),false);
+  }
+});
+
+test('qstash diagnostic route: unchanged HTTP rejection/body/headers, no pre-auth data access; logger failure is contained', async t => {
+  const lines:string[]=[];t.mock.method(console,'warn',(line:string)=>lines.push(line));
+  const f=await fixture(),before={connects:f.connects(),sends:f.sends.length,posts:f.posts.length};
+  const bad=await sign({at:start,key:OLD});
+  const response=await f.deliver({signature:bad});
+  assert.equal(response.status,489);assert.deepEqual(await response.json(),{error:'scheduler_signature_invalid'});
+  assert.equal(response.headers.get('upstash-nonretryable-error'),'true');
+  assert.equal(lines.length,1);assert.equal(JSON.parse(lines[0]!).current.category,'signature_mismatch');
+  assert.deepEqual({connects:f.connects(),sends:f.sends.length,posts:f.posts.length},before);
+  const poison='SYNTHETIC_UNTRUSTED_BODY_ERROR';
+  const broken=new ReadableStream<Uint8Array>({pull(){throw Error(poison);}});
+  const bodyFailure=await f.deliver({body:broken});
+  assert.equal(bodyFailure.status,489);assert.deepEqual(await bodyFailure.json(),{error:'scheduler_signature_invalid'});
+  assert.equal(lines.length,2);assert.equal(JSON.parse(lines[1]!).stage,'body_read');assert.equal(lines[1]!.includes(poison),false);
+  assert.deepEqual({connects:f.connects(),sends:f.sends.length,posts:f.posts.length},before);
+  const valid=await f.deliver();assert.equal(valid.status,200);assert.equal(lines.length,2,'accepted deliveries do not emit failure events');
+  t.mock.method(console,'warn',()=>{throw Error(poison);});
+  const ignored=await f.deliver({signature:bad});assert.equal(ignored.status,489);
+  assert.deepEqual(await ignored.json(),{error:'scheduler_signature_invalid'});
 });

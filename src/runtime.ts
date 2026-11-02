@@ -22,7 +22,7 @@ import { createTaskAccess } from './task-access.ts';
 import { wakeSyncRecipients, WAKE_SYNC_FLAG } from './sync.ts';
 import { attachmentConfig, createBlobProvider } from './blob.ts';
 import { createAttachments, admitAttachments, validRetentionPolicy } from './attachments.ts';
-import { qstashConfig, verifyQStashTick, boundedBody, tickSeen, recordTick } from './qstash.ts';
+import { qstashConfig, verifyQStashTick, boundedBody, tickSeen, recordTick, createQStashFailureDiagnostic } from './qstash.ts';
 import { timingSafeEqual } from 'node:crypto';
 import type { KeyResolver } from './policy.ts';
 import type { StorePool } from './store.ts';
@@ -346,10 +346,12 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
           if (request.method !== 'POST') return reply({ error: 'method_not_allowed' }, 405);
           const config = qstashConfig(env);
           if (!config.valid) return reply({ error: 'scheduler_not_configured' }, 503);
+          const diagnostic = createQStashFailureDiagnostic();
           try {
             const body = await boundedBody(request);
-            tick = await verifyQStashTick({ config, signature: request.headers.get('upstash-signature'), body, now: clock() });
+            tick = await verifyQStashTick({ config, signature: request.headers.get('upstash-signature'), body, now: clock(), diagnostic });
           } catch (error) {
+            diagnostic.emit();
             // A body that did not arrive in time is retryable; everything else is permanent.
             if (error instanceof BridgeError && error.code === 'scheduler_body_timeout') return reply({ error: error.code }, 408);
             return permanent(error instanceof BridgeError && error.status === 401 ? error.code : 'scheduler_signature_invalid');
