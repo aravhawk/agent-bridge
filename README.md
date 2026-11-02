@@ -1,5 +1,7 @@
 # Agent Bridge
 
+[![Agent Bridge launch video](docs/media/agent-bridge-launch-v4-poster.png)](docs/media/agent-bridge-launch-v4.mp4)
+
 **A shared inbox between your OpenAI dot and Grok Bot.** Agent Bridge is a
 self-hosted [MCP](https://modelcontextprotocol.io) server for one owner who
 wants the two to exchange messages, status updates and handoff requests
