@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { generateKeyPair, SignJWT } from 'jose';
+import { generateKeyPair, SignJWT, CompactSign } from 'jose';
 import { emptyState } from '../src/store.ts';
 import { SCOPES } from '../src/policy.ts';
 import { MESSAGE_PROTOCOL } from '../src/messages.ts';
@@ -109,6 +109,42 @@ test('qstash signature: current or next key; body, destination, algorithm, issue
   await refused(verify(good, { now: start + 6 * MINUTE }));
   // No configuration: refused as unconfigured.
   await refused(verify(good, { env: {} }), 'scheduler_not_configured');
+});
+
+test('qstash NumericDate: fractional seconds preserve time bounds and replay expiry', async () => {
+  const seconds = start / 1000;
+  for (const key of [CURRENT, NEXT]) {
+    for (const claims of [
+      { nbf: seconds - 0.25 },
+      { iat: seconds - 0.5, nbf: seconds - 0.25, exp: seconds + 299.75 },
+    ]) {
+      const signature = await sign({ at: start, key, claims });
+      const tick = await verify(signature);
+      assert.equal(tick.key, key);
+      assert.equal(tick.expiresAt, (claims.exp ?? seconds + 300) * 1000);
+      const state = emptyState(); recordTick(state, tick.jti, tick.expiresAt, start);
+      assert.equal(tickSeen(state, tick.jti, tick.expiresAt - 0.5), true);
+      assert.equal(tickSeen(state, tick.jti, tick.expiresAt), false);
+    }
+  }
+  // No truncation/rounding may admit a token across an existing time bound.
+  for (const claims of [
+    { iat: seconds + 5.25, nbf: seconds }, { nbf: seconds + 5.25 },
+    { iat: seconds, nbf: seconds - 5.25 }, { exp: seconds - 5.25 },
+    { exp: seconds }, { exp: seconds + 900.25 },
+  ]) await refused(verify(await sign({ at: start, claims })));
+  assert.ok(await verify(await sign({ at: start, claims: { exp: seconds + 900 } })));
+  for (const claim of ['iat', 'nbf', 'exp']) {
+    for (const value of [-0.25, '1', null, true, {}, [], NaN, Infinity, -Infinity, Number.MAX_VALUE,
+      Number.MAX_SAFE_INTEGER, Math.floor(Number.MAX_SAFE_INTEGER / 1000) + 1]) {
+      // CompactSign permits malformed claim types that SignJWT refuses to construct.
+      const payload = { iss: 'Upstash', sub: DEST, iat: seconds, nbf: seconds, exp: seconds + 300,
+        jti: 'invalid_numeric_date', body: bodyHash(QSTASH_TICK_BODY), [claim]: value };
+      const signature = await new CompactSign(Buffer.from(JSON.stringify(payload)))
+        .setProtectedHeader({ alg: 'HS256' }).sign(new TextEncoder().encode(CURRENT));
+      await refused(verify(signature));
+    }
+  }
 });
 
 // --- Runtime route ------------------------------------------------------------

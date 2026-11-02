@@ -107,7 +107,10 @@ export function qstashConfig(env: Readonly<Record<string, string | undefined>>):
 }
 
 const base64url = (bytes: Uint8Array) => Buffer.from(bytes).toString('base64url');
-const int = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
+// RFC 7519 NumericDate permits fractional seconds. Preserve them through
+// verification and replay expiry; bound conversion to finite safe-range millis.
+const numericDate = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) &&
+  value >= 0 && value <= Math.floor(Number.MAX_SAFE_INTEGER / 1000);
 
 // Verify one delivery. `body` is the raw request bytes (a Buffer). Returns
 // { key, jti, expiresAt } (key: the signing key that verified, to recheck
@@ -141,9 +144,9 @@ export async function verifyQStashTick({ config, signature, body, now, diagnosti
   diagnostic?.stage('claim_bounds');
   const bound: (claim: ClaimName, category?: 'claim_bounds_invalid' | 'time_invalid' | 'token_lifetime_exceeded') => never =
     (claim, category = 'claim_bounds_invalid') => { diagnostic?.bound(claim, category); return reject('scheduler_signature_invalid'); };
-  if (!int(iat)) bound('iat');
-  if (!int(nbf)) bound('nbf');
-  if (!int(exp)) bound('exp');
+  if (!numericDate(iat)) bound('iat');
+  if (!numericDate(nbf)) bound('nbf');
+  if (!numericDate(exp)) bound('exp');
   if (exp <= nbf) bound('exp', 'time_invalid');
   if (nbf < iat - CLOCK_TOLERANCE_S) bound('nbf', 'time_invalid');
   if (exp - iat > MAX_TOKEN_LIFETIME_S) bound('exp', 'token_lifetime_exceeded');
