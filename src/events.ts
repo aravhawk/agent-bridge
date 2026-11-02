@@ -229,12 +229,13 @@ function deliveryDestinations(state: BridgeState, envelope: Envelope, now: Milli
 }
 // Whether appendDeliveryJobs would find a destination now, without creating one.
 export const hasDeliveryDestination = (state: BridgeState, envelope: Envelope, now: Millis): boolean => deliveryDestinations(state, envelope, now).length > 0;
-export interface JobOptions { subscriptionId?: string | undefined; maxAttempts?: number | undefined }
-export function appendDeliveryJobs(state: BridgeState, envelope: Envelope, now: Millis, { subscriptionId, maxAttempts }: JobOptions = {}): string[] {
+export interface JobOptions { subscriptionId?: string | undefined; maxAttempts?: number | undefined; syncRecoveryGeneration?: number }
+export function appendDeliveryJobs(state: BridgeState, envelope: Envelope, now: Millis, { subscriptionId, maxAttempts, syncRecoveryGeneration }: JobOptions = {}): string[] {
   const destinations = deliveryDestinations(state, envelope, now, subscriptionId);
   const jobIds: string[] = [];
   for (const sub of destinations) {
-    const eventId = 'evt_' + digest(JSON.stringify([envelope.id, sub.id]));
+    const eventId = 'evt_' + digest(JSON.stringify(syncRecoveryGeneration === undefined ? [envelope.id, sub.id]
+      : [envelope.id, sub.id, 'sync_receipt_recovery', syncRecoveryGeneration]));
     const id = 'job_' + eventId.slice(4);
     if (!state.jobs[id]) {
       const event = envelope.to === EVENTS_PEER ? { eventId, name: EVENT_NAME, timestamp: new Date(now).toISOString(),
@@ -242,6 +243,7 @@ export function appendDeliveryJobs(state: BridgeState, envelope: Envelope, now: 
       state.jobs[id] = { id, messageId: envelope.id, recipient: envelope.to,
         subscriptionId: envelope.to === EVENTS_PEER ? sub.id : null, eventId,
         body: JSON.stringify(event), state: 'pending', attempts: 0, dueAt: now, leaseId: null, leaseUntil: null,
+        ...(syncRecoveryGeneration !== undefined ? { syncRecoveryGeneration } : {}),
         ...(maxAttempts ? { maxAttempts } : {}) };
     }
     jobIds.push(id);

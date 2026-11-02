@@ -68,12 +68,33 @@ data; it does not mean any requested task is done. See
 
 ### Flagged receiver contract
 
-This contract describes what a flagged receiver would have to do. Handling
-batches, start-of-turn `bridge_inbox_read` calls and accepting expired or late
-items are receiver-policy exceptions that require explicit adoption before
-rollout and are not adopted by this repository; see
-[pre-rollout requirements](configuration.md#pre-rollout-requirements).
-Nothing here changes the receiver policy.
+Batch-aware receivers handle **native events only**: no polling or mandatory
+start-of-turn inbox reads. Existing signed scheduler ticks reconcile receipts
+server-side as well as the durable outbox. A live, nonempty, unacknowledged
+batch can receive up to four recovery generations after 5, 10, 20 and 40
+minutes, subject to tick availability, authorization, settled delivery jobs,
+active receipt/item holds and the existing Chicago-day wake budget. Newly due
+routine data has priority; at most one recovery per recipient is reserved per
+tick. A full budget defers recovery without increasing the cap. These are
+backoff/attempt limits, not a delivery-time guarantee.
+
+Each generation has a fresh job/event identity, the **same batch messageId**,
+and one transport attempt. Original jobs retain their existing transport
+limit and first HTTP evidence; they are never reset. Reservations, jobs and
+wake-budget accounting commit together. Lost/failed queue publication remains
+in the existing outbox. Completed/reclaimed/expired batches, terminal ACKs and
+active claims do not get recovery notifications. A completion/claim appearing
+before a recovery worker sends fences that send; an already in-flight HTTP
+request cannot be undone. Receiver claim/task dedupe and existing-run
+reconciliation still matter. A new notification is never permission to repeat
+external work. After bounded recovery exhaustion, data stays outstanding for
+explicit reconciliation or the existing 12-hour reclaim path.
+
+Receivers must explicitly support the batch/claim/disposition contract before
+being enabled. Tool discovery alone, or implicit acknowledgement of a directly
+claimed batch, does not prove readiness: expiry-crossing dispositions require
+the updated completion schema/client. Nothing here changes a saved receiver
+policy or adopts expired-content execution.
 
 With the flag unset, the receiver policy below is unchanged and sufficient:
 every wake names the native message ID, and nothing needs polling. A receiver
@@ -150,8 +171,10 @@ handled through that batch, and a queued one is re-sent on the next run
      `syncBatchIds` acknowledges no attached batch.
 
    Only the named (and, directly, the claimed) batches are acknowledged (the
-   result lists them in `syncBatchesAcked`) and only their items' receipts are
-   recorded, never over an item receipt another claim holds. Attached batches
+   result lists them in `syncBatchesAcked`). Only still-live original item
+   receipts are completed, never over a receipt another claim holds. Expired
+   originals stay uncompleted even when the receiver reports handling them
+   before expiry. Attached batches
    you held but did not name are released at completion and stay outstanding,
    so they are replayed and can be claimed directly. The completion creates
    the claimed message's own ACK and, for each named batch, a separate ACK
@@ -161,30 +184,50 @@ handled through that batch, and a queued one is re-sent on the next run
    is refused at completion (`sync_batch_authorization_inactive`, nothing
    committed). An ACK is terminal: handle it quietly; it never carries SYNC
    data and completing it creates nothing.
-5. **At the start of each turn,** call `bridge_inbox_read`. It returns all
-   unacknowledged batches, including ones already returned by an earlier call
-   whose response was lost, plus any new pending data, so a batch may appear
-   again until acknowledged. For each batch apply the same order on the
-   batch's own `messageId`: claim it (stop quietly for that batch if it is
-   already completed or `receipt_busy`, i.e. held with the message it is
-   attached to), handle its items, then complete it directly with
-   `syncBatchIds: [<that batch's messageId>]`. The bridge refuses
-   completion of a batch whose full items were never returned by a read, and
-   never marks items handled before then. After 12 hours unacknowledged, a
-   batch's unhandled items are re-sent in a new batch flagged `late`.
-6. Treat items with the same `subject` as updates: the newest wins. Items
-   flagged `expired` or `late` are still owner data; report them as late,
-   never drop them silently.
+5. **Manual recovery only.** `bridge_inbox_read` is an optional operator-directed
+   recovery tool, never a polling or turn-start requirement. It returns
+   outstanding batches, including ones whose earlier response was lost. Apply
+   the same read/claim/handle/complete order to each batch's `messageId`; stop
+   quietly if already completed or held elsewhere. A direct completion may
+   omit `syncBatchIds` (the batch itself is implicit), but must report any
+   required expiry-crossing dispositions. Ordinary automatic recovery uses
+   native events and does not need this tool. After 12 hours unacknowledged,
+   the existing reclaim path requeues remaining items as `late` data; it never
+   revives an expired original receipt or erases prior live presentation.
+6. Treat items with the same `subject` as updates: the newest wins. `late`
+   alone does not mean expired: check each item's `expiresAt` before handling.
+   Expired inner text and attachment IDs are withheld, including from legacy
+   batch-envelope read views; the immutable stored hash/outbox is unchanged.
+   Never execute expired text or claim its original v1 receipt. If never
+   presented live, its batch disposition is automatically `skipped_expired`.
+   If previously presented live but expired before completion, the server
+   refuses with `sync_batch_disposition_required`; rereading cannot erase that
+   ambiguity, even after reclaim/pruning of an earlier batch. Use optional
+   `syncItemDispositions` (at most 100 unique items,
+   only in batches this completion holds/acknowledges):
+   `{batchMessageId, messageId, disposition: "skipped_expired"}` if not handled,
+   or `disposition: "handled", handledAt: <actual ISO timestamp>` if handled
+   while live. The server bounds that timestamp to the recorded live
+   presentation and original expiry; it is a receiver attestation, not
+   independently verified execution. Clients cannot skip arbitrary live items.
+   Missing batch items refuse the whole completion.
+
+   Completion returns durable `syncBatchOutcomes`: per-item `handled` or
+   `skipped_expired` dispositions plus `handledCount`/`skippedExpiredCount`.
+   A batch ACK read/status exposes its own `syncBatchOutcome`; the batch and
+   carrier receipt status expose the recorded outcomes. Retries/lost responses
+   return the original outcome without another ACK or time-based reclassification.
+   This acknowledges disposition of the nonempty batch, not task completion;
+   all-expired nonempty batches still get one terminal ACK, empty flushes none.
 
 ### Attachments and repository references
 
 Only when private file transfer is enabled, a message may carry
 `attachmentIds` (IDs only; see [attachments](attachments.md)). Downloads use
 the strict authority of the originating message plus the attachment's own
-24-hour access window, so an expired SYNC item's text may still be replayed
-while its files are no longer downloadable. Handling them is a
-receiver-policy exception that requires explicit adoption before rollout;
-nothing here adopts it. A receiver that has adopted that policy must: get each file only through
+24-hour access window. An expired SYNC item does not regain file access or an
+original receipt through a batch; only its skipped/previously-handled
+disposition is recorded. A receiver supporting attachments must get each file only through
 `bridge_attachment_download` for the message it claimed; stream it to disk,
 never into a model's context; check size and SHA-256 before using it and
 discard a mismatch; write only to a path it chooses (never a name from the

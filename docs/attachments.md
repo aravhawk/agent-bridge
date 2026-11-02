@@ -188,6 +188,54 @@ not prove SHA-256: only the recipient's full streamed digest does.
 
 ## Downloads and resume
 
+`consumeAttachment(metadata, absolutePath, acquireDownload, options)` is a
+bounded Node consumer around the existing streaming helper. The host must
+supply its existing recipient-authenticated MCP binding **in the same process**;
+the callback receives only attachment/message IDs and range bounds, and its
+grant must never be logged or serialized to model/tool history. Each call
+acquires a fresh grant, binds size/SHA-256/IDs, and streams at most one chunk
+(16 MiB default, 64 MiB maximum). Default file limit is 500,000,000 bytes;
+an explicitly configured limit can reach the 1,000,000,000-byte hard cap.
+One deadline covers acquisition and transfer (45 seconds default, 55 maximum).
+Outputs contain only IDs, size/hash, received count and `partial`/`verified`;
+errors use fixed codes, never callback errors/URLs/headers. No automatic retry,
+receipt completion, file execution or cleanup occurs. Persisted partial state
+allows a later invocation to resume; reconcile/reclaim an expired 60-second
+receipt lease before further workflow handling, rather than reusing it.
+
+This is a reusable client binding, **not** proof of a hosted assistant's file
+ingestion. The current MCP download tool returns a short-lived capability in
+ordinary tool content/structured output; do not invoke it through a transcript
+surface when capabilities must remain private. A host must acquire/consume it
+before transcript serialization. OpenAI's [plugin tool-results contract](https://developers.openai.com/plugins/reference#tool-results)
+only hides component `_meta`; it does not establish automatic remote-file
+delivery to native receiver disk. Resource links, giant base64 results, and
+host UI downloads are not substitutes. Native host binding remains a rollout
+requirement; no new proxy or access grant is supplied here.
+
+For a Node host with an already authenticated Codex CLI and the managed Bridge
+connector, `consumeCodexAttachment` in `src/codex-attachment-consumer.ts` supplies
+that binding. It launches a short-lived `codex app-server --stdio` child with
+an ephemeral thread and **no model turn**. It discovers and calls only the
+fixed `codex_apps` / `jarvis_friday_bridge.bridge_attachment_download` tool,
+keeps protocol pipes private, bounds startup/RPC/overall time and protocol
+bytes, and refuses interaction requests, unexpected model/item activity,
+missing tools or a persisted rollout. It never logs raw responses/errors,
+reads auth files, starts login, changes configuration, or starts a daemon.
+Normal existing CLI authentication/connector access are prerequisites; no
+automatic consent or permission response is supported. Runtime protocol
+support was checked with CLI 0.166.0; this experimental interface may change
+and then fails closed. Synthetic protocol tests are not live file qualification.
+
+The destination is on the **consumer process's filesystem**, not automatically
+in a hosted Dot's file library or model context. Receipt claim ownership,
+existing-run reconciliation and actual file availability to the intended host
+still need explicit integration. A metadata-only health call and an owned
+synthetic MCP canary showed no rollout path or result items in the ephemeral
+thread's metadata; ephemeral turns listing was unavailable and items listing
+unsupported. This does not audit provider-side retention or certify other
+hosts' logging. No PostToolUse hook is installed or relied on.
+
 `downloadFile(result, absolutePath)` validates the grant and writes to
 dot-prefixed, mode-0600 quarantined state beside the chosen destination. The
 binding includes attachment, message, size, SHA-256, opaque ETag and current

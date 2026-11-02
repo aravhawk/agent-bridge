@@ -44,6 +44,13 @@ export interface DownloadGrant {
   attachmentId: string; messageId: string; size: number; sha256: string;
   download?: { method: string; url: string; headers: Record<string, string | null | undefined>; expiresAt: string; range?: { start: number; end: number } | undefined };
 }
+/** Non-secret identity from the referencing message and finalized metadata. */
+export interface AttachmentRequest { attachmentId: string; messageId: string; size: number; sha256: string }
+export interface DownloadRequest { attachmentId: string; messageId: string; rangeStart?: number; rangeEnd?: number }
+/** Host-owned authenticated MCP binding. It must not log/serialize the returned capability. */
+export type AcquireDownload = (request: DownloadRequest, options: { signal: AbortSignal }) => Promise<DownloadGrant>;
+export interface ConsumerOptions extends TransferOptions { chunkBytes?: number; maxBytes?: number }
+export interface ConsumerResult extends AttachmentRequest { disposition: 'partial' | 'verified'; received: number }
 /** What partial download bytes belong to (the .part.json file). */
 export interface PartialBinding { v: number; attachmentId: string; messageId: string; size: number; sha256: string; etag?: string }
 export interface PartialPaths { data: string; meta: string }
@@ -508,6 +515,55 @@ export async function downloadFile(download: DownloadGrant | null | undefined, d
     }
     if (error instanceof AttachmentClientError) throw error;
     fail('transfer_failed');
+  }
+}
+
+// One bounded recipient-side step. The host supplies its EXISTING authenticated
+// binding and a caller-chosen quarantine path; no URL, token, remote filename or
+// file bytes cross this interface. Acquisition and streaming share one deadline.
+// This deliberately neither claims nor completes a receipt: transport integrity
+// and workflow handling are distinct. After a lost lease the host must reconcile
+// its existing run / acquire a fresh claim before continuing workflow handling.
+export async function consumeAttachment(request: AttachmentRequest, destinationPath: string, acquire: AcquireDownload,
+  options: ConsumerOptions = {}): Promise<ConsumerResult> {
+  const { chunkBytes = 16 * MIB, maxBytes = 500000000, timeoutMs = 45000, now = Date.now } = options;
+  // Validate before filesystem access or authenticated grant acquisition.
+  expectation(request);
+  if (!validSize(maxBytes) || request.size > maxBytes) fail('consumer_size_limit');
+  if (!Number.isSafeInteger(chunkBytes) || chunkBytes < 16 * MIB || chunkBytes > 64 * MIB) fail('invalid_chunk_size');
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 55000) fail('invalid_timeout');
+  if (typeof acquire !== 'function') fail('grant_unavailable');
+  const signal = deadline({ signal: options.signal, timeoutMs });
+  try {
+    if (signal.aborted) fail(abortCode(signal));
+    const offset = await bounded(() => resumeOffset(destinationPath, request), signal);
+    if (signal.aborted) fail(abortCode(signal));
+    const end = Math.min(offset + chunkBytes, request.size) - 1;
+    const ranged = offset < request.size && (offset > 0 || end < request.size - 1);
+    // An already-complete partial needs a fresh whole-object binding for local
+    // verification only. downloadFile sends no GET in that recovery case.
+    const args: DownloadRequest = { attachmentId: request.attachmentId, messageId: request.messageId,
+      ...(ranged ? { rangeStart: offset, rangeEnd: end } : {}) };
+    let grant: DownloadGrant;
+    try { grant = await bounded(() => acquire(args, { signal }), signal); }
+    catch { fail(signal.aborted ? abortCode(signal) : 'grant_unavailable'); }
+    if (signal.aborted) fail(abortCode(signal));
+    // Both the authenticated response and the partial must bind to the exact
+    // referencing message / attachment, not merely another valid capability.
+    if (grant.attachmentId !== request.attachmentId || grant.messageId !== request.messageId ||
+      grant.size !== request.size || grant.sha256 !== request.sha256) fail('grant_binding_mismatch');
+    const checked = checkDownloadGrant(grant);
+    if (checked.ranged !== ranged || checked.start !== (ranged ? offset : 0) || checked.end !== (ranged ? end : request.size - 1)) fail('range_mismatch');
+    const result = await downloadFile(grant, destinationPath, { ...options, now, signal, timeoutMs });
+    return { attachmentId: request.attachmentId, messageId: request.messageId, size: request.size, sha256: request.sha256,
+      disposition: result.complete ? 'verified' : 'partial', received: result.complete ? request.size : result.received! };
+  } catch (error) {
+    // A host callback/fetch implementation can throw an Error containing a URL,
+    // response body or token. Expose only this static, capability-free vocabulary.
+    const safe = ['grant_unavailable', 'grant_binding_mismatch', 'invalid_grant', 'range_mismatch', 'partial_mismatch',
+      'destination_exists', 'sha256_mismatch', 'object_changed', 'size_mismatch', 'content_range_mismatch',
+      'unexpected_content_encoding', 'transfer_incomplete', 'grant_expired', 'transfer_timeout', 'transfer_aborted'];
+    fail(error instanceof AttachmentClientError && safe.includes(error.code) ? error.code : 'transfer_failed');
   }
 }
 

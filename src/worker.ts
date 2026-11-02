@@ -3,6 +3,7 @@ import { BridgeError, DELIVERY_TRANSPORT_OUTCOME } from './policy.ts';
 import { subscriptionAccessAllowed, messageAccessAllowed, testEnvelopeAllowed } from './access.ts';
 import { signedHeaders } from './webhook.ts';
 import { EVENTS_PEER, PEER_IDS, peerCode } from './config.ts';
+import { syncReceiptRecoveryAllowed } from './sync.ts';
 import type { DenialView } from './access.ts';
 import type { Protector, TransportRequest } from './webhook.ts';
 import type { WebhookSend } from './webhook-sender.ts';
@@ -84,6 +85,9 @@ export class DeliveryWorker {
         job.state = 'dead'; job.lastError = 'subscription_inactive'; return null;
       }
       const message = state.messages[job.messageId];
+      if (job.syncRecoveryGeneration !== undefined && !syncReceiptRecoveryAllowed(state, message, this.clock())) {
+        job.state = 'dead'; job.lastError = 'sync_batch_receipt_inactive'; return null;
+      }
       if (this.clock() >= this.deliveryUntil || !this.messageAllowed(state, message, this.clock()) ||
           message.envelope.to !== job.recipient || !message.jobIds.includes(jobId)) {
         job.state = 'dead'; job.lastError = 'message_authorization_inactive'; return null;
@@ -112,6 +116,7 @@ export class DeliveryWorker {
           if (activeJob?.leaseId !== job.leaseId || activeJob!.state !== 'leased' || (activeJob!.leaseUntil as Millis) <= this.clock() ||
               this.outOfScope(state, activeJob!) ||
               this.clock() >= this.deliveryUntil || !this.messageAllowed(state, message, this.clock()) ||
+              (activeJob!.syncRecoveryGeneration !== undefined && !syncReceiptRecoveryAllowed(state, message, this.clock())) ||
               message!.envelope.to !== activeJob!.recipient || !message!.jobIds.includes(jobId) ||
               (subscription && (activeJob!.recipient !== activeSub?.recipient ||
                 !subscriptionAccessAllowed(state, activeSub, this.policyId, this.clock())))) return null;
@@ -171,6 +176,7 @@ export class DeliveryWorker {
           !subscriptionAccessAllowed(state, sub, this.policyId, this.clock()))) { accepted = false; retry = false; code = 'subscription_inactive'; }
       const message = state.messages[job.messageId];
       if (this.clock() >= this.deliveryUntil || !this.messageAllowed(state, message, this.clock()) ||
+          (activeJob.syncRecoveryGeneration !== undefined && !syncReceiptRecoveryAllowed(state, message, this.clock())) ||
           message.envelope.to !== activeJob.recipient || !message.jobIds.includes(jobId) || this.outOfScope(state, activeJob)) {
         accepted = false; retry = false; code = 'message_authorization_inactive';
       }
@@ -233,7 +239,10 @@ export async function reofferOverdueJobs(store: Store, enqueueJob: EnqueueJob, n
   { pendingGraceMs = 0, limit = 100 }: { pendingGraceMs?: number; limit?: number } = {}): Promise<{ scheduled: number; failed: number; deferred: number }> {
   if (typeof enqueueJob !== 'function') throw new BridgeError('queue_configuration_required', 503);
   const { picked, eligible } = await store.transaction(state => {
-    const due = Object.values(state.jobs).filter(job => (job.state === 'pending' && job.dueAt <= now - pendingGraceMs) ||
+    // Receipt-recovery jobs were already reserved with their conservative
+    // backoff; a lost initial enqueue must not add the ordinary grace again.
+    const due = Object.values(state.jobs).filter(job => (job.state === 'pending' &&
+      job.dueAt <= now - (job.syncRecoveryGeneration !== undefined ? 0 : pendingGraceMs)) ||
       (job.state === 'leased' && (job.leaseUntil as Millis) <= now));
     due.sort((a, b) => (a.reofferedAt ?? 0) - (b.reofferedAt ?? 0) || jobPriority(state, a) - jobPriority(state, b) ||
       a.dueAt - b.dueAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));

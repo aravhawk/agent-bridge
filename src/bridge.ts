@@ -7,15 +7,15 @@ import { diagnosticReadCandidate, diagnosticReadStatus, observeDiagnosticRead,
   canaryReadCandidate, canaryReadStatus, observeCanaryRead } from './observability.ts';
 import { canaryEnvelope, reserveCanary, canaryReceipt } from './canary.ts';
 import { EVENTS_PEER, NAMES } from './config.ts';
-import { classify, enqueueSync, supersedeBySubject, cutBatch, presentBatch, ackBatch, outstandingBatches, flushDue, markDispatched,
+import { classify, enqueueSync, supersedeBySubject, cutBatch, presentBatch, batchEnvelopeView, ackBatch, batchOutcome, outstandingBatches, flushDue, markDispatched,
   reconcileSync, syncItemClaimRedirect, batchItemsBusy, stampAdmission, attachRoom, MAX_SYNC_BATCH_IDS } from './sync.ts';
 import type { BridgeErrorDetails } from './policy.ts';
 import type { ActiveSubscription } from './access.ts';
 import type { JobOptions } from './events.ts';
 import type { CanaryConfig } from './canary.ts';
-import type { FlushResult, SyncClassification } from './sync.ts';
+import type { FlushResult, SyncClassification, SyncItemDisposition } from './sync.ts';
 import type { BridgeState, CanaryReservation, Envelope, FirstTransportOutcome, JobState, MessageAuthorization, Millis, PolicyIds, Principal,
-  Role, Store, StoredMessage } from './types.ts';
+  Role, Store, StoredMessage, SyncBatchOutcome } from './types.ts';
 
 /** Message tool input as read before validation: optional-chained reads only (any value is safe there). */
 type MessageInput = { readonly kind?: unknown; readonly id?: string | { toLowerCase?: () => string };
@@ -32,6 +32,7 @@ export interface SendResult {
 }
 export interface ReadResult {
   envelope: Envelope; authority?: string; expired?: boolean; receivedAt: string; syncBatches?: BatchPresentation[];
+  syncBatchOutcome?: SyncBatchOutcome;
 }
 /** A claim (claimId, leaseUntil and held batches) or the recorded completion of a replay. */
 export interface ClaimResult {
@@ -51,11 +52,14 @@ export interface StatusResult {
   batchAckMessageId?: string | null; evidenceStatus?: string; wakeVerified?: boolean; canary?: unknown;
   messageStored?: boolean; readObservations?: Record<string, unknown>[]; sync?: SyncStatusView['sync']; syncBatch?: SyncStatusView['syncBatch'];
   piggybackedBatchIds?: string[];
+  syncBatchOutcome?: SyncBatchOutcome;
+  syncBatchOutcomes?: SyncBatchOutcome[];
 }
 export interface BatchAck { batchMessageId: string; ackMessageId: string | null }
 export interface CompleteResult {
   completed: boolean; duplicate: boolean; ackMessageId: string | null | undefined; jobIds?: string[]; evidenceStatus: string;
   syncBatchesAcked?: string[]; syncBatchAcks?: BatchAck[];
+  syncBatchOutcomes?: SyncBatchOutcome[];
 }
 export type AttachmentAdmission = (state: BridgeState, envelope: Envelope, principal: Principal, now: Millis) => void;
 export interface BridgeOptions {
@@ -218,6 +222,7 @@ function syncStatus(message: StoredMessage) {
     ...(s.redeliveries ? { redeliveries: s.redeliveries } : {}), ...(s.supersededBy ? { supersededBy: s.supersededBy } : {}) } } : {}),
     ...(b ? { syncBatch: { reason: b.reason, ...(b.trigger ? { trigger: b.trigger } : {}), itemCount: b.itemIds.length,
       presented: !!b.presentedAt, acknowledged: !!b.ackedAt, reclaimed: !!b.reclaimedAt,
+      ...(b.recovery ? { recovery: { generation: b.recovery.generation, nextAt: new Date(b.recovery.nextAt).toISOString() } } : {}),
       ...(b.rehomedTo ? { rehomedTo: b.rehomedTo } : {}) } } : {}),
     ...(message.syncBatchIds ? { piggybackedBatchIds: [...message.syncBatchIds] } : {}) };
 }
@@ -373,9 +378,10 @@ export class Bridge {
       canary = canaryReadCandidate(state, principal, params.messageId, now);
       const message = incoming(state, principal, params.messageId, this.probeMessageId, this.probeSender);
       const syncBatches = this.syncBatches(state, message, principal.role, now);
-      return { envelope: message.envelope, ...(dailyMessage(message.envelope) ? { authority: 'peer_data_requires_user_workflow',
+      return { envelope: batchEnvelopeView(message), ...(dailyMessage(message.envelope) ? { authority: 'peer_data_requires_user_workflow',
         expired: Date.parse(message.envelope.expiresAt) <= this.clock() } : {}), receivedAt: new Date(message.storedAt).toISOString(),
-        ...(syncBatches.length ? { syncBatches } : {}) };
+        ...(syncBatches.length ? { syncBatches } : {}),
+        ...(message.syncBatchOutcome ? { syncBatchOutcome: structuredClone(message.syncBatchOutcome) } : {}) };
     }); } catch (error) {
       if (candidate) await observeDiagnosticRead({ store: this.store, principal, messageId: params.messageId as string, error, failed: true, clock: this.clock });
       if (canary) await observeCanaryRead({ store: this.store, principal, messageId: params.messageId as string, error, failed: true, clock: this.clock });
@@ -471,7 +477,7 @@ export class Bridge {
   // and ran its own workflow on it). It is not completion of any task the data
   // asks for, and the hosted IDs are not independent host verification.
   async complete(principal: Principal, params: unknown): Promise<CompleteResult> {
-    ownKeys(params, ['messageId', 'claimId', 'hostedEventId', 'hostedTurnId', 'syncBatchIds'],
+    ownKeys(params, ['messageId', 'claimId', 'hostedEventId', 'hostedTurnId', 'syncBatchIds', 'syncItemDispositions'],
       ['messageId', 'claimId', 'hostedEventId', 'hostedTurnId']);
     // Optional: the batch IDs this receiver saw with the message (from its own
     // read) and has handled. Only these are acknowledged; omitted means none.
@@ -479,6 +485,18 @@ export class Bridge {
     const ackIds = (params.syncBatchIds ?? []) as string[];
     if (!Array.isArray(ackIds) || ackIds.length > MAX_SYNC_BATCH_IDS || new Set(ackIds).size !== ackIds.length ||
         ackIds.some(id => typeof id !== 'string' || !uuid.test(id))) fail('invalid_params');
+    const rawDispositions = params.syncItemDispositions === undefined ? [] : params.syncItemDispositions;
+    if (!Array.isArray(rawDispositions) || rawDispositions.length > 100) fail('invalid_params');
+    for (const item of rawDispositions) {
+      ownKeys(item, ['batchMessageId', 'messageId', 'disposition', 'handledAt'], ['batchMessageId', 'messageId', 'disposition']);
+      if (typeof item.batchMessageId !== 'string' || !uuid.test(item.batchMessageId) || typeof item.messageId !== 'string' || !uuid.test(item.messageId) ||
+        !['handled', 'skipped_expired'].includes(item.disposition as string)) fail('invalid_params');
+      if (item.disposition === 'handled' ? typeof item.handledAt !== 'string' || !Number.isFinite(Date.parse(item.handledAt)) ||
+        new Date(item.handledAt).toISOString() !== item.handledAt : item.handledAt !== undefined) fail('invalid_params');
+    }
+    // The bounded structural checks above narrow this untrusted optional input.
+    const itemDispositions = rawDispositions as SyncItemDisposition[];
+    if (new Set(itemDispositions.map(i => i.batchMessageId + ':' + i.messageId)).size !== itemDispositions.length) fail('invalid_params');
     for (const field of ['hostedEventId', 'hostedTurnId']) {
       if (params[field] !== null && (typeof params[field] !== 'string' || !/^[A-Za-z0-9_.:-]{1,160}$/.test(params[field] as string))) {
         fail('invalid_receipt_evidence');
@@ -516,6 +534,7 @@ export class Bridge {
       // A retry after a lost response returns what was recorded: no new ACK.
       if (receipt.state === 'complete') return { completed: true, duplicate: true,
         ackMessageId: receipt.ackMessageId, evidenceStatus: 'reported_requires_independent_host_confirmation',
+        ...(receipt.syncBatchOutcomes ? { syncBatchOutcomes: structuredClone(receipt.syncBatchOutcomes) } : {}),
         ...(receipt.syncBatchAcks?.length ? { syncBatchesAcked: receipt.syncBatchAcks.map(a => a.batchMessageId),
           syncBatchAcks: receipt.syncBatchAcks.map(a => ({ ...a })) } : {}) };
       if (!messageAccessAllowed(state, message, this.messagePolicyIds, now)) fail('message_authorization_inactive', 403);
@@ -538,6 +557,11 @@ export class Bridge {
           conflict('sync_batch_authorization_inactive', { batchMessageId: id });
         }
       }
+      const handledBatches = [...new Set([...(ownBatch ? [ownBatch] : []), ...ackIds])];
+      if (itemDispositions.some(i => !handledBatches.includes(i.batchMessageId))) fail('invalid_sync_item_disposition', 409);
+      // Validate every disposition/missing item before any completion or ACK is
+      // written, including batches whose items crossed expiry during this lease.
+      for (const id of handledBatches) batchOutcome(state, id, now, itemDispositions);
       // A batch is never finalized with an item still under another live claim:
       // refuse the whole completion before anything changes.
       const busyItems = [...new Set(([ownBatch, ...ackIds].filter(Boolean) as string[])
@@ -564,7 +588,7 @@ export class Bridge {
       // message's), then releases its other holds so they can be claimed
       // directly.
       // claimId equals this receipt's claim (checked above).
-      const evidence = { hostedEventId: params.hostedEventId, hostedTurnId: params.hostedTurnId, claimId: params.claimId as string };
+      const evidence = { hostedEventId: params.hostedEventId, hostedTurnId: params.hostedTurnId, claimId: params.claimId as string, itemDispositions };
       const syncBatchAcks: { batchMessageId: string; ackMessageId: string | null }[] = [];
       if (ownBatch) ackBatch(state, ownBatch, principal, now, evidence, () => ackMessageId);
       for (const id of ackIds) {
@@ -582,8 +606,11 @@ export class Bridge {
         if (state.receipts[id]?.state === 'claimed' && state.receipts[id].claimId === params.claimId) delete state.receipts[id];
       }
       const acked = [...(ownBatch && message.syncBatch!.ackedAt === now ? [ownBatch] : []), ...syncBatchAcks.map(a => a.batchMessageId)];
+      const outcomes = acked.flatMap(id => state.messages[id]?.syncBatch?.outcome ? [structuredClone(state.messages[id]!.syncBatch!.outcome!)] : []);
+      if (outcomes.length) state.receipts[params.messageId as string]!.syncBatchOutcomes = outcomes;
       return { completed: true, duplicate: false, ackMessageId, jobIds,
         evidenceStatus: 'reported_requires_independent_host_confirmation',
+        ...(outcomes.length ? { syncBatchOutcomes: structuredClone(outcomes) } : {}),
         ...(acked.length ? { syncBatchesAcked: acked } : {}), ...(syncBatchAcks.length ? { syncBatchAcks } : {}) };
     });
   }
@@ -610,6 +637,8 @@ export class Bridge {
         // A SYNC item has no ACK of its own; its batch's ACK covers it.
         ...(receipt?.batchAckMessageId ? { batchAckMessageId: receipt.batchAckMessageId } : {}),
         evidenceStatus: receipt?.evidenceStatus || 'no_hosted_receipt', wakeVerified: false, ...(canary ? { canary } : {}),
+        ...(receipt?.syncBatchOutcomes ? { syncBatchOutcomes: structuredClone(receipt.syncBatchOutcomes) } : {}),
+        ...(message.syncBatchOutcome ? { syncBatchOutcome: structuredClone(message.syncBatchOutcome) } : {}),
         ...syncStatus(message) };
     });
   }

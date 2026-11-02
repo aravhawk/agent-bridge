@@ -129,6 +129,14 @@ export interface SyncInfo {
   orderUnknown?: boolean;
   /** Re-queued after a rollback native send could no longer deliver; never sent natively again. */
   nativeFailed?: boolean;
+  /** Earliest live presentation, preserved when an unacknowledged batch is reclaimed. */
+  livePresentedAt?: Millis;
+}
+export interface SyncBatchOutcome {
+  batchMessageId: string;
+  items: { messageId: string; disposition: 'handled' | 'skipped_expired'; handledAt?: string }[];
+  handledCount: number;
+  skippedExpiredCount: number;
 }
 export interface SyncBatch {
   recipient: Role;
@@ -142,6 +150,11 @@ export interface SyncBatch {
   reclaimedAt?: Millis;
   rehomedTo?: string;
   rehomedAt?: Millis;
+  outcome?: SyncBatchOutcome;
+  /** First live presentation, retained across later reads to detect ambiguous expiry. */
+  livePresentedAt?: Record<string, Millis>;
+  /** Receipt-aware native-event generations, reserved under the state lock. */
+  recovery?: { generation: number; reservedAt: Millis; nextAt: Millis };
 }
 export interface StoredMessage {
   envelope: Envelope;
@@ -153,6 +166,8 @@ export interface StoredMessage {
   sync?: SyncInfo;
   syncBatch?: SyncBatch;
   syncBatchIds?: string[];
+  /** Server-derived batch disposition; ACK envelope/hash/wire shape stay unchanged. */
+  syncBatchOutcome?: SyncBatchOutcome;
   admission?: number;
   /** Durable admission sequence (sync.ts stampAdmission). */
   syncSeq?: number;
@@ -175,6 +190,7 @@ export interface Receipt {
   evidenceStatus?: string;
   /** The named batches a message completion acknowledged, each with its own ACK. */
   syncBatchAcks?: { batchMessageId: string; ackMessageId: string | null }[];
+  syncBatchOutcomes?: SyncBatchOutcome[];
 }
 export type JobState = 'pending' | 'leased' | 'accepted' | 'dead' | 'failed';
 export interface Job {
@@ -183,6 +199,8 @@ export interface Job {
   recipient: Role;
   subscriptionId: string | null;
   eventId: string;
+  /** Additive native-event identity; never rewrites an original delivery job. */
+  syncRecoveryGeneration?: number;
   body: string;
   state: JobState;
   attempts: number;

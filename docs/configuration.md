@@ -479,15 +479,18 @@ The implementation does not settle the following. Resolve them before setting
   still delays delivery, so it is not a proven guarantee. The schedule is
   a separately configured operator action (see [scheduler](scheduler.md)). The
   30-minute slack in SYNC promotion only covers modest lateness.
-- **Receiver policy exceptions are required and not adopted here.** The
-  [flagged receiver contract](inbox-policy.md#flagged-receiver-contract)
-  needs the receiver to (1) handle SYNC batches and their items, (2) call
-  `bridge_inbox_read` at the start of a turn, which departs from the current
-  no-polling rule, and (3) accept and report expired or `late` items, which
-  departs from the current rule to reject expired content. Each needs an
-  explicit operator policy decision before rollout. This
-  documentation describes the contract; it does not adopt those exceptions or
-  change any receiver policy.
+- **Batch-aware receiver adoption is required.** Verify the
+  [flagged receiver contract](inbox-policy.md#flagged-receiver-contract): exact
+  native-event reads, claim-held batches only, truthful completion/dispositions
+  and immediate terminal ACKs. No model polling or all-turn inbox reads are
+  required; `bridge_inbox_read` is optional manual recovery. The signed
+  scheduler's bounded receipt-aware notifications cover live unacknowledged
+  batches (including accepted HTTP delivery without a receipt), subject to
+  existing authorization, claims, retry and daily-wake budgets. Recovery spends
+  the same day slots as routine batch wakes; a full budget defers it. Expired
+  original messages are never executed or completed through a batch. A saved
+  receiver must support the updated contract/schema before rollout; this
+  documentation does not mutate it.
 
 ### Rollout and rollback
 

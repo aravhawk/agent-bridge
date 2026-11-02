@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, truncateSync, openSync, writeSync, closeSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, truncateSync, openSync, writeSync, closeSync, chmodSync, promises as fs } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { generateKeyPair, SignJWT } from 'jose';
@@ -18,8 +18,10 @@ import { attachmentConfig, createBlobProvider, checkUploadUrl, uploadHeaders } f
 import { createAttachments, admitAttachments, MAX_ATTACHMENT_BYTES, DEFAULT_MAX_ATTACHMENT_BYTES, MAX_LIVE_PER_SENDER, CLEANUP_PER_RUN,
   ATTACHMENT_TTL_MS, UPLOAD_WINDOW_MS, DELETE_RECHECK_MS, TOMBSTONE_MS, RATE_PER_MINUTE, MAX_RESERVED_BYTES,
   MAX_GET_URLS, MIN_RANGE_BYTES, DOWNLOAD_RATE_PER_MINUTE, validRetentionPolicy } from '../src/attachments.ts';
-import { describeFile, uploadFile, downloadFile, hashStream, writeFully, resumeOffset, discardPartial, partialPaths,
+import { describeFile, uploadFile, downloadFile, consumeAttachment, hashStream, writeFully, resumeOffset, discardPartial, partialPaths,
   MAX_TRANSFER_MS } from '../src/attachment-client.ts';
+import { consumeCodexAttachment } from '../src/codex-attachment-consumer.ts';
+import type { TestContext } from 'node:test';
 import { gzipSync } from 'node:zlib';
 import { Readable } from 'node:stream';
 import { createFakeBlob } from './fixtures/fake-blob.ts';
@@ -1154,4 +1156,167 @@ test('complete partial: wrong bytes are never published; binding, expiry and des
   assert.equal(existsSync(dest), false);
   assert.deepEqual(readdirSync(dir), []);
   assert.equal(await resumeOffset(dest, fresh), 0);
+});
+
+// Local host binding only: real grant admission + existing streaming helper,
+// synthetic provider HTTP. No native host integration or live Blob is implied.
+test('consumer: two fresh in-process grants stream 32 MiB to verified disk; output/checkpoint contain no capability', async () => {
+  const f = await fixture(), bytes = randomBytes(32 * 1024 * 1024), { a, m, grant } = await sentAttachment(f, bytes);
+  const dest = path.join(tmp(), 'verified.bin'), requests: object[] = [];
+  const request = { attachmentId: a.attachmentId, messageId: m.id, size: a.size, sha256: a.sha256 };
+  const acquire = async (args: { rangeStart?: number; rangeEnd?: number }, { signal }: { signal: AbortSignal }) => {
+    assert.equal(signal.aborted, false); requests.push(args); return grant(args);
+  };
+  const first = await consumeAttachment(request, dest, acquire, { fetchImpl: f.r2.fetch, now: f.clock });
+  assert.deepEqual(first, { ...request, disposition: 'partial', received: 16 * 1024 * 1024 });
+  assert.equal(existsSync(dest), false);
+  const persisted = readFileSync(partialPaths(dest, a.attachmentId).meta, 'utf8');
+  assert.equal(/https:|signature|token|url/i.test(persisted), false);
+  const second = await consumeAttachment(request, dest, acquire, { fetchImpl: f.r2.fetch, now: f.clock });
+  assert.deepEqual(second, { ...request, disposition: 'verified', received: bytes.length });
+  assert.deepEqual(readFileSync(dest), bytes);
+  assert.deepEqual(requests, [{ attachmentId: a.attachmentId, messageId: m.id, rangeStart: 0, rangeEnd: 16777215 },
+    { attachmentId: a.attachmentId, messageId: m.id, rangeStart: 16777216, rangeEnd: 33554431 }]);
+  assert.equal(/https:|signature|token|headers/i.test(JSON.stringify([first, second, requests])), false);
+  assert.equal(f.snapshot().receipts[m.id], undefined, 'verified transport never claims workflow handling or creates an ACK');
+});
+
+test('consumer: interrupted bytes resume via fresh authorized grant; another message cannot reuse the partial', async () => {
+  const f = await fixture(), bytes = randomBytes(200000), { a, m, grant } = await sentAttachment(f, bytes);
+  const dest = path.join(tmp(), 'verified.bin'), request = { attachmentId: a.attachmentId, messageId: m.id, size: a.size, sha256: a.sha256 };
+  await assert.rejects(consumeAttachment(request, dest, () => grant(), { now: f.clock, fetchImpl: async () =>
+    new Response(dropAfter(bytes, 1234), { headers: { etag: (await grant()).download.headers['if-match']! } }) }), /transfer_failed/);
+  let calls = 0;
+  await assert.rejects(consumeAttachment({ ...request, messageId: randomUUID() }, dest, async () => { calls++; return grant(); }), /partial_mismatch/);
+  assert.equal(calls, 0);
+  const resumed = await consumeAttachment(request, dest, async args => { assert.equal(args.rangeStart, 1234); return grant(args); },
+    { now: f.clock, fetchImpl: f.r2.fetch });
+  assert.equal(resumed.disposition, 'verified'); assert.deepEqual(readFileSync(dest), bytes);
+});
+
+test('consumer: rejects mismatched authenticated metadata before GET and sanitizes callback failures', async () => {
+  const f = await fixture(), { a, m, grant } = await sentAttachment(f, Buffer.from('small fixture'));
+  const dest = path.join(tmp(), 'verified.bin'), request = { attachmentId: a.attachmentId, messageId: m.id, size: a.size, sha256: a.sha256 };
+  let gets = 0;
+  for (const mismatch of [{ messageId: randomUUID() }, { attachmentId: randomUUID() }, { size: a.size + 1 }, { sha256: 'a'.repeat(64) }]) {
+    await assert.rejects(consumeAttachment(request, dest, async () => ({ ...await grant(), ...mismatch }), {
+      now: f.clock, fetchImpl: async () => { gets++; throw Error('must not send'); } }), /grant_binding_mismatch/);
+  }
+  assert.equal(gets, 0); assert.equal(existsSync(dest), false);
+  await assert.rejects(consumeAttachment(request, dest, async () => { throw Error('https://secret.invalid/?token=PRIVATE'); }),
+    e => e instanceof Error && e.message === 'grant_unavailable' && !String(e.stack).includes('PRIVATE'));
+});
+
+test('consumer: size/time budgets and cancellation cover grant acquisition before any download', async () => {
+  const f = await fixture(), { a, m } = await sentAttachment(f, Buffer.from('x'));
+  const request = { attachmentId: a.attachmentId, messageId: m.id, size: a.size, sha256: a.sha256 }, dest = path.join(tmp(), 'out');
+  let calls = 0;
+  const acquire = async (): Promise<never> => { calls++; throw Error('must not acquire'); };
+  await assert.rejects(consumeAttachment({ ...request, size: 500000001 }, dest, acquire), /consumer_size_limit/);
+  await assert.rejects(consumeAttachment(request, dest, acquire, { timeoutMs: 60000 }), /invalid_timeout/);
+  await assert.rejects(consumeAttachment(request, dest, acquire, { chunkBytes: 1024 }), /invalid_chunk_size/);
+  await assert.rejects(consumeAttachment(request, dest, acquire, { signal: AbortSignal.abort() }), /transfer_aborted/);
+  assert.equal(calls, 0);
+  const abort = new AbortController();
+  const pending = consumeAttachment(request, dest, (_args, { signal }) => {
+    assert.equal(signal.aborted, false); return new Promise(() => {});
+  }, { signal: abort.signal });
+  const timer = setTimeout(() => abort.abort(), 20);
+  try { await assert.rejects(pending, /transfer_aborted/); } finally { clearTimeout(timer); }
+  assert.equal(existsSync(dest), false);
+});
+
+test('consumer: a blocked filesystem preflight is bounded; a late result never starts grant acquisition', async t => {
+  const f = await fixture(), { a, m } = await sentAttachment(f, Buffer.from('preflight'));
+  const request = { attachmentId: a.attachmentId, messageId: m.id, size: a.size, sha256: a.sha256 };
+  const dir = tmp(), dest = path.join(dir, 'out'), original = fs.lstat;
+  let release!: () => void, entered!: () => void, calls = 0;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  // Test-only replacement of the existing fs API, not a production injection hook.
+  const mock = t.mock.method(fs, 'lstat', async () => { entered(); await blocked; return original(dir); });
+  const abort = new AbortController();
+  try {
+    const pending = consumeAttachment(request, dest, async () => { calls++; throw Error('must not acquire'); }, { signal: abort.signal });
+    await started; abort.abort();
+    await assert.rejects(pending, /transfer_aborted/);
+    assert.equal(calls, 0);
+  } finally { release(); mock.mock.restore(); }
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls, 0); assert.equal(existsSync(dest), false);
+});
+
+function fakeCodex(t: TestContext, grant: unknown, mode = 'normal') {
+  const dir = tmp(), fixture = path.join(dir, 'synthetic-grant.json'), trace = path.join(dir, 'methods.txt');
+  writeFileSync(fixture, JSON.stringify(grant)); // Synthetic provider fixture only; never a real capability.
+  const executable = path.join(dir, 'codex');
+  writeFileSync(executable, `#!${process.execPath}\n` + String.raw`
+const { createInterface } = require('node:readline');
+const { readFileSync, appendFileSync } = require('node:fs');
+if (JSON.stringify(process.argv.slice(2)) !== JSON.stringify(['app-server','--stdio'])) process.exit(9);
+const mode = process.env.BRIDGE_FAKE_CODEX_MODE;
+let sent = false;
+createInterface({ input: process.stdin }).on('line', line => {
+ const m = JSON.parse(line); appendFileSync(process.env.BRIDGE_FAKE_CODEX_TRACE, m.method+'\n');
+ if (m.id === undefined) return;
+ let result;
+ const thread = () => ({ id:'synthetic-owned-thread', path: mode === 'persist' && sent ? '/synthetic-not-a-real-path' : null, turns: [] });
+ if (mode === 'hang') return;
+ if (mode === 'oversized') { process.stdout.write('X'.repeat(9*1024*1024)); return; }
+ if (mode === 'malformed') { process.stdout.write('not json\n'); return; }
+ if (m.method === 'initialize') result = {};
+ else if (m.method === 'thread/start') {
+   if (m.params.ephemeral !== true || Object.keys(m.params).some(k => !['cwd','ephemeral'].includes(k))) process.exit(8);
+   result = {thread:thread()};
+ } else if (m.method === 'mcpServerStatus/list') result = {data:[{name:'codex_apps',tools:mode==='missing'?{}:{one:{name:'jarvis_friday_bridge.bridge_attachment_download'}}}],nextCursor:null};
+ else if (m.method === 'thread/read') result = {thread:thread()};
+ else if (m.method === 'mcpServer/tool/call') {
+   if(m.params.server!=='codex_apps'||m.params.tool!=='jarvis_friday_bridge.bridge_attachment_download') process.exit(7);
+   if(mode==='interaction') { process.stdout.write(JSON.stringify({id:999,method:'mcpServer/elicitation/request',params:{syntheticOnly:true}})+'\n'); return; }
+   sent = true;
+   if(mode==='denied') { process.stdout.write(JSON.stringify({id:m.id,error:{code:-32000,message:'SYNTHETIC_PRIVATE_ERROR_MUST_NOT_ESCAPE'}})+'\n'); return; }
+   result={structuredContent:JSON.parse(readFileSync(process.env.BRIDGE_FAKE_CODEX_GRANT,'utf8')),content:[]};
+ } else process.exit(6); // No model turns, auth/config changes or other tools.
+ process.stdout.write(JSON.stringify({id:m.id,result})+'\n');
+});
+`);
+  chmodSync(executable, 0o700);
+  const replacement = { PATH: dir + path.delimiter + process.env.PATH, BRIDGE_FAKE_CODEX_MODE: mode,
+    BRIDGE_FAKE_CODEX_GRANT: fixture, BRIDGE_FAKE_CODEX_TRACE: trace };
+  const before = Object.fromEntries(Object.keys(replacement).map(k => [k, process.env[k]]));
+  Object.assign(process.env, replacement);
+  t.after(() => { for (const [k, v] of Object.entries(before)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } });
+  return () => existsSync(trace) ? readFileSync(trace, 'utf8').trim().split('\n') : [];
+}
+
+test('Codex consumer: private fixed-tool/no-model protocol binds a synthetic grant and publishes verified bytes only', async t => {
+  const f = await fixture(), bytes = Buffer.from('synthetic app-server transfer'), { a, m, grant } = await sentAttachment(f, bytes);
+  const methods = fakeCodex(t, await grant()), dest = path.join(tmp(), 'verified.bin');
+  const request = { attachmentId: a.attachmentId, messageId: m.id, size: a.size, sha256: a.sha256 };
+  const result = await consumeCodexAttachment(request, dest, { fetchImpl: f.r2.fetch, now: f.clock });
+  assert.deepEqual(result, { ...request, disposition: 'verified', received: bytes.length });
+  assert.deepEqual(readFileSync(dest), bytes);
+  assert.equal(/https:|headers|token|url/i.test(JSON.stringify(result)), false);
+  assert.deepEqual(methods(), ['initialize','initialized','thread/start','mcpServerStatus/list','thread/read','mcpServer/tool/call','thread/read']);
+  assert.equal(f.snapshot().receipts[m.id], undefined);
+});
+
+for (const mode of ['interaction','persist','missing','oversized','malformed','denied']) test(`Codex consumer: ${mode} fails closed without a GET or raw protocol/error output`, async t => {
+  const f = await fixture(), { a, m, grant } = await sentAttachment(f, Buffer.from('synthetic refusal'));
+  fakeCodex(t, await grant(), mode);
+  let gets = 0;
+  const dest = path.join(tmp(), 'not-published');
+  await assert.rejects(consumeCodexAttachment({ attachmentId:a.attachmentId,messageId:m.id,size:a.size,sha256:a.sha256 }, dest,
+    { now:f.clock, fetchImpl:async () => { gets++; throw Error('must not send'); } }), e =>
+      e instanceof Error && e.message === 'grant_unavailable' && !String(e.stack).includes('SYNTHETIC_PRIVATE_ERROR'));
+  assert.equal(gets, 0); assert.equal(existsSync(dest), false);
+});
+
+test('Codex consumer: overall deadline terminates an unresponsive synthetic app-server', async t => {
+  const f = await fixture(), { a, m, grant } = await sentAttachment(f, Buffer.from('synthetic timeout'));
+  fakeCodex(t, await grant(), 'hang');
+  const started = Date.now();
+  await assert.rejects(consumeCodexAttachment({ attachmentId:a.attachmentId,messageId:m.id,size:a.size,sha256:a.sha256 }, path.join(tmp(),'out'),
+    { timeoutMs:100 }), /transfer_timeout/);
+  assert.ok(Date.now()-started < 2000, 'deadline and own-child cleanup stay bounded');
 });

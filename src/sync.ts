@@ -4,8 +4,9 @@ import { messageAccessAllowed, resourceDenied } from './access.ts';
 import { resourceFor } from './resource.ts';
 import { appendDeliveryJobs } from './events.ts';
 import { PEER_IDS, counterpart } from './config.ts';
+import { BridgeError } from './policy.ts';
 import type { BridgeState, DailyEnvelope, Envelope, MessageAuthorization, Millis, PolicyIds, Principal, Role, StoredMessage,
-  SyncBatch, SyncInfo, SyncQueue } from './types.ts';
+  SyncBatch, SyncBatchOutcome, SyncInfo, SyncQueue } from './types.ts';
 
 /** A stored SYNC batch message (its syncBatch record is present). */
 export type BatchMessage = StoredMessage & { syncBatch: SyncBatch };
@@ -14,7 +15,11 @@ export interface ChicagoWall { date: string; hour: number; minute: number; key: 
 export interface SyncClassification { class: 'wake' | 'sync'; promoted?: string }
 export interface SyncRedirect { code: string; details?: { batchMessageId?: string | undefined; supersededBy?: string | undefined } }
 /** Completion evidence for ackBatch (the caller's validated claim and reported host IDs). */
-export interface BatchAckEvidence { claimId: string; hostedEventId: unknown; hostedTurnId: unknown; via?: string | undefined }
+export interface SyncItemDisposition {
+  batchMessageId: string; messageId: string; disposition: 'handled' | 'skipped_expired'; handledAt?: string;
+}
+export interface BatchAckEvidence { claimId: string; hostedEventId: unknown; hostedTurnId: unknown; via?: string | undefined;
+  itemDispositions?: SyncItemDisposition[] }
 export interface FlushOutcome { recipient: Role; outcome: string; reason?: string; items?: number; rehomedBatches?: number }
 export interface FlushResult { boundary: Millis; results: FlushOutcome[]; dispatch: string[] }
 
@@ -41,6 +46,12 @@ export const SYNC_TIME_ZONE = 'America/Chicago';
 // batch is attached to, or held by, one message stays within it, so the
 // documented read -> claim -> complete flow always fits one completion.
 export const MAX_SYNC_BATCH_IDS = 32;
+// One original notification generation plus at most four receipt-recovery
+// generations. Recovery jobs have ONE transport attempt each (original jobs
+// keep their existing five-attempt limit), so this is not a physical exactly-
+// five-send claim. Every recovery reservation also spends an existing day slot.
+export const SYNC_RECEIPT_RECOVERY_MS = 5 * 60000;
+export const MAX_SYNC_RECEIPT_RECOVERIES = 4;
 const HOUR = 3600000;
 
 // Unset or empty: off. Any unknown peer ID closes the whole flag (v1 behavior)
@@ -232,7 +243,9 @@ function requeue(state: BridgeState, recipient: Role, item: StoredMessage, now: 
   }
   const slot = queue.pending[key] ? 'id:' + item.envelope.id : key;
   queue.pending[slot] = item.envelope.id;
+  const presented = livePresentation(state, item.envelope.id, Date.parse(item.envelope.expiresAt as string));
   item.sync = { state: 'pending', key, ...(slot !== key ? { slot } : {}), queuedAt: now,
+    ...(presented !== undefined ? { livePresentedAt: presented } : {}),
     redeliveries: (item.sync!.redeliveries || 0) + 1, ...(item.sync!.nativeFailed ? { nativeFailed: true } : {}),
     ...(ambiguous || item.sync!.orderUnknown ? { orderUnknown: true } : {}), ...extra };
 }
@@ -287,6 +300,54 @@ export function batchItemsBusy(state: BridgeState, batch: StoredMessage | null |
     return state.messages[id] && receipt?.state === 'claimed' && (receipt.leaseUntil as Millis) > now && receipt.claimId !== claimId;
   });
 }
+/** Shared reservation/worker fence. Does not grant source/subscription authority. */
+export function syncReceiptRecoveryAllowed(state: BridgeState, batch: StoredMessage | undefined, now: Millis): boolean {
+  const b = batch?.syncBatch, receipt = batch && state.receipts[batch.envelope.id];
+  return !!b && batch!.envelope.kind !== 'ack' && b.itemIds.length > 0 &&
+    b.itemIds.every(id => !!state.messages[id]) && !b.ackedAt && !b.outcome && !b.reclaimedAt &&
+    receipt?.state !== 'complete' && !(receipt?.state === 'claimed' && (receipt.leaseUntil ?? 0) > now) &&
+    batchItemsBusy(state, batch, null, now).length === 0;
+}
+
+// Run after ordinary flushes: newly due routine data keeps priority. At most
+// ONE recovery per recipient per tick, least recently reserved first. All
+// generation, jobs and day-slot state commit together. A failed/lost queue
+// publication is recovered from these same pending jobs by the existing outbox;
+// it never resets accepted jobs or reserves a second generation.
+function recoverSyncReceipts(state: BridgeState, now: Millis, policyIds: PolicyIds | null | undefined, results: FlushOutcome[]): void {
+  const day = chicagoDate(now);
+  for (const recipient of PEER_IDS) {
+    if (results.some(r => r.recipient === recipient && ['daily_cap', 'no_destination'].includes(r.outcome))) continue;
+    const eligible = batches(state, recipient).filter(batch => {
+      const b = batch.syncBatch;
+      if (!syncReceiptRecoveryAllowed(state, batch, now) || !messageAccessAllowed(state, batch, policyIds, now) ||
+          (b.recovery?.generation ?? 0) >= MAX_SYNC_RECEIPT_RECOVERIES) return false;
+      // A piggyback's carrier and all previous generations must have settled.
+      // Even an expired delivery lease stays with the ordinary outbox retry.
+      const carriers = Object.values(state.messages).filter(m => m.syncBatchIds?.includes(batch.envelope.id));
+      const jobs = [batch, ...carriers].flatMap(m => m.jobIds.map(id => state.jobs[id]).filter(j => !!j));
+      if (jobs.some(j => j.state === 'pending' || j.state === 'leased')) return false;
+      const lastDelivery = Math.max(b.createdAt, ...jobs.map(j => j.acceptedAt ?? j.dueAt));
+      return now >= Math.max(b.recovery?.nextAt ?? 0, lastDelivery + SYNC_RECEIPT_RECOVERY_MS);
+    }).sort((a, b) => (a.syncBatch.recovery?.reservedAt ?? a.syncBatch.createdAt) -
+      (b.syncBatch.recovery?.reservedAt ?? b.syncBatch.createdAt) || byId(a, b));
+    const batch = eligible[0];
+    if (!batch) continue;
+    const queue = queueFor(state, recipient);
+    if (queue.flushDay !== day) { queue.flushDay = day; queue.flushCount = 0; }
+    if ((queue.flushCount ?? 0) >= dailyFlushCap(day)) {
+      results.push({ recipient, outcome: 'recovery_daily_cap' }); continue;
+    }
+    const generation = (batch.syncBatch.recovery?.generation ?? 0) + 1;
+    const jobs = appendDeliveryJobs(state, batch.envelope, now, { syncRecoveryGeneration: generation, maxAttempts: 1 });
+    if (!jobs.length) { results.push({ recipient, outcome: 'recovery_no_destination' }); continue; }
+    batch.jobIds.push(...jobs);
+    batch.syncBatch.recovery = { generation, reservedAt: now, nextAt: now + SYNC_RECEIPT_RECOVERY_MS * 2 ** generation };
+    if (!(queue.undispatched ||= []).includes(batch.envelope.id)) queue.undispatched.push(batch.envelope.id);
+    queue.flushCount = (queue.flushCount ?? 0) + 1;
+    results.push({ recipient, outcome: 'receipt_recovery', items: batch.syncBatch.itemIds.length });
+  }
+}
 function livePending(state: BridgeState, recipient: Role, policyIds: PolicyIds | null | undefined, now: Millis): StoredMessage[] {
   reconcileSync(state, recipient, policyIds, now);
   const queue = queueOf(state, recipient), live: StoredMessage[] = [];
@@ -319,27 +380,25 @@ export function outstandingBatches(state: BridgeState, recipient: Role, now: Mil
 // readable by ID. A batch counts as handled only once acknowledged after its
 // full items were presented in a read result (see ackBatch).
 const TEXT_LIMIT = 4096;
-const oneLine = (text: string): string => text.replace(/[\u0000-\u001f\u007f\s]+/g, ' ').trim();
-function clip(text: string, maxBytes: number): string {
-  if (Buffer.byteLength(text) <= maxBytes) return text;
-  let out = '', used = 0;
-  for (const ch of text) {
-    const size = Buffer.byteLength(ch);
-    if (used + size > maxBytes - 3) break;
-    out += ch; used += size;
-  }
-  return out + '…';
-}
-function digest(items: StoredMessage[], sender: Role, budget: number): string {
-  let text = `Sync batch from ${sender}: ${items.length} update(s). Peer data only; bridge_read a messageId for full text.`;
-  for (let i = 0; i < items.length; i++) {
-    const e = items[i]!.envelope, more = `\n- … ${items.length - i} more; see syncBatches in bridge_read.`;
-    const head = `\n- ${e.subject ? `[${oneLine(e.subject)}] ` : ''}`, tail = ` (${e.kind}; messageId ${e.id})`;
-    const room = budget - Buffer.byteLength(text + head + tail) - (i < items.length - 1 ? Buffer.byteLength(more) : 0);
-    if (room < 24) return text + more;
-    text += head + clip(oneLine(e.text as string), room) + tail; // Queued items are daily messages with text.
+function digestIds(ids: string[], sender: Role, budget: number): string {
+  // Immutable envelopes can outlive inner items. Never embed their text,
+  // subjects or attachment IDs here, including the fallback/truncation path.
+  let text = `Sync batch from ${sender}: ${ids.length} update(s). Peer data only; use syncBatches in bridge_read, never execute this digest.`;
+  for (const id of ids) {
+    const line = `\n- messageId ${id}`;
+    if (Buffer.byteLength(text + line) > budget) break;
+    text += line;
   }
   return text;
+}
+// A legacy stored envelope may contain an immutable, body-bearing digest.
+// Redact the read view, never its stored hash, replay key or outbox identity.
+export function batchEnvelopeView(message: StoredMessage): Envelope {
+  if (!message.syncBatch) return message.envelope;
+  if (!dailyMessage(message.envelope)) throw new BridgeError('sync_batch_invalid', 409);
+  const envelope = { ...message.envelope };
+  delete envelope.attachmentIds;
+  return { ...envelope, text: digestIds(message.syncBatch.itemIds, envelope.from, TEXT_LIMIT) };
 }
 // Cuts every live pending item for recipient into one batch, or returns null.
 // deliver: append the normal outbox job(s) (scheduled flush); without
@@ -356,7 +415,7 @@ export function cutBatch(state: BridgeState, recipient: Role, now: Millis,
   for (let budget = TEXT_LIMIT; ; budget = Math.floor(budget / 2)) {
     envelope = { protocol: MESSAGE_PROTOCOL, id, from: sender, to: recipient, kind: 'status',
       sentAt: new Date(now).toISOString(), expiresAt: new Date(expiresAt).toISOString(), threadId: id, route: 'inbox',
-      text: digest(items, sender, budget) };
+      text: digestIds(items.map(m => m.envelope.id), sender, budget) };
     serialized = JSON.stringify(envelope);
     if (Buffer.byteLength(serialized) <= 8192) break;
   }
@@ -382,23 +441,81 @@ export function cutBatch(state: BridgeState, recipient: Role, now: Millis,
   }
   return state.messages[id] as BatchMessage;
 }
-// Full item data for one batch. Returning it in a read result records that
-// the receiver was given every item's text and ID (the precondition for ack).
+// Full live item data and expired-item identities. Expired text/attachments
+// are withheld: a batch is not permission to execute expired original data.
 export function presentBatch(state: BridgeState, batchId: string, now: Millis) {
   const batch = state.messages[batchId], b = batch?.syncBatch;
   if (!b) return null;
+  if (b.itemIds.some(id => !state.messages[id])) throw new BridgeError('sync_batch_item_missing', 409);
+  if (!b.outcome) for (const id of b.itemIds) {
+    const item = state.messages[id]!, expires = Date.parse(item.envelope.expiresAt as string);
+    if (expires > now && state.receipts[id]?.state !== 'complete') (b.livePresentedAt ||= {})[id] ??= now;
+    const presented = livePresentation(state, id, expires);
+    if (presented !== undefined && item.sync) item.sync.livePresentedAt = presented;
+  }
   b.presentedAt ??= now;
   return { messageId: batchId, reason: b.reason, createdAt: new Date(b.createdAt).toISOString(), acknowledged: !!b.ackedAt,
-    items: (b.itemIds.map(id => state.messages[id]).filter(Boolean) as StoredMessage[]).map(({ envelope: e, storedAt, sync }) => ({
-      messageId: e.id, kind: e.kind, class: 'sync', ...(e.subject !== undefined ? { subject: e.subject } : {}),
-      text: e.text, threadId: e.threadId, sentAt: e.sentAt, expiresAt: e.expiresAt,
-      ...(e.effectiveAt !== undefined ? { effectiveAt: e.effectiveAt } : {}), ...(e.dueAt !== undefined ? { dueAt: e.dueAt } : {}),
-      receivedAt: new Date(storedAt).toISOString(), expired: Date.parse(e.expiresAt as string) <= now,
-      late: !!b.lateItemIds?.includes(e.id), orderUnknown: !!sync?.orderUnknown,
-      ...(e.attachmentIds ? { attachmentIds: [...e.attachmentIds] } : {}) })) };
+    ...(b.outcome ? { outcome: structuredClone(b.outcome) } : {}),
+    items: b.itemIds.map(id => {
+      const { envelope: e, storedAt, sync } = state.messages[id]!; // Missing items refused above.
+      const expires = Date.parse(e.expiresAt as string), expired = expires <= now;
+      const previous = b.outcome?.items.find(i => i.messageId === id)?.disposition;
+      const complete = state.receipts[id]?.state === 'complete';
+      const actionable = !b.outcome && !complete && !expired;
+      return { messageId: e.id, kind: e.kind, class: 'sync', ...(e.subject !== undefined ? { subject: e.subject } : {}),
+        text: actionable ? e.text : '', threadId: e.threadId, sentAt: e.sentAt, expiresAt: e.expiresAt,
+        ...(e.effectiveAt !== undefined ? { effectiveAt: e.effectiveAt } : {}), ...(e.dueAt !== undefined ? { dueAt: e.dueAt } : {}),
+        receivedAt: new Date(storedAt).toISOString(), expired,
+        disposition: previous ?? (complete ? 'handled' as const : expired ?
+          livePresentation(state, id, expires) !== undefined ? 'requires_disposition' as const : 'skipped_expired' as const : 'pending' as const),
+        late: !!b.lateItemIds?.includes(e.id), orderUnknown: !!sync?.orderUnknown,
+        ...(e.attachmentIds && actionable ? { attachmentIds: [...e.attachmentIds] } : {}) };
+    }) };
+}
+// Older stored batches lack per-item presentation times. Their first full
+// presentation is conservative evidence that each then-live item was exposed.
+function livePresentation(state: BridgeState, id: string, expires: Millis): Millis | undefined {
+  const times = [state.messages[id]?.sync?.livePresentedAt];
+  for (const message of Object.values(state.messages)) {
+    const b = message.syncBatch;
+    if (!b?.itemIds.includes(id)) continue;
+    times.push(b.livePresentedAt?.[id], b.presentedAt !== undefined && b.presentedAt < expires ? b.presentedAt : undefined);
+  }
+  const recorded = times.filter((at): at is number => at !== undefined);
+  return recorded.length ? Math.min(...recorded) : undefined;
+}
+// Completion is all-or-nothing. An item read live then expiring is ambiguous:
+// require a bounded receiver report instead of inferring that it was skipped.
+// This is reported handling evidence, never proof of external task execution.
+export function batchOutcome(state: BridgeState, batchId: string, now: Millis, attestations: SyncItemDisposition[] = []): SyncBatchOutcome {
+  const b = state.messages[batchId]?.syncBatch;
+  if (!b || b.itemIds.some(id => !state.messages[id])) throw new BridgeError('sync_batch_item_missing', 409);
+  if (attestations.some(a => a.batchMessageId === batchId && !b.itemIds.includes(a.messageId))) throw new BridgeError('invalid_sync_item_disposition', 409);
+  const items = b.itemIds.map(messageId => {
+    const expires = Date.parse(state.messages[messageId]!.envelope.expiresAt as string), presented = livePresentation(state, messageId, expires);
+    const attestation = attestations.find(i => i.batchMessageId === batchId && i.messageId === messageId);
+    const completed = state.receipts[messageId]?.state === 'complete';
+    if (completed || expires > now) {
+      if (attestation) throw new BridgeError('invalid_sync_item_disposition', 409);
+      return { messageId, disposition: 'handled' as const };
+    }
+    if (presented === undefined) {
+      if (attestation) throw new BridgeError('invalid_sync_item_disposition', 409);
+      return { messageId, disposition: 'skipped_expired' as const };
+    }
+    if (!attestation) throw new BridgeError('sync_batch_disposition_required', 409);
+    if (attestation.disposition === 'skipped_expired') return { messageId, disposition: 'skipped_expired' as const };
+    const handled = Date.parse(attestation.handledAt!);
+    if (!(handled >= presented && handled < expires && handled <= now)) throw new BridgeError('invalid_sync_item_disposition', 409);
+    return { messageId, disposition: 'handled' as const, handledAt: attestation.handledAt! };
+  });
+  return { batchMessageId: batchId, items, handledCount: items.filter(i => i.disposition === 'handled').length,
+    skippedExpiredCount: items.filter(i => i.disposition === 'skipped_expired').length };
 }
 // Acknowledge a presented batch held by evidence.claimId: its receipt plus
-// every item's receipt. The batch receipt must already be complete (direct
+// each live item's receipt. Expired originals stay uncompleted; their skipped
+// dispositions belong to the batch, not to an expired v1 receipt.
+// The batch receipt must already be complete (direct
 // completion, same transaction) or be a hold of that same claim; a receipt
 // owned by any other claim, for the batch or an item, is never overwritten.
 // makeAck() runs only once every check has passed and returns the batch's own
@@ -412,16 +529,21 @@ export function ackBatch(state: BridgeState, batchId: string, principal: Princip
   if (held?.state !== 'complete' && !(held?.state === 'claimed' && held.claimId === evidence.claimId)) return false;
   // Never finalize a batch while another live claim holds one of its items.
   if (batchItemsBusy(state, batch, evidence.claimId, now).length) return false;
+  const outcome = batchOutcome(state, batchId, now, evidence.itemDispositions), items = outcome.items;
   const ackMessageId = makeAck();
   b.ackedAt = now;
+  b.outcome = outcome;
   const receipt = { state: 'complete' as const, owner: principal.principalKey, completedAt: now,
     hostedEventId: evidence.hostedEventId, hostedTurnId: evidence.hostedTurnId,
     evidenceStatus: 'reported_requires_independent_host_confirmation' };
   // held is complete or this claim's hold (checked above).
   if (held!.state !== 'complete') state.receipts[batchId] = { ...receipt, ackMessageId, claimId: evidence.claimId, viaMessage: evidence.via };
-  for (const id of b.itemIds) {
+  state.receipts[batchId]!.syncBatchOutcomes = [structuredClone(outcome)];
+  if (ackMessageId) state.messages[ackMessageId]!.syncBatchOutcome = structuredClone(outcome);
+  for (const { messageId: id, disposition } of items) {
     // Covered already (completed by its own claim) or stale (lapsed lease).
     if (!state.messages[id] || state.receipts[id]?.state === 'complete') continue;
+    if (disposition === 'skipped_expired' || Date.parse(state.messages[id]!.envelope.expiresAt as string) <= now) continue;
     // No ACK per item: the batch's ACK covers it.
     state.receipts[id] = { ...receipt, ackMessageId: null, batchAckMessageId: ackMessageId, viaBatch: batchId };
   }
@@ -537,6 +659,7 @@ export function flushDue(state: BridgeState, now: Millis,
     results.push({ recipient, outcome: 'flushed', reason, items: live.length ? batch.syncBatch.itemIds.length : 0,
       ...(rehomed ? { rehomedBatches: rehomed } : {}) });
   }
+  recoverSyncReceipts(state, now, policyIds, results);
   const dispatch = PEER_IDS.flatMap(recipient => {
     const queue = queueOf(state, recipient);
     if (queue?.undispatched) queue.undispatched = queue.undispatched.filter(id => state.messages[id]);
