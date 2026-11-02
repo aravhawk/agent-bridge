@@ -145,10 +145,11 @@ export async function verifyQStashTick({ config, signature, body, now, diagnosti
   const bound: (claim: ClaimName, category?: 'claim_bounds_invalid' | 'time_invalid' | 'token_lifetime_exceeded') => never =
     (claim, category = 'claim_bounds_invalid') => { diagnostic?.bound(claim, category); return reject('scheduler_signature_invalid'); };
   if (!numericDate(iat)) bound('iat');
-  if (!numericDate(nbf)) bound('nbf');
+  // nbf is an independent lower time bound, not an issuance timestamp.
+  // RFC 7519 permits finite pre-epoch values; JOSE still enforces now >= nbf (5s tolerance).
+  if (typeof nbf !== 'number' || !Number.isFinite(nbf) || Math.abs(nbf) > Math.floor(Number.MAX_SAFE_INTEGER / 1000)) bound('nbf');
   if (!numericDate(exp)) bound('exp');
   if (exp <= nbf) bound('exp', 'time_invalid');
-  if (nbf < iat - CLOCK_TOLERANCE_S) bound('nbf', 'time_invalid');
   if (exp - iat > MAX_TOKEN_LIFETIME_S) bound('exp', 'token_lifetime_exceeded');
   if (iat > seconds + CLOCK_TOLERANCE_S) bound('iat', 'time_invalid');
   if (typeof jti !== 'string' || !JTI.test(jti)) bound('jti');

@@ -130,12 +130,12 @@ test('qstash NumericDate: fractional seconds preserve time bounds and replay exp
   // No truncation/rounding may admit a token across an existing time bound.
   for (const claims of [
     { iat: seconds + 5.25, nbf: seconds }, { nbf: seconds + 5.25 },
-    { iat: seconds, nbf: seconds - 5.25 }, { exp: seconds - 5.25 },
+    { exp: seconds - 5.25 },
     { exp: seconds }, { exp: seconds + 900.25 },
   ]) await refused(verify(await sign({ at: start, claims })));
   assert.ok(await verify(await sign({ at: start, claims: { exp: seconds + 900 } })));
   for (const claim of ['iat', 'nbf', 'exp']) {
-    for (const value of [-0.25, '1', null, true, {}, [], NaN, Infinity, -Infinity, Number.MAX_VALUE,
+    for (const value of [...(claim === 'nbf' ? [] : [-0.25]), '1', null, true, {}, [], NaN, Infinity, -Infinity, Number.MAX_VALUE,
       Number.MAX_SAFE_INTEGER, Math.floor(Number.MAX_SAFE_INTEGER / 1000) + 1]) {
       // CompactSign permits malformed claim types that SignJWT refuses to construct.
       const payload = { iss: 'Upstash', sub: DEST, iat: seconds, nbf: seconds, exp: seconds + 300,
@@ -144,6 +144,26 @@ test('qstash NumericDate: fractional seconds preserve time bounds and replay exp
         .setProtectedHeader({ alg: 'HS256' }).sign(new TextEncoder().encode(CURRENT));
       await refused(verify(signature));
     }
+  }
+});
+
+test('qstash nbf: finite pre-epoch and early lower bounds do not extend fresh-token authority', async () => {
+  const seconds = start / 1000;
+  for (const key of [CURRENT, NEXT]) for (const nbf of [-0.25, -62135596800, -Math.floor(Number.MAX_SAFE_INTEGER / 1000), 0, seconds - 60]) {
+    const tick = await verify(await sign({ at: start, key, claims: { nbf } }));
+    assert.equal(tick.key, key); assert.equal(tick.expiresAt, start + 300000);
+    for (const claims of [{ nbf, exp: seconds - 6 }, { nbf, iat: seconds - 901, exp: seconds + 1 },
+      { nbf, iat: seconds + 6 }, { nbf, exp: seconds + 901 }, { nbf, sub: DEST + '/wrong' }]) {
+      await refused(verify(await sign({ at: start, key, claims })));
+    }
+    await refused(verify(await sign({ at: start, key: OLD, claims: { nbf } })));
+    await refused(verify(await sign({ at: start, key, claims: { nbf } }), { body: QSTASH_TICK_BODY + ' ' }), 'scheduler_body_invalid');
+  }
+  for (const raw of ['-1e309', '1e309', String(-Math.floor(Number.MAX_SAFE_INTEGER / 1000) - 1)]) {
+    const payload = JSON.stringify({ iss: 'Upstash', sub: DEST, iat: seconds, nbf: 'REPLACE_NBF', exp: seconds + 300,
+      jti: 'invalid_nbf', body: bodyHash(QSTASH_TICK_BODY) }).replace('"REPLACE_NBF"', raw);
+    const token = await new CompactSign(Buffer.from(payload)).setProtectedHeader({ alg: 'HS256' }).sign(new TextEncoder().encode(CURRENT));
+    await refused(verify(token));
   }
 });
 
