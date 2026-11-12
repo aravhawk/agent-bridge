@@ -65,7 +65,7 @@ Ground rules:
    that my own Vercel project deploys from my own GitHub repository (Vercel's
    GitHub integration needs the repository owner). Keep the original as the
    `upstream` remote for later updates.
-3. Prerequisites: Node.js 24.22.1 or newer within 24.x for local checks; a
+3. Prerequisites: Node.js 24.22.3 or newer within 24.x for local checks; a
    Vercel project with Vercel Queues; a Postgres database with a publicly
    trusted TLS certificate (sslmode=require), with schema.sql applied once;
    a stable HTTPS origin for the bridge (my project's *.vercel.app domain
@@ -174,7 +174,7 @@ git remote add upstream https://github.com/aravhawk/agent-bridge.git
 
 ### 2. Install and check locally
 
-Node.js 24.22.1 or newer within major 24 is required. The source is
+Node.js 24.22.3 or newer within major 24 is required. The source is
 TypeScript that Node runs directly, so there is no build step:
 
 ```sh

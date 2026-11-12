@@ -14,7 +14,7 @@ npm audit
 python3 scripts/audit_repo.py  # secret/identifier audit of the index and Git history
 ```
 
-Node.js 24.22.1 or newer within major 24 is required (see `engines` in
+Node.js 24.22.3 or newer within major 24 is required (see `engines` in
 `package.json`). The source is TypeScript that Node 24 runs directly (type
 stripping, so only erasable syntax: no enums, namespaces or parameter
 properties) and Vercel compiles at deploy time; there is no build step to

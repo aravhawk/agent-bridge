@@ -229,7 +229,7 @@ host's scheduler.
 
 ## Local verification
 
-With the repository's Node 24.22.1 toolchain:
+With the repository's Node 24.22.3 toolchain:
 
 ```sh
 node --test test/task*.test.ts
