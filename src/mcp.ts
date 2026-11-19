@@ -42,7 +42,7 @@ export interface McpHandlerOptions {
   enabled?: boolean; verify?: ((request: Request) => Promise<VerifiedPrincipal>) | undefined; bridge?: McpBridge | undefined;
   events?: McpEvents | undefined; scheduleJobs?: ((jobIds: string[]) => Promise<unknown>) | undefined;
   resourceMetadataUrl?: string | undefined; observeValidationFailure?: ((facts: ValidationFailureFacts) => void) | undefined;
-  health?: (() => object | Promise<object>) | undefined; dailyEnabled?: boolean; healthOnly?: boolean;
+  health?: (() => object | Promise<object>) | undefined; instanceId?: string | undefined; dailyEnabled?: boolean; healthOnly?: boolean;
   webhookDiagnostic?: McpDiagnostic | undefined; tasks?: McpTasks | undefined;
   wakeSync?: (() => readonly string[]) | undefined; attachments?: McpAttachments | undefined;
 }
@@ -51,9 +51,19 @@ type UntrustedView = { readonly [key: string]: UntrustedView } | null | undefine
 
 const idSchema = { type: 'string', format: 'uuid' };
 const object = (properties: Record<string, JsonSchema>): ObjectSchema => ({ type: 'object', properties, required: Object.keys(properties), additionalProperties: false });
+const pinnedObject = (properties: Record<string, JsonSchema>): ObjectSchema => ({
+  ...object(properties), properties: { ...properties, expectedInstanceId: { ...idSchema,
+    description: 'Optional operator-pinned Bridge instance ID. If supplied, the operation runs only on that instance.' } },
+});
+function pinnedArgs(args: unknown, instanceId: string | undefined): unknown {
+  if (!args || typeof args !== 'object' || Array.isArray(args) || !Object.hasOwn(args, 'expectedInstanceId')) return args;
+  const { expectedInstanceId, ...rest } = args as JsonObject;
+  if (!instanceId || expectedInstanceId !== instanceId) throw new BridgeError('bridge_instance_mismatch', 409);
+  return rest;
+}
 const tool = (name: string, description: string, inputSchema: JsonSchema, readOnly = false): ToolDefinition => ({ name, description, inputSchema,
   annotations: { readOnlyHint: readOnly, destructiveHint: false, idempotentHint: true, openWorldHint: false } });
-const completeSchema = object({ messageId: idSchema, claimId: idSchema, hostedEventId: { type: ['string', 'null'], maxLength: 160 },
+const completeSchema = pinnedObject({ messageId: idSchema, claimId: idSchema, hostedEventId: { type: ['string', 'null'], maxLength: 160 },
   hostedTurnId: { type: ['string', 'null'], maxLength: 160 } });
 completeSchema.properties.syncBatchIds = { type: 'array', items: idSchema, maxItems: MAX_SYNC_BATCH_IDS, uniqueItems: true,
   description: 'Batch messageIds you handled: this batch itself (direct completion; also implied) and attached batches your read returned and your claim holds. Omit to acknowledge no attached batch.' };
@@ -63,8 +73,8 @@ completeSchema.properties.syncItemDispositions = { type: 'array', maxItems: 100,
   description: 'Only for items presented live that expired before completion (sync_batch_disposition_required). Report skipped_expired if not handled, or handled with the actual handledAt timestamp before expiry. Server validates the held batch, presentation and expiry; expired original receipts stay uncompleted. Never use to skip live items.' };
 const tools = [
   tool('bridge_health', 'Check authenticated bridge configuration without reading messages, storing state or sending events.', object({}), true),
-  tool('bridge_read', 'Read the stored message identified by the native received event. Never use to poll.', object({ messageId: idSchema }), true),
-  tool('bridge_receipt_claim', 'Claim this received message for one hosted turn, with a short recovery lease. If SYNC batches were presented with it, the claim also holds those not held by another claim (syncBatchIds) and reports the others (syncBatchesHeldElsewhere); handle only held batches. A queued or batch-carried SYNC item cannot be claimed on its own; the error names the batch to claim (batchMessageId).', object({ messageId: idSchema })),
+  tool('bridge_read', 'Read the stored message identified by the native received event. Never use to poll.', pinnedObject({ messageId: idSchema }), true),
+  tool('bridge_receipt_claim', 'Claim this received message for one hosted turn, with a short recovery lease. If SYNC batches were presented with it, the claim also holds those not held by another claim (syncBatchIds) and reports the others (syncBatchesHeldElsewhere); handle only held batches. A queued or batch-carried SYNC item cannot be claimed on its own; the error names the batch to claim (batchMessageId).', pinnedObject({ messageId: idSchema })),
   tool('bridge_receipt_complete', 'After handling the received data, complete the claimed receipt; this atomically creates one immediate correlated ACK back to the sender (none for an ACK: ACKs are terminal). An ACK reports that you handled the received data, not that any requested task is done; supplied host IDs require independent verification. Optional syncBatchIds acknowledges SYNC batches you handled, each with its own ACK reporting live-item handling and expired-item disposition (syncBatchOutcomes), not task completion. Never execute expired inner text; expiry after a live read requires syncItemDispositions. Batch IDs are: the batch ID itself when completing a batch directly, and attached batches your read returned and your claim holds. Unnamed batches stay outstanding and get no ACK.',
     completeSchema),
   tool('bridge_status', 'Inspect one known message during an explicit diagnostic. HTTP receipt alone never verifies wake.', object({ messageId: idSchema }), true),
@@ -178,7 +188,7 @@ async function boundedJson(request: Request): Promise<unknown> {
 // Mount only at the configured authenticated peer paths. This resource server
 // never creates a provider, issues tokens or registers a native plugin.
 export function createMcpHandler({ enabled = false, verify, bridge, events, scheduleJobs, resourceMetadataUrl,
-  observeValidationFailure, health, dailyEnabled = true, healthOnly = false, webhookDiagnostic, tasks, wakeSync, attachments }: McpHandlerOptions):
+  observeValidationFailure, health, instanceId, dailyEnabled = true, healthOnly = false, webhookDiagnostic, tasks, wakeSync, attachments }: McpHandlerOptions):
   (request: Request) => Promise<Response> {
   return async request => {
     let id: unknown = null, input: unknown, stage = 'before_authenticated_body';
@@ -244,13 +254,13 @@ export function createMcpHandler({ enabled = false, verify, bridge, events, sche
             case NAMES.diagnosticTool: ownKeys(params.arguments, [], []); output = await webhookDiagnostic!.run!(principal); break;
             case 'bridge_subscription_status': output = await events.status(principal, params.arguments); break;
             case 'bridge_message_send': output = await bridge.sendMessage(principal, params.arguments); break;
-            case 'bridge_read': output = await bridge.read(principal, params.arguments); break;
+            case 'bridge_read': output = await bridge.read(principal, pinnedArgs(params.arguments, instanceId)); break;
             case 'bridge_inbox_read': authorizeRecipient(principal); output = await bridge.inboxRead(principal, params.arguments); break;
             case 'bridge_attachment_begin': output = await attachments!.begin(principal, params.arguments); break;
             case 'bridge_attachment_finalize': output = await attachments!.finalize(principal, params.arguments); break;
             case 'bridge_attachment_download': authorizeRecipient(principal); output = await attachments!.download(principal, params.arguments); break;
-            case 'bridge_receipt_claim': authorizeRecipient(principal); output = await bridge.claim(principal, params.arguments); break;
-            case 'bridge_receipt_complete': authorizeRecipient(principal); output = await bridge.complete(principal, params.arguments); break;
+            case 'bridge_receipt_claim': authorizeRecipient(principal); output = await bridge.claim(principal, pinnedArgs(params.arguments, instanceId)); break;
+            case 'bridge_receipt_complete': authorizeRecipient(principal); output = await bridge.complete(principal, pinnedArgs(params.arguments, instanceId)); break;
             case 'bridge_status': output = await bridge.status(principal, params.arguments); break;
             case 'bridge_task_command': output = await tasks!.apply(principal, params.arguments); break;
             case 'bridge_task_get': output = await tasks!.get(principal, params.arguments); break;

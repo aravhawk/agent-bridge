@@ -115,6 +115,10 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
   const identityConfigured = !!provider &&
     (!!env.BRIDGE_ALLOWED_SUBJECT || /^[a-f0-9]{64}$/.test(env.BRIDGE_ALLOWED_SUBJECT_SHA256 || ''));
   const contractReady = identityConfigured && env.BRIDGE_OAUTH_CONTRACT_VERIFIED === 'true';
+  const configuredInstanceId = env.BRIDGE_INSTANCE_ID;
+  const instanceId = configuredInstanceId &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(configuredInstanceId)
+    ? configuredInstanceId : undefined;
   // Webhook peer settings: BRIDGE_PEER_<ID>_* with FRIDAY_* fallbacks. Read per
   // use, like every other readiness input, so withdrawn settings close at once.
   const peerSettings = () => webhookPeerSettings(env);
@@ -299,11 +303,12 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
         if (!(readiness() as Record<string, unknown>)[NAMES.diagnosticArmed]) throw new BridgeError(peerCode('diagnostic_not_armed'), 503);
         configure(); return diagnostic(principal);
       } };
-      return createMcpHandler({ enabled: true, verify, bridge: operations, events: nativeEvents,
+      return createMcpHandler({ enabled: true, verify, bridge: operations, events: nativeEvents, instanceId,
         dailyEnabled: true, healthOnly: !contractReady, webhookDiagnostic, tasks: taskOperations, wakeSync,
         attachments: { enabled: () => attachmentSettings().valid, maxBytes: () => (attachmentSettings() as Partial<ValidAttachmentConfig>).maxBytes,
           ...Object.fromEntries((['begin', 'finalize', 'download'] as const).map(m => [m, async (...args: [VerifiedPrincipal, unknown]) => attachmentCapability()[m](...args)])) } as McpAttachments,
-        health: () => ({ status: 'ok', authenticated: true, serverVersion: VERSION, readiness: readiness() }),
+        health: () => ({ status: 'ok', authenticated: true, serverVersion: VERSION,
+          ...(instanceId ? { instanceId } : {}), readiness: readiness() }),
         scheduleJobs: async (ids: string[]) => {
           if (!readiness().deliveryEnabled) throw new BridgeError('queue_not_enabled', 503);
           configure(); return queue.scheduleJobs(ids);

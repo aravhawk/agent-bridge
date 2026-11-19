@@ -64,6 +64,7 @@ uses `Agent Bridge` in generic mode; compatibility mode deliberately keeps
 | `BRIDGE_ALLOWED_SUBJECT` | Alternative: the raw allowed `sub`. Set exactly one of the two. |
 | `BRIDGE_OAUTH_SCOPE_CLAIM` | `scope` (default), `scp` or `scopes`. |
 | `BRIDGE_OAUTH_CONTRACT_VERIFIED` | `true` only after you have verified real tokens for both peers (below). |
+| `BRIDGE_INSTANCE_ID` | Optional non-secret, lowercase UUIDv4 for this logical Bridge instance. Set a distinct value per independent instance and retain it across redeploys of that instance. A valid value appears as `instanceId` in authenticated `bridge_health`; absent or invalid values are omitted. |
 
 Tokens must be RS256 JWTs with `exp`, `iat` and `sub`, the exact peer resource
 as audience and the configured issuer. Both peer clients are public OAuth
@@ -108,6 +109,20 @@ Health still verifies signature, issuer, audience, subject and scopes; it reads
 no messages and lists no events. Its `caller` field reports the role, whether
 the token carries the send and ACK scopes, and the exact tool names offered.
 Compare that with what your host displays before attesting the contract.
+
+For a receiver pinned to a specific Bridge instance, record the expected ID
+from the operator's deployment configuration through a trusted channel. Check
+`bridge_health` on the same connector binding the receiver will use to read,
+claim and complete messages, and pass that independently configured ID as
+`expectedInstanceId` to each of those three calls. The bridge rejects a supplied
+pin as `bridge_instance_mismatch` before storage when it differs or when no
+valid server ID is configured. Older servers reject the extra argument, and
+unpinned callers are unchanged. Stop on an absent or mismatched health ID,
+unsupported pin argument or pin error. The ID identifies the server reached
+by that connector; it does not identify the host's installed app, grant
+access or replace authentication and receipt checks. Separately verify the
+host's app and subscription binding at cutover. Never copy the production ID
+to an independent preview or rollback instance.
 
 ## Storage
 

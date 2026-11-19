@@ -65,6 +65,45 @@ test('health rejects wrong issuer, audience, subject, expired token, unrelated s
   assert.equal(rejected.isError, true); assert.deepEqual(rejected.structuredContent, { error: 'invalid_params' });
   assert.equal((await handler(rpc('FIXTURE_INVALID_NOT_A_TOKEN'))).status, 401);
 });
+test('authenticated health exposes only a valid operator assigned bridge identity', async () => {
+  const instanceId = '67c078e5-5be1-4949-964d-42b64fba8392';
+  const { handler, sign } = await fixture({ BRIDGE_INSTANCE_ID: instanceId });
+  const response = await handler(rpc(await sign({ instanceId: 'caller-identity-must-not-win' })));
+  assert.equal((await response.json() as RpcResponse<ToolCallResult<Record<string, unknown>>>)
+    .result.structuredContent.instanceId, instanceId);
+  const denied = await handler(rpc(await sign({}, { subject: 'different-subject' })));
+  assert.equal(denied.status, 403);
+  assert.doesNotMatch(await denied.text(), new RegExp(instanceId));
+
+  const invalidValue = 'not-an-instance-id-or-safe-to-echo';
+  const invalid = await fixture({ BRIDGE_INSTANCE_ID: invalidValue });
+  const result = (await (await invalid.handler(rpc(await invalid.sign()))).json() as
+    RpcResponse<ToolCallResult<Record<string, unknown>>>).result;
+  assert.equal(Object.hasOwn(result.structuredContent, 'instanceId'), false);
+  assert.doesNotMatch(JSON.stringify(result), new RegExp(invalidValue));
+});
+test('receiver calls reject a changed bridge route before opening storage', async () => {
+  const expectedInstanceId = '67c078e5-5be1-4949-964d-42b64fba8392';
+  const otherInstanceId = '525afcc2-1cb9-4ccc-927e-d3aa7d9f2c90';
+  const messageId = '84e850bb-3688-4ba5-b3b0-2df14260088e';
+  const intended = await fixture({ BRIDGE_INSTANCE_ID: expectedInstanceId });
+  const routedElsewhere = await fixture({ BRIDGE_INSTANCE_ID: otherInstanceId });
+  const unconfigured = await fixture();
+  const healthy = (await (await intended.handler(rpc(await intended.sign()))).json() as ToolResponse).result;
+  assert.equal(healthy.structuredContent.instanceId, expectedInstanceId);
+  for (const target of [routedElsewhere, unconfigured]) {
+    const token = await target.sign();
+    for (const tool of ['bridge_read', 'bridge_receipt_claim', 'bridge_receipt_complete']) {
+      const response = await target.handler(rpc(token, tool, { messageId, expectedInstanceId }));
+      const result = (await response.json() as ToolResponse).result;
+      assert.equal(result.isError, true);
+      assert.deepEqual(result.structuredContent, { error: 'bridge_instance_mismatch' });
+    }
+  }
+  const matching = (await (await intended.handler(rpc(await intended.sign(), 'bridge_read',
+    { messageId, expectedInstanceId }))).json() as ToolResponse).result;
+  assert.deepEqual(matching.structuredContent, { error: 'storage_configuration_required' });
+});
 test('gate flags alone cannot report subscription or delivery ready', async () => {
   const { handler, sign } = await fixture({ BRIDGE_SUBSCRIPTIONS_ENABLED: 'true', BRIDGE_DELIVERY_ENABLED: 'true',
     BRIDGE_SUBSCRIPTION_STORAGE_KEY: Buffer.alloc(32, 7).toString('base64') });
