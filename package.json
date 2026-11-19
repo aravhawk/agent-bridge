@@ -22,10 +22,10 @@
     "profile:cloudflare": "node scripts/profile-cloudflare.ts"
   },
   "dependencies": {
-    "@vercel/blob": "2.8.2",
-    "@vercel/queue": "0.10.0",
+    "@vercel/blob": "2.9.0",
+    "@vercel/queue": "0.11.0",
     "ipaddr.js": "2.5.0",
-    "jose": "6.2.13",
+    "jose": "6.2.17",
     "pg": "8.23.1",
     "standardwebhooks": "1.1.1"
   },
