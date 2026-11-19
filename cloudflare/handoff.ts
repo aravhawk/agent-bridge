@@ -26,11 +26,11 @@ export async function handoff(source:MigrationControl,target:MigrationControl,re
  // permits old-source activation or automatic fallback.
  try{await target.importFrozen(transfer);}catch{await target.importFrozen(transfer);}
  const staged=await target.status();
- if(staged.mode!=='frozen'||staged.revision!==revision||staged.keyId!==transfer.keyId)
+ if(staged.mode!=='frozen'||staged.revision!==revision||staged.keyId!==transfer.keyId||staged.handoff!==transfer.handoff)
   throw new BridgeError('migration_destination_not_frozen',503);
  try{await target.activate(transfer.handoff,revision);}catch{
   const actual=await target.status();
-  if(actual.mode!=='active'||actual.revision!==revision+1||actual.epoch!==staged.epoch)
+  if(actual.mode!=='active'||actual.revision!==revision+1||actual.epoch!==staged.epoch||actual.handoff!==transfer.handoff)
    throw new BridgeError('migration_activation_uncertain',503);
  }
  return {revision:revision+1,checksum:transfer.checksum,handoff:transfer.handoff};

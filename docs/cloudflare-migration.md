@@ -103,6 +103,18 @@ synthetic transfer through dormant, frozen, active, and exported states, and
 checks repeat import and export. It leaves the pilot exported. It does not
 exercise a real peer, signed scheduler, Vercel Queue, or Blob transfer.
 
+The operator helper reads a local mode-0600 JSON file with `databaseUrl`,
+`postgresIdentity`, `cloudflareOrigin`, `cloudflareIdentity`, `migrationKey`,
+and `subscriptionKey`. It verifies the exact remote store identity, uses
+strict database TLS, and prints only phase and revision metadata. Use
+`node scripts/handoff-cloudflare.ts status <private-config>` to inspect.
+After independently draining traffic and verifying the paused deployment,
+run `prepare` once to install the Postgres fence, then `cutover` to transfer.
+For reverse transfer use `rollback`. Each mutating command also requires the
+observed source revision as its final argument and checks that the public
+origin responds with `bridge_migration_paused`. It does not promote or resume
+the Vercel deployment.
+
 ## Single-writer cutover rehearsal and runbook
 
 No production export is authorized by implementing this protocol. A transfer contains

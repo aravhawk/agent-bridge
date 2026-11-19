@@ -57,6 +57,7 @@ export class BridgeObject extends DurableObject<Bindings> {
         const c = command as Record<string, unknown>;
         const key = decodeStorageKey(this.environment.BRIDGE_SUBSCRIPTION_STORAGE_KEY); if (!key) throw Error();
         switch (c.operation) {
+          case 'identity': return Response.json({ identity: this.store.identity });
           case 'status': return Response.json(this.store.status());
           case 'inspect': if(typeof c.revision!=='number')throw Error();return Response.json(this.store.inspect(c.revision));
           case 'import': return Response.json(this.store.importFrozen(c.transfer, keyIdentity(key)));

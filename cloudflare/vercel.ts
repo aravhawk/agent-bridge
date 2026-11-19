@@ -1,6 +1,6 @@
 import { QueueClient } from '@vercel/queue';
 import { BridgeError } from '../src/policy.ts';
-import { QUEUE_REGION } from '../src/release.ts';
+import { PUBLIC_ORIGIN, QUEUE_REGION } from '../src/release.ts';
 import { createCloudflareFrontend } from './frontend.ts';
 import { errorResponse } from './protocol.ts';
 import type { Env } from '../src/config.ts';
@@ -39,6 +39,10 @@ export async function routeStateRequest(request: Request, postgres: (request: Re
   env: Env = process.env, fetcher?: Fetcher) {
   try {
     const frontend = selectStateBackend(env, fetcher);
+    const url = new URL(request.url);
+    if (frontend && request.method === 'GET' && ['/', '/health'].includes(url.pathname) && url.origin !== PUBLIC_ORIGIN) {
+      return await frontend.fetch(new Request(PUBLIC_ORIGIN + url.pathname + url.search, request));
+    }
     return await (frontend ? frontend.fetch(request) : postgres(request));
   } catch (error) { return errorResponse(error); }
 }
