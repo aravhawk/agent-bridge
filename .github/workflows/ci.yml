@@ -18,6 +18,8 @@ jobs:
       # Vercel compiles api/*.ts without type checking (noCheck), so the strict
       # typecheck and a clean emitted-JavaScript compile/load check gate here.
       - run: npm run typecheck
+      - run: npm run typecheck:cloudflare
+      - run: npm run build:cloudflare
       - run: npm run compile:check
       - run: npm test
       - run: npm audit --audit-level=moderate

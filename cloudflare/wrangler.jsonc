@@ -1,0 +1,10 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  "name": "agent-bridge-state-prototype",
+  "main": "worker.ts",
+  "compatibility_date": "2026-11-16",
+  "compatibility_flags": ["nodejs_compat", "enable_nodejs_http_modules"],
+  "workers_dev": false,
+  "durable_objects": { "bindings": [{ "name": "BRIDGE", "class_name": "BridgeObject" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["BridgeObject"] }]
+}

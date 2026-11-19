@@ -39,7 +39,7 @@ import type { TaskIntegration } from './task-integration.ts';
 import type { TaskCapabilityLimits } from './task-capability.ts';
 import type { TaskRetentionOptions } from './task-retention.ts';
 import type { VerifiedTick } from './qstash.ts';
-import type { BridgeState, Millis, PolicyIds, Role, VerifiedPrincipal } from './types.ts';
+import type { BridgeState, Millis, PolicyIds, Role, Store, VerifiedPrincipal } from './types.ts';
 
 /** Constructor-only task DATA opt-in (validated below; never from env or a request). */
 export interface TaskRuntimeOptions extends TaskCapabilityLimits {
@@ -51,6 +51,8 @@ export type RuntimePoolConstructor = new (config: pg.PoolConfig) => RuntimePool;
 /** Publishing (queue.ts), plus the SDK callback handler that only queueHandler() uses. */
 export type RuntimeQueueClient = QueuePublisher & { handleCallback?: QueueClient['handleCallback'] };
 export interface RuntimeOptions {
+  /** Constructor-only durable backend: state transitions execute in its host, never serialized closures. */
+  durableStore?: Store | undefined;
   env?: Env; Pool?: RuntimePoolConstructor; keyResolver?: KeyResolver | undefined; queueClient?: RuntimeQueueClient | undefined;
   accessAllowed?: DeliveryAccessCheck | undefined; webhookSender?: WebhookSend | undefined; clock?: () => Millis;
   transportFactory?: (options: PublicTransportOptions) => WebhookTransport; taskData?: TaskRuntimeOptions | undefined;
@@ -86,7 +88,7 @@ function terminalTransport(transport: WebhookTransport): DeliveryTransport {
 // credentials, issuance and refresh. Secrets are injected by the platform, never pulled.
 export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
   queueClient, accessAllowed, webhookSender, clock = Date.now, transportFactory = createPublicWebhookTransport,
-  taskData, attachmentProviderFactory, attachmentRetention }: RuntimeOptions = {}) {
+  taskData, attachmentProviderFactory, attachmentRetention, durableStore }: RuntimeOptions = {}) {
   // Constructor-only opt-in. No environment variable or request can enable it;
   // the exported production instance below deliberately supplies no option.
   if (taskData !== undefined && (!taskData || typeof taskData !== 'object' || Array.isArray(taskData)))
@@ -131,7 +133,7 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
   const wakeSyncStatus = () => wakeSyncRecipients(env[WAKE_SYNC_FLAG]);
   const wakeSync = () => wakeSyncStatus().recipients;
   // Assigned by configure() before any use (only pool, transport, protector and the task capability may stay unset).
-  let pool: RuntimePool | undefined, store: PostgresStore, bridge: Bridge, events: NativeEvents, queue: QueueAdapter,
+  let pool: RuntimePool | undefined, store: Store, bridge: Bridge, events: NativeEvents, queue: QueueAdapter,
     diagnostic: ReturnType<typeof createWebhookDiagnostic>, transport: WebhookTransport | undefined, protector: Protector | undefined,
     authorize: Authorize, taskCapability: TaskIntegration | undefined;
   const resolver = keyResolver || (provider ? createRemoteJWKSet(new URL(provider.jwks), { timeoutDuration: 5000 }) : undefined);
@@ -166,13 +168,13 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
   }
   function readiness() {
     const callbackProtectorConfigured = !!decodeStorageKey(env.BRIDGE_SUBSCRIPTION_STORAGE_KEY);
-    const base = contractReady && callbackProtectorConfigured && !!env.DATABASE_URL;
+    const base = contractReady && callbackProtectorConfigured && !!(durableStore || env.DATABASE_URL);
     const peer = peerSettings();
     const senderConfigured = webhookSenderConfigured(destination());
     const receiverPolicyVerified = env.BRIDGE_RECEIVER_POLICY === 'inbox-v1' && peer.receiverId === RECEIVER_ID;
     const webhookContractVerified = peer.contractVerified === 'true';
     // Independent of delivery: one operator-armed transport check only.
-    const webhookDiagnosticArmed = contractReady && !!env.DATABASE_URL && senderConfigured &&
+    const webhookDiagnosticArmed = contractReady && !!(durableStore || env.DATABASE_URL) && senderConfigured &&
       peer.receiverId === RECEIVER_ID && diagnosticWindowOpen(peer.diagnosticFrom, peer.diagnosticUntil, clock());
     const deliveryEnabled = !!base && env.BRIDGE_DELIVERY_ENABLED === 'true' &&
       senderConfigured && receiverPolicyVerified && webhookContractVerified;
@@ -180,7 +182,7 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
     // reported; a durable reservation (not this flag) decides whether it is spent.
     const canaryArmed = base && senderConfigured && peer.receiverId === RECEIVER_ID &&
       !deliveryEnabled && !!canaryConfiguration(env, clock());
-    return { storageConfigured: !!env.DATABASE_URL, callbackProtectorConfigured,
+    return { storageConfigured: !!(durableStore || env.DATABASE_URL), callbackProtectorConfigured,
       currentAccessCheckConfigured: !!policyIds[EVENTS_PEER],
       subscriptionSetupEnabled: !!base && env.BRIDGE_SUBSCRIPTIONS_ENABLED === 'true',
       [NAMES.senderConfigured]: senderConfigured, receiverPolicyVerified,
@@ -197,21 +199,24 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
   const armedCanary = () => readiness().canaryArmed ? canaryConfiguration(env, clock()) : null;
   function configure() {
     if (store) return;
-    if (!env.DATABASE_URL) throw new BridgeError('storage_configuration_required', 503);
-    const db = new URL(env.DATABASE_URL);
-    // Any PostgreSQL with a publicly trusted TLS certificate; an optional
-    // BRIDGE_DATABASE_HOST_SUFFIX pins the provider (compatibility: .neon.tech).
-    if (!['postgres:', 'postgresql:'].includes(db.protocol) ||
-        (CONFIG.databaseHostSuffix && !db.hostname.endsWith(CONFIG.databaseHostSuffix)) ||
-        !['require', 'verify-full'].includes(db.searchParams.get('sslmode') as string) ||
-        [...db.searchParams.keys()].some(k => ['sslrootcert', 'sslkey', 'sslcert'].includes(k))) {
-      throw new BridgeError('storage_tls_configuration_required', 503);
+    if (durableStore) store = durableStore;
+    else {
+      if (!env.DATABASE_URL) throw new BridgeError('storage_configuration_required', 503);
+      const db = new URL(env.DATABASE_URL);
+      // Any PostgreSQL with a publicly trusted TLS certificate; an optional
+      // BRIDGE_DATABASE_HOST_SUFFIX pins the provider (compatibility: .neon.tech).
+      if (!['postgres:', 'postgresql:'].includes(db.protocol) ||
+          (CONFIG.databaseHostSuffix && !db.hostname.endsWith(CONFIG.databaseHostSuffix)) ||
+          !['require', 'verify-full'].includes(db.searchParams.get('sslmode') as string) ||
+          [...db.searchParams.keys()].some(k => ['sslrootcert', 'sslkey', 'sslcert'].includes(k))) {
+        throw new BridgeError('storage_tls_configuration_required', 503);
+      }
+      db.searchParams.set('sslmode', 'verify-full'); db.searchParams.delete('uselibpqcompat');
+      pool = new Pool({ connectionString: db.href, max: 2, connectionTimeoutMillis: 5000,
+        idleTimeoutMillis: 10000, query_timeout: 10000 });
+      pool.on('error', () => {});
+      store = new PostgresStore(pool);
     }
-    db.searchParams.set('sslmode', 'verify-full'); db.searchParams.delete('uselibpqcompat');
-    pool = new Pool({ connectionString: db.href, max: 2, connectionTimeoutMillis: 5000,
-      idleTimeoutMillis: 10000, query_timeout: 10000 });
-    pool.on('error', () => {});
-    store = new PostgresStore(pool);
     const ready = readiness(), delivery = ready.deliveryEnabled;
     const key = decodeStorageKey(env.BRIDGE_SUBSCRIPTION_STORAGE_KEY);
     protector = key ? createProtector(key) : undefined;
@@ -271,7 +276,27 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
       return taskCapability[method](...args);
     }])),
   } as McpTasks : undefined;
+  const consumeQueue = async (...args: Parameters<QueueAdapter['consume']>) => {
+    configure();
+    const payload = args[0];
+    const cleanup = payload && Object.keys(payload).length === 1 &&
+      /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test((payload as { cleanupMessageId?: string }).cleanupMessageId || '');
+    // The SDK's (payload, metadata) pair, checked by the adapter.
+    if (readiness().deliveryEnabled || cleanup) return queue.consume(...(args as Parameters<QueueAdapter['consume']>));
+    // Canary mode admits only its own source/ACK dispatch items; direct job
+    // IDs and all other queued work stay closed and untouched.
+    const canary = armedCanary();
+    if (canary && canaryDispatch(payload, canary)) return canaryParts(canary).queue.consume(...(args as Parameters<QueueAdapter['consume']>));
+    throw new BridgeError('delivery_not_enabled', 503);
+
+  };
   return {
+    // Only a trusted queue SDK adapter may call this constructor-assembled path.
+    consumeQueue,
+    queueRetry(error: unknown, metadata: Parameters<QueueAdapter['retry']>[1]) {
+      configure();
+      return queue.retry(error, metadata);
+    },
     handler(role: Role) {
       if (!identityConfigured) throw new BridgeError('provider_contract_verification_required', 503);
       // identityConfigured implies a provider.
@@ -317,18 +342,7 @@ export function createRuntime({ env = process.env, Pool = pg.Pool, keyResolver,
     queueHandler() {
       configure();
       // The SDK client provides handleCallback; an injected client used for queue callbacks must too.
-      return client.handleCallback!(async (...args) => {
-        const payload = args[0];
-        const cleanup = payload && Object.keys(payload).length === 1 &&
-          /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test((payload as { cleanupMessageId?: string }).cleanupMessageId || '');
-        // The SDK's (payload, metadata) pair, checked by the adapter.
-        if (readiness().deliveryEnabled || cleanup) return queue.consume(...(args as Parameters<QueueAdapter['consume']>));
-        // Canary mode admits only its own source/ACK dispatch items; direct job
-        // IDs and all other queued work stay closed and untouched.
-        const canary = armedCanary();
-        if (canary && canaryDispatch(payload, canary)) return canaryParts(canary).queue.consume(...(args as Parameters<QueueAdapter['consume']>));
-        throw new BridgeError('delivery_not_enabled', 503);
-      }, { visibilityTimeoutSeconds: 60, retry: queue.retry });
+      return client.handleCallback!(consumeQueue, { visibilityTimeoutSeconds: 60, retry: queue.retry });
     },
     // Scheduled trigger. Authenticated either by a verified QStash signature
     // (POST with Upstash-Signature; see qstash.ts) or, for any other

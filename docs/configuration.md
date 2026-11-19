@@ -624,3 +624,10 @@ deployments must pass the actual `--peer` and `--counterpart` from
 python3 scripts/package_plugin.py --origin https://bridge.example.com --peer alice \
   --counterpart bob --issuer https://clerk.bridge.example.com --client-id <public-client-id>
 ```
+
+### Experimental Cloudflare state backend
+
+The [local Cloudflare migration prototype](cloudflare-migration.md) moves state and
+atomic transitions into one SQLite-backed Durable Object while retaining the public
+Vercel origin, Blob and QStash. It is not selected by the production entrypoints.
+Its runbook lists the single-writer cutover, rollback and approval gates.

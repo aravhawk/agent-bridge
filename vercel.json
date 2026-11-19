@@ -10,6 +10,6 @@
     "api/cron.ts": { "maxDuration": 60 }
   },
   "rewrites": [
-    { "source": "/((?!api/queue|api/cron).*)", "destination": "/api/index" }
+    { "source": "/((?!api/queue|api/cron|api/bridge-effects).*)", "destination": "/api/index" }
   ]
 }

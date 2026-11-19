@@ -1,8 +1,9 @@
 import { createResourceRouter } from '../src/resource.ts';
 import { createRuntime, runtime as v1Runtime } from '../src/runtime.ts';
 import { BridgeError } from '../src/policy.ts';
+import { routeStateRequest } from '../cloudflare/vercel.ts';
 let runtime: ReturnType<typeof createRuntime>;
-export const handle = createResourceRouter({ getHandler: role => {
+const postgresHandler = createResourceRouter({ getHandler: role => {
   if (!runtime) {
     try {
       runtime = createRuntime({ taskData: {
@@ -17,4 +18,5 @@ export const handle = createResourceRouter({ getHandler: role => {
   }
   return runtime.handler(role);
 } });
+export const handle = (request: Request) => routeStateRequest(request, postgresHandler);
 export default { fetch: handle };

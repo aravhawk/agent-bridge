@@ -1,10 +1,14 @@
 {
   "compilerOptions": {
     "target": "es2024",
-    "lib": ["es2024"],
+    "lib": [
+      "es2024"
+    ],
     "module": "nodenext",
     "moduleResolution": "nodenext",
-    "types": ["node"],
+    "types": [
+      "node"
+    ],
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
@@ -20,5 +24,11 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["src/**/*.ts", "api/**/*.ts", "scripts/**/*.ts", "test/**/*.ts"]
+  "include": [
+    "src/**/*.ts",
+    "api/**/*.ts",
+    "scripts/**/*.ts",
+    "test/**/*.ts",
+    "cloudflare/**/*.ts"
+  ]
 }

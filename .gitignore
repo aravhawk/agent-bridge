@@ -20,3 +20,5 @@ evidence/
 .DS_Store
 __pycache__/
 *.pyc
+dist-cloudflare/
+.wrangler/
