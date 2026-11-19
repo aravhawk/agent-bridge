@@ -9,11 +9,19 @@ export function createCloudflareFrontend({ endpoint, key, fetcher = request => f
   return {
     async fetch(request: Request): Promise<Response> {
       const h = headers(); h.set('x-bridge-url', request.url); h.set('x-bridge-method', request.method);
+      h.set('accept-encoding', 'identity');
       for (const name of ['authorization', 'content-type', 'origin', 'upstash-signature']) {
         const value = request.headers.get(name); if (value !== null) h.set('x-bridge-original-' + name, value);
       }
-      return fetcher(new Request(endpoint + '/invoke', { method: 'POST', headers: h, redirect: 'manual',
+      const response = await fetcher(new Request(endpoint + '/invoke', { method: 'POST', headers: h, redirect: 'manual',
         body: request.body, ...(request.body ? { duplex: 'half' } : {}), signal: AbortSignal.timeout(55000) }));
+      const forwarded = new Headers();
+      for (const name of ['content-type', 'cache-control', 'www-authenticate', 'allow', 'retry-after',
+        'upstash-nonretryable-error', 'access-control-allow-origin', 'vary']) {
+        const value = response.headers.get(name);
+        if (value !== null) forwarded.set(name, value);
+      }
+      return new Response(response.body, { status: response.status, headers: forwarded });
     },
     // Wire ONLY behind the existing official queue SDK's handleCallback. Never mount as a public queue route.
     async consume(payload: QueuePayload, metadata: QueueMetadata): Promise<void> {

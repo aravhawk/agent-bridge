@@ -54,9 +54,16 @@ test('Vercel routes paused and unavailable Cloudflare deployments without a Post
     assert.equal(forwarded.headers.get('x-bridge-url'), original);
     assert.equal(forwarded.headers.get('x-bridge-original-upstash-signature'), 'fixture-signature');
     assert.equal(await forwarded.text(), '{"synthetic":true}');
-    return new Response('unavailable', { status: 503 });
+    assert.equal(forwarded.headers.get('accept-encoding'), 'identity');
+    return new Response('unavailable', { status: 503, headers: { 'content-encoding': 'br', 'content-length': '42',
+      'retry-after': '10', 'upstash-nonretryable-error': 'true' } });
   });
   assert.equal(reply.status, 503);
+  assert.equal(await reply.text(), 'unavailable');
+  assert.equal(reply.headers.has('content-encoding'), false);
+  assert.equal(reply.headers.has('content-length'), false);
+  assert.equal(reply.headers.get('retry-after'), '10');
+  assert.equal(reply.headers.get('upstash-nonretryable-error'), 'true');
   assert.equal(postgresCalls, 1);
 });
 
